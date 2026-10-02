@@ -154,6 +154,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.imageTurret = g->get("image_turret");
         t.imageScale = (float)g->getNum("imagescale", g->getNum("scaleimagesto_scale", 1));
         t.turretImageScale = (float)g->getNum("turretimagescale", 1);
+        t.imageShadow = g->get("image_shadow");
+        t.shadowOffX = (float)g->getNum("shadowoffsetx", 0);
+        t.shadowOffY = (float)g->getNum("shadowoffsety", 0);
         t.totalFrames = (int)g->getNum("total_frames", 1);
         if (t.totalFrames < 1) t.totalFrames = 1;
         t.drawLayer = g->get("drawlayer");
@@ -176,6 +179,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.decel = (float)m->getNum("movedecelerationspeed", 0.17);
         t.maxTurnSpeed = (float)m->getNum("maxturnspeed", 4);
         t.turnAccel = (float)m->getNum("turnacceleration", 0.25);
+        t.reverseSpeed = (float)m->getNum("reversespeedpercentage", 0.6);
     }
     if (t.isBuilding) t.moveType = MoveType::NONE;
 
@@ -215,6 +219,16 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             tt.canShoot = s.getBool("canshoot", true);
             tt.turnSpeed = (float)s.getNum("turnspeed", t.turretTurnSpeed);
             tt.warmup = (float)s.getNum("warmup", 0);
+            tt.idleDir = (float)s.getNum("idledir", 0);
+            tt.shouldResetTurret = s.getBool("shouldresetturret", true);
+            // RWX shoot_flame accepts a comma list; only the built-in flame sizes are rendered here
+            {
+                std::string fl = ToLower(s.get("shoot_flame", ""));
+                size_t comma = fl.find(','); if (comma != std::string::npos) fl = Trim(fl.substr(0, comma));
+                if (fl == "small") tt.shootFlame = 1;
+                else if (fl == "medium") tt.shootFlame = 2;
+                else if (fl == "large") tt.shootFlame = 3;
+            }
             if (s.has("canattackflyingunits")) tt.canAttackFlying = s.getBool("canattackflyingunits", true); else tt.canAttackFlying = t.canAttackFlying;
             if (s.has("canattacklandunits")) tt.canAttackLand = s.getBool("canattacklandunits", true); else tt.canAttackLand = t.canAttackLand;
             tt.canAttackUnderwater = s.getBool("canattackunderwaterunits", false);

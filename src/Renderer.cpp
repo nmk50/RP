@@ -84,6 +84,18 @@ bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     return tex.id != missing_.id;
 }
 
+bool Renderer::shared(const std::string& file, Texture2D& out) {
+    std::string key = "@drawable/" + file;
+    auto it = cache_.find(key);
+    if (it != cache_.end()) { out = it->second; return it->second.id != missing_.id; }
+    std::string path = g_assetsRoot + "/drawable/" + file;
+    Texture2D tex = missing_;
+    if (FileExists(path.c_str())) tex = LoadTexture(path.c_str());
+    cache_[key] = tex;
+    out = tex;
+    return tex.id != missing_.id;
+}
+
 static void worldViewCull(const Camera2D& cam, float sw, float sh, float& x0, float& y0, float& x1, float& y1) {
     Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam);
     Vector2 br = GetScreenToWorld2D({ sw, sh }, cam);
@@ -123,6 +135,22 @@ static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2
 static float spriteRot(float angleRad) { return angleRad * 180.0f / 3.14159265f + 90.0f; }
 
 static const TurretTpl kZeroTurret{};
+
+// RWX image_shadow: AUTO = the body frame with RGB forced to black, shifted by shadowOffsetX/Y world px.
+// Drawn in its own pass so one unit's shadow never stains a neighbour's sprite.
+void Renderer::drawUnitShadow(const Unit& u) {
+    if (!u.tpl) return;
+    const UnitTemplate& t = *u.tpl;
+    if (ToLower(t.imageShadow) != "auto") return;
+    Texture2D tex;
+    if (!loaded(t, 0, tex)) return;
+    int frames = std::max(1, t.totalFrames);
+    int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
+    int anim = ef > 1 ? (int)(GetTime() * 5.0f) % ef : 0;
+    float rot = t.isStatic() ? 0 : spriteRot(u.facing);
+    drawSpriteFrame(tex, ef, anim, Vector2{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY },
+        std::max(6.0f, t.displayRadius) * 2.0f * t.imageScale, rot, Color{ 0, 0, 0, 128 });
+}
 
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!u.tpl) return;
@@ -172,6 +200,19 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, turW, rot, col);
         }
     }
+    // RWX shoot_flame: effectTemplates[3] = drawable/flame.png, 20x25 frames, attached to the shooter
+    if (u.muzzleType && u.muzzleT > 0) {
+        Texture2D fl;
+        if (shared("flame.png", fl)) {
+            int total = u.muzzleType == 1 ? 8 : 10;
+            float elapsed = (float)total - u.muzzleT;
+            int frame = u.muzzleType == 1 ? (int)(elapsed * 0.5f) : 1 + (int)(elapsed * 0.4f);
+            int ef = std::max(1, fl.width / 20);
+            drawSpriteFrame(fl, ef, std::min(ef - 1, frame),
+                Vector2{ pv.x + u.muzzleOff.x, pv.y + u.muzzleOff.y },
+                20.0f * (u.muzzleType == 2 ? 0.75f : 1.0f), spriteRot(u.muzzleAng), col);
+        }
+    }
     // team ring under selection
     if (u.selected) {
         DrawCircleLines((int)pv.x, (int)pv.y, r + 3, Color{ 60, 220, 90, 255 });
@@ -211,6 +252,7 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     drawMap(g, view.cam);
 
     // under-construction + normal units sorted so buildings draw first
+    for (auto& u : g.units) drawUnitShadow(u);
     for (auto& u : g.units) if (u.tpl && u.tpl->isStatic()) drawUnit(g, u, view.cam);
     for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic()) drawUnit(g, u, view.cam);
 
@@ -220,12 +262,20 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         Color pc = p.team == g.playerTeam() ? Color{ 255, 240, 120, 255 } : Color{ 255, 150, 90, 255 };
         DrawCircleV(Vector2{ p.pos.x, p.pos.y }, s, pc);
     }
-    // effects
-    for (auto& e : g.effects) {
-        float prog = e.t / e.dur;
-        float rad = e.radius * (0.5f + prog);
-        Color ec = Color{ (uint8_t)(255), (uint8_t)(200 - 120 * prog), (uint8_t)(120 - 100 * prog), (uint8_t)(220 * (1 - prog)) };
-        DrawCircleV(Vector2{ e.pos.x, e.pos.y }, rad, ec);
+    // RWX explosion: explode_big.png strip (13 frames), alpha 0.7 fading over the last 10 ticks
+    Texture2D ex;
+    if (!g.effects.empty() && shared("explode_big.png", ex)) {
+        const int kFrames = 13;
+        float fw = ex.width / (float)kFrames;
+        for (auto& e : g.effects) {
+            float el = e.t - e.delay;
+            if (el < 0) continue;
+            float life = 13.0f / e.frameSpeed;
+            float a = 0.7f * std::max(0.0f, std::min(1.0f, (life - el) / 10.0f));
+            drawSpriteFrame(ex, kFrames, std::min(kFrames - 1, (int)(el * e.frameSpeed)),
+                Vector2{ e.pos.x, e.pos.y }, fw * e.scale, e.rot * 57.29578f,
+                Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
+        }
     }
     // nano build particles (green flecks flying builder -> building, RW effects.png frame 6)
     for (auto& p : g.particles) {

@@ -45,6 +45,15 @@ struct Unit {
     // and its angular velocity (ramped by [movement] turnAcceleration).
     float targetFacing = 0, turnVel = 0;
     bool hasFacingTarget = false;
+    // RWX BaseUnit.rotation: signed 0..1 throttle ramped by moveAcceleration/DecelerationSpeed,
+    // negative while flip-turning; isRotating marks the >100 deg reverse-and-pivot manoeuvre.
+    float throttle = 0;
+    bool isRotating = false;
+    // RWX shoot_flame: the flame effect is attached to the unit, so it keeps its offset from the
+    // firing turret and its angle while it plays.
+    int muzzleType = 0;
+    float muzzleT = 0, muzzleAng = 0;
+    Vec2 muzzleOff;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
@@ -68,8 +77,16 @@ struct Projectile {
     bool dead = false;
 };
 
+// RWX EffectManager.createSmallExplosion: explode_big.png strip, frames 0..12 at 0.5/tick,
+// with a random spin, scale and (for big explosions) a delayed start.
 struct Effect {
-    Vec2 pos; float t = 0, dur = 0.3f; float radius = 10; bool large = false; bool dead = false;
+    Vec2 pos;
+    float t = 0;              // ticks since spawn
+    float delay = 0;          // RWX delayedStartTimer, in ticks
+    float rot = 0;            // sprite rotation, radians
+    float scale = 1;          // 0.8..1 like RWX
+    float frameSpeed = 0.5f;  // frames per tick
+    bool dead = false;
 };
 
 // nano build particle: flies from builder to the target building (RWX OrderableUnit nano effect)
@@ -140,6 +157,7 @@ private:
     void updateUnit(Unit& u);
     void updateProjectile(Projectile& p);
     void killUnit(Unit& u);
+    void explode(Vec2 at, bool big);
     void fire(Unit& u, Unit& target);
     void runAI();
     std::vector<Unit*> queryNearestEnemy(int team, Vec2 pos, float maxDist, const UnitTemplate* shooter);

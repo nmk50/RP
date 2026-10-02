@@ -18,6 +18,11 @@ struct TurretTpl {
     bool canShoot = true;
     float turnSpeed = 4.0f;
     float warmup = 0;
+    // RWX [turret_N]: idle rest angle relative to the hull, and whether the turret returns to it
+    float idleDir = 0;
+    bool shouldResetTurret = true;
+    // RWX shoot_flame built-in effects: 0 none, 1 small, 2 medium, 3 large (flame.png frames)
+    int shootFlame = 0;
     bool canAttackFlying = true, canAttackLand = true, canAttackUnderwater = false;
 };
 
@@ -48,6 +53,9 @@ struct UnitTemplate {
     std::string overrideName;
     std::string displayText;
     std::string image, imageWreak, imageTurret;
+    // RWX [graphics] image_shadow: "AUTO" = the body silhouette in black, offset by shadowOffsetX/Y world px
+    std::string imageShadow;
+    float shadowOffX = 0, shadowOffY = 0;
     std::string sourceDir;   // directory of the ini, for image resolution
 
     float price = 100, maxHp = 100, mass = 1000;
@@ -70,6 +78,7 @@ struct UnitTemplate {
 
     MoveType moveType = MoveType::NONE;
     float moveSpeed = 0, accel = 0.07f, decel = 0.17f, maxTurnSpeed = 4, turnAccel = 0.25f;
+    float reverseSpeed = 0.6f; // RWX [movement] reverseSpeedPercentage: allows the flip-turn
 
     float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0;
 

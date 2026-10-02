@@ -125,6 +125,9 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.hp = u.maxHp = tpl->maxHp;
     u.footprint[0] = tpl->footL; u.footprint[1] = tpl->footU; u.footprint[2] = tpl->footR; u.footprint[3] = tpl->footD;
     u.turretRot = -1.5708f;
+    // RWX BaseBuilding.java:108: a building's body angle is -90 deg, so its turret idles along the
+    // unrotated sprite (north) plus [turret] idleDir.
+    if (tpl->isStatic()) u.facing = -1.5708f;
     u.underConstruction = underConstruction;
     units.push_back(u);
     if (tpl->isStatic()) markBuildingOcc(map, units.back(), +1);
@@ -348,7 +351,7 @@ void Game::update() {
             if (dist < rr && dist > 0.0001f) a.pos = a.pos + d.norm() * (rr - dist) * 0.5f;
         }
     }
-    for (auto& e : effects) { e.t += 1.0f / TICK_RATE; if (e.t >= e.dur) e.dead = true; }
+    for (auto& e : effects) { e.t += 1; if (e.t - e.delay >= 13.0f / e.frameSpeed) e.dead = true; }
     for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
     units.erase(std::remove_if(units.begin(), units.end(), [](const Unit& u) { return u.dead; }), units.end());
     projectiles.erase(std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.dead; }), projectiles.end());
@@ -434,7 +437,7 @@ void Game::updateUnit(Unit& u) {
                     u.hp = nt->maxHp * frac;
                     u.footprint[0] = nt->footL; u.footprint[1] = nt->footU; u.footprint[2] = nt->footR; u.footprint[3] = nt->footD;
                     if (nt->isStatic()) markBuildingOcc(map, u, +1);
-                    effects.push_back({ u.pos, 0, 0.4f, nt->radius * 1.5f, false });
+                    explode(u.pos, false);
                 }
                 u.upgradeIdx = -1;
                 u.upgradeProgress = 0;
@@ -456,58 +459,40 @@ void Game::updateUnit(Unit& u) {
     }
     Unit* tgt = combatTarget >= 0 ? get(combatTarget) : nullptr;
 
-    if (!u.isStatic() && u.repathTimer > 0) u.repathTimer--;
-    if (!u.isStatic() && u.pathIdx < (int)u.path.size()) {
-        Vec2 wp = u.path[u.pathIdx];
-        bool last = u.pathIdx + 1 >= (int)u.path.size();
-        float sp = tpl.moveSpeed;
-        float dist = wp.dist(u.pos);
-        float arrive = last ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7
-        if (dist <= std::max(arrive, sp)) {
-            u.pathIdx++;
-            if (u.pathIdx >= (int)u.path.size()) { u.path.clear(); u.pathIdx = 0; u.hasGoal = false; }
-        } else {
-            // early switch when the next waypoint is already nearer (RW :2832-2839)
-            if (!last) {
-                Vec2 nx = u.path[u.pathIdx + 1];
-                if (nx.dist(u.pos) < dist - 1.0f) { u.pathIdx++; wp = u.path[u.pathIdx]; last = u.pathIdx + 1 >= (int)u.path.size(); dist = wp.dist(u.pos); }
-            }
-            Vec2 dir = (wp - u.pos).norm();
-            // wall sliding (RW applyPositionChange); if trapped on a blocked tile, allow escape
-            Vec2 np = u.pos + dir * sp;
-            bool trapped = !passableAt(*this, u.pos, tpl.moveType);
-            if (trapped || passableAt(*this, np, tpl.moveType)) u.pos = np;
-            else {
-                Vec2 nxp{ np.x, u.pos.y }, nyp{ u.pos.x, np.y };
-                if (passableAt(*this, nxp, tpl.moveType)) u.pos = nxp;
-                else if (passableAt(*this, nyp, tpl.moveType)) u.pos = nyp;
-            }
-            u.animFrame += 0.2f;
-            // stuck recovery (RW blockedRecoveryTime / pathRetryTimer)
-            if (u.pos.dist(u.prevPos) < 0.35f) u.stuckTimer++; else u.stuckTimer = 0;
-            u.prevPos = u.pos;
-            if (u.stuckTimer > 200 && dist < 60.0f) { u.stuckTimer = 0; if (!last) u.pathIdx++; }
-            else if (u.stuckTimer > 90 && u.repathTimer <= 0) { u.stuckTimer = 0; computePath(*this, u, u.hasGoal ? u.moveGoal : wp); }
-        }
-        // RWX OrderableUnit.java:2864-2884: the hull aims at the node it is heading to,
-        // whether or not the unit actually moved this tick.
-        if (u.pathIdx < (int)u.path.size()) {
-            Vec2 node = u.path[u.pathIdx];
-            u.targetFacing = std::atan2(node.y - u.pos.y, node.x - u.pos.x);
-            u.hasFacingTarget = true;
-        }
-    } else if (!u.isStatic() && u.hasGoal && u.repathTimer <= 0 && u.pos.dist(u.moveGoal) > 8.0f) {
-        computePath(*this, u, u.moveGoal); // retry after blockage cleared
-    }
-
-    // RWX OrderableUnit.rotateToward + addRotation: turning is its own tick step, so the hull
-    // keeps rotating to its heading after the unit stops, and the turret rides along with it.
     if (!u.isStatic()) {
-        // [attack] isFixedFiring: no turret to aim with, so the whole body faces the target
-        if (tpl.isFixedFiring && tgt) {
-            u.targetFacing = Vec2::angleTo(u.pos, tgt->pos);
-            u.hasFacingTarget = true;
+        if (u.repathTimer > 0) u.repathTimer--;
+        // RWX air and hover units steer by velocity (moveIgnoringBody), so the hull never gates them
+        bool ignoreBody = tpl.moveType == MoveType::AIR || tpl.moveType == MoveType::HOVER;
+        bool pathing = u.pathIdx < (int)u.path.size();
+        bool lastNode = pathing && u.pathIdx + 1 >= (int)u.path.size();
+        int nodesLeft = pathing ? (int)u.path.size() - u.pathIdx : 0;
+        Vec2 node = pathing ? u.path[u.pathIdx] : u.pos;
+        float dist = pathing ? node.dist(u.pos) : 0.0f;
+        float distSq = dist * dist;
+        float bearing = pathing ? std::atan2(node.y - u.pos.y, node.x - u.pos.x) : u.facing;
+        // OrderableUnit.java:2880-2884 vs 3175-3192: while pathing the hull follows the path node;
+        // a fixed-firing unit faces its target only once it has stopped (or it ignores move orders).
+        bool aimWithBody = tpl.isFixedFiring && tgt && (!pathing || ignoreBody);
+        if (aimWithBody) bearing = Vec2::angleTo(u.pos, tgt->pos);
+        float heading = bearing;
+        // [movement] reverseSpeedPercentage decides whether a >100 deg swing becomes a flip-turn
+        float revPct = tpl.reverseSpeed;
+        bool flipOk = !ignoreBody && pathing && !aimWithBody &&
+            (revPct > 0.95f || (revPct > 0.87f && nodesLeft <= 9 && distSq < 250000.0f)
+             || (revPct > 0.7f && nodesLeft <= 4 && distSq < 40000.0f)
+             || (revPct > 0.4f && nodesLeft <= 2 && distSq < 10000.0f));
+        if (flipOk) {
+            float errDeg = std::fabs(angleDiff(u.facing, bearing)) * 57.29578f;
+            if (errDeg > 100.0f) { u.isRotating = true; heading = bearing + 3.14159265f; }
+            else u.isRotating = false;
+        } else {
+            u.isRotating = false;
         }
+        u.targetFacing = heading;
+        u.hasFacingTarget = true;
+
+        // rotateToward + addRotation: the hull keeps turning to its heading after the unit stops,
+        // and the turret rides along with it.
         if (u.hasFacingTarget) {
             float diff = angleDiff(u.facing, u.targetFacing);
             float maxV = tpl.maxTurnSpeed * 0.0174533f;
@@ -524,6 +509,64 @@ void Game::updateUnit(Unit& u) {
                 u.turretRot += step;
             }
         }
+        float aimErrDeg = std::fabs(angleDiff(u.facing, heading)) * 57.29578f;
+
+        // RWX throttle: full speed only when the hull is aimed within the distance-scaled
+        // tolerance (:2893-2916), otherwise the unit stops to turn, and it brakes on the way in.
+        float tol = distSq > 3600.0f ? 89.0f : (distSq > 361.0f ? 46.0f : 20.0f);
+        if (tpl.maxTurnSpeed < 1.4f) tol = distSq > 6400.0f ? tol * 0.5f : 17.0f;
+        if (tpl.maxTurnSpeed < 1.1f) tol *= 0.7f;
+        if (u.throttle > 0.4f && distSq > 16900.0f) tol = 180.0f;
+        if (ignoreBody) tol = 181.0f;
+        float want = 0;
+        bool parked = lastNode && distSq < 16.0f;
+        if (pathing && !parked && aimErrDeg <= tol) {
+            want = 1.0f;
+            if (lastNode) {
+                if (distSq < 324.0f && tpl.decel < 0.13f && tpl.moveSpeed > 1.0f) want *= 0.5f;
+                if (distSq < 169.0f && tpl.decel < 0.15f && tpl.moveSpeed > 0.9f) want *= 0.5f;
+            }
+            if (distSq < 9.0f) want = 0;
+        }
+        // :3003-3006 while flipping the unit backs up at reverseSpeedPercentage
+        if (u.isRotating && !ignoreBody) want = -want * revPct;
+        float rate = want > u.throttle ? tpl.accel : tpl.decel;
+        if (std::fabs(want - u.throttle) <= rate) u.throttle = want;
+        else u.throttle += (want > u.throttle ? rate : -rate);
+
+        // position: land and water units drive along the hull, never sideways
+        if (std::fabs(u.throttle) > 1e-4f) {
+            float a = ignoreBody ? bearing : u.facing;
+            Vec2 step{ std::cos(a), std::sin(a) };
+            Vec2 np = u.pos + step * (tpl.moveSpeed * u.throttle);
+            bool trapped = !passableAt(*this, u.pos, tpl.moveType);
+            if (trapped || passableAt(*this, np, tpl.moveType)) u.pos = np;
+            else {
+                Vec2 nxp{ np.x, u.pos.y }, nyp{ u.pos.x, np.y };
+                if (passableAt(*this, nxp, tpl.moveType)) u.pos = nxp;
+                else if (passableAt(*this, nyp, tpl.moveType)) u.pos = nyp;
+                else u.throttle *= 0.5f;
+            }
+        }
+        if (pathing) {
+            float arrive = lastNode ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7
+            if (dist <= std::max(arrive, tpl.moveSpeed)) {
+                u.pathIdx++;
+                if (u.pathIdx >= (int)u.path.size()) { u.path.clear(); u.pathIdx = 0; u.hasGoal = false; }
+            } else if (!lastNode) {
+                // early switch when the next waypoint is already nearer (RW :2832-2839)
+                Vec2 nx = u.path[u.pathIdx + 1];
+                if (nx.dist(u.pos) < dist - 1.0f) u.pathIdx++;
+            }
+            // stuck recovery (RW blockedRecoveryTime / pathRetryTimer)
+            if (u.pos.dist(u.prevPos) < 0.35f) u.stuckTimer++; else u.stuckTimer = 0;
+            u.prevPos = u.pos;
+            if (u.stuckTimer > 200 && dist < 60.0f) { u.stuckTimer = 0; if (u.pathIdx < (int)u.path.size() && !lastNode) u.pathIdx++; }
+            else if (u.stuckTimer > 90 && u.repathTimer <= 0) { u.stuckTimer = 0; computePath(*this, u, u.hasGoal ? u.moveGoal : node); }
+        }
+    }
+    if (!u.isStatic() && u.pathIdx >= (int)u.path.size() && u.hasGoal && u.repathTimer <= 0 && u.pos.dist(u.moveGoal) > 8.0f) {
+        computePath(*this, u, u.moveGoal); // retry after blockage cleared
     }
 
     if (u.shootCooldown > 0) u.shootCooldown -= 1;
@@ -536,11 +579,18 @@ void Game::updateUnit(Unit& u) {
         float tol = tpl.isFixedFiring ? 0.2f : 0.5f;
         bool aimed = std::fabs(angleDiff(u.turretRot, want)) < tol;
         if (dist <= tpl.attackRange + tgt->tpl->radius && aimed && u.shootCooldown <= 0) { fire(u, *tgt); u.shootCooldown = tpl.shootDelay; }
-    } else if (!u.isStatic()) {
-        // RWX: with no target the turret tracks the hull so it stays glued while moving
+    } else if (!tpl.turrets.empty()) {
+        const TurretTpl& tur = tpl.turrets[0];
         if (tpl.isFixedFiring) u.turretRot = u.facing;
-        else if (!tpl.turrets.empty()) u.turretRot = lerpAngle(u.turretRot, u.facing, tpl.turretTurnSpeed * 0.05236f);
+        else if (tur.shouldResetTurret) {
+            // RWX OrderableUnit.java:846-857: with no target the turret turns back to C(i) =
+            // hull facing + idleDir; shouldResetTurret:false parks it on its last aim.
+            float rest = u.facing + tur.idleDir * 0.0174533f;
+            if (u.isRotating && tpl.reverseSpeed > 0.95f) rest += 3.14159265f;
+            u.turretRot = lerpAngle(u.turretRot, rest, tur.turnSpeed * 0.05236f);
+        }
     }
+    if (u.muzzleT > 0) u.muzzleT -= 1;
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;
     if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f) {
@@ -578,6 +628,14 @@ void Game::fire(Unit& u, Unit& target) {
     p.explodeOnHit = pt.explodeOnHit || pt.areaDamage > 0; p.largeHit = pt.largeHit;
     p.vel = (target.pos - p.pos).norm() * p.speed;
     projectiles.push_back(p);
+    if (tur.shootFlame) {
+        // RWX EffectManager.createFlameEffect(2): small plays frames 0..3 at 0.5/tick (8 ticks),
+        // large/medium frames 1..4 at 0.4/tick (10 ticks); the flame is attached to the shooter.
+        u.muzzleType = tur.shootFlame;
+        u.muzzleT = tur.shootFlame == 1 ? 8.0f : 10.0f;
+        u.muzzleAng = u.turretRot;
+        u.muzzleOff = p.pos - u.pos;
+    }
 }
 
 void Game::updateProjectile(Projectile& p) {
@@ -592,7 +650,7 @@ void Game::updateProjectile(Projectile& p) {
 }
 
 void Game::impact(Projectile& p, Vec2 point) {
-    effects.push_back({ point, 0, p.largeHit ? 0.6f : 0.3f, p.areaRadius > 0 ? p.areaRadius : 8, p.largeHit });
+    explode(point, p.largeHit || p.areaRadius > 0);
     if (p.damage > 0) { Unit* t = p.targetId >= 0 ? get(p.targetId) : nullptr; if (t && !t->dead) damage(*t, p.damage); }
     if (p.areaDamage > 0)
         for (auto& u : units) {
@@ -607,12 +665,27 @@ void Game::damage(Unit& target, float dmg) {
     if (target.hp <= 0) killUnit(target);
 }
 
+// RWX EffectManager.createExplosionWithVelocity: a big explosion is 7 flames jittered +-20 px,
+// each starting 0..20 ticks later and running at 0.3..0.6 frames/tick.
+void Game::explode(Vec2 at, bool big) {
+    for (int i = 0, n = big ? 7 : 1; i < n; ++i) {
+        Effect e;
+        if (big) e.pos = at + Vec2{ g_rng.range(-20.0f, 20.0f), g_rng.range(-20.0f, 20.0f) };
+        else e.pos = at;
+        e.rot = g_rng.range(-3.14159265f, 3.14159265f);
+        e.scale = g_rng.range(0.8f, 1.0f);
+        e.frameSpeed = big ? g_rng.range(0.3f, 0.6f) : 0.5f;
+        e.delay = big ? g_rng.range(0.0f, 20.0f) : 0.0f;
+        effects.push_back(e);
+    }
+}
+
 void Game::killUnit(Unit& u) {
     if (u.dead) return;
     u.dead = true;
     if (u.tpl && u.tpl->isStatic()) markBuildingOcc(map, u, -1);
     bool big = u.tpl && u.tpl->radius > 20;
-    effects.push_back({ u.pos, 0, big ? 0.6f : 0.35f, u.tpl ? u.tpl->radius * 1.2f : 12, big });
+    explode(u.pos, big);
     for (auto& o : units) { if (o.orderTargetId == u.id) o.orderTargetId = -1; if (o.constructingId == u.id) o.constructingId = -1; }
     for (auto& p : projectiles) if (p.targetId == u.id) p.targetId = -1;
 }
