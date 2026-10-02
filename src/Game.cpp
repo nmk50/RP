@@ -14,6 +14,14 @@ static float lerpAngle(float a, float b, float maxStep) {
     return a + (d > 0 ? maxStep : -maxStep);
 }
 
+// shortest signed delta from a to b, in radians (RWX Utility.endsWith)
+static float angleDiff(float a, float b) {
+    float d = b - a;
+    while (d > 3.14159265f) d -= 2 * 3.14159265f;
+    while (d < -3.14159265f) d += 2 * 3.14159265f;
+    return d;
+}
+
 static Team* teamOf(Game& g, int id) { for (auto& t : g.teams) if (t.id == id) return &t; return nullptr; }
 
 bool Game::init(const std::string& mapPath, std::string* err) {
@@ -475,33 +483,63 @@ void Game::updateUnit(Unit& u) {
                 else if (passableAt(*this, nyp, tpl.moveType)) u.pos = nyp;
             }
             u.animFrame += 0.2f;
-            // body turns toward the waypoint at maxTurnSpeed deg/tick (RW rotateToward)
-            float want = std::atan2(dir.y, dir.x);
-            float diff = want - u.facing;
-            while (diff > 3.14159265f) diff -= 6.2831853f;
-            while (diff < -3.14159265f) diff += 6.2831853f;
-            float step = tpl.maxTurnSpeed * 0.0174533f;
-            u.facing += std::max(-step, std::min(step, diff));
             // stuck recovery (RW blockedRecoveryTime / pathRetryTimer)
             if (u.pos.dist(u.prevPos) < 0.35f) u.stuckTimer++; else u.stuckTimer = 0;
             u.prevPos = u.pos;
             if (u.stuckTimer > 200 && dist < 60.0f) { u.stuckTimer = 0; if (!last) u.pathIdx++; }
             else if (u.stuckTimer > 90 && u.repathTimer <= 0) { u.stuckTimer = 0; computePath(*this, u, u.hasGoal ? u.moveGoal : wp); }
         }
+        // RWX OrderableUnit.java:2864-2884: the hull aims at the node it is heading to,
+        // whether or not the unit actually moved this tick.
+        if (u.pathIdx < (int)u.path.size()) {
+            Vec2 node = u.path[u.pathIdx];
+            u.targetFacing = std::atan2(node.y - u.pos.y, node.x - u.pos.x);
+            u.hasFacingTarget = true;
+        }
     } else if (!u.isStatic() && u.hasGoal && u.repathTimer <= 0 && u.pos.dist(u.moveGoal) > 8.0f) {
         computePath(*this, u, u.moveGoal); // retry after blockage cleared
+    }
+
+    // RWX OrderableUnit.rotateToward + addRotation: turning is its own tick step, so the hull
+    // keeps rotating to its heading after the unit stops, and the turret rides along with it.
+    if (!u.isStatic()) {
+        // [attack] isFixedFiring: no turret to aim with, so the whole body faces the target
+        if (tpl.isFixedFiring && tgt) {
+            u.targetFacing = Vec2::angleTo(u.pos, tgt->pos);
+            u.hasFacingTarget = true;
+        }
+        if (u.hasFacingTarget) {
+            float diff = angleDiff(u.facing, u.targetFacing);
+            float maxV = tpl.maxTurnSpeed * 0.0174533f;
+            if (std::fabs(diff) < 1e-4f) {
+                u.facing += diff; u.turnVel = 0; u.hasFacingTarget = false;
+            } else {
+                float accel = tpl.turnAccel * 0.0174533f;
+                float wantV = diff > 0 ? maxV : -maxV;
+                if (std::fabs(wantV - u.turnVel) <= accel) u.turnVel = wantV;
+                else u.turnVel += (wantV > u.turnVel ? accel : -accel);
+                float step = u.turnVel;
+                if (std::fabs(step) > std::fabs(diff)) step = diff;
+                u.facing += step;
+                u.turretRot += step;
+            }
+        }
     }
 
     if (u.shootCooldown > 0) u.shootCooldown -= 1;
     if (tpl.canAttack && u.operational() && tgt) {
         float want = Vec2::angleTo(u.pos, tgt->pos);
-        u.turretRot = lerpAngle(u.turretRot, want, tpl.turretTurnSpeed * 0.05236f);
+        // RWX OrderableUnit.java:4750: the barrel fires along the hull when isFixedFiring
+        if (tpl.isFixedFiring) u.turretRot = u.facing;
+        else u.turretRot = lerpAngle(u.turretRot, want, tpl.turretTurnSpeed * 0.05236f);
         float dist = u.pos.dist(tgt->pos);
-        bool aimed = tpl.isFixedFiring || std::fabs(lerpAngle(u.turretRot, want, 1e9f) - u.turretRot) < 0.5f;
+        float tol = tpl.isFixedFiring ? 0.2f : 0.5f;
+        bool aimed = std::fabs(angleDiff(u.turretRot, want)) < tol;
         if (dist <= tpl.attackRange + tgt->tpl->radius && aimed && u.shootCooldown <= 0) { fire(u, *tgt); u.shootCooldown = tpl.shootDelay; }
-    } else if (!u.isStatic() && !tpl.turrets.empty()) {
+    } else if (!u.isStatic()) {
         // RWX: with no target the turret tracks the hull so it stays glued while moving
-        u.turretRot = lerpAngle(u.turretRot, u.facing, tpl.turretTurnSpeed * 0.05236f);
+        if (tpl.isFixedFiring) u.turretRot = u.facing;
+        else if (!tpl.turrets.empty()) u.turretRot = lerpAngle(u.turretRot, u.facing, tpl.turretTurnSpeed * 0.05236f);
     }
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;

@@ -41,6 +41,10 @@ struct Unit {
     int repathTimer = 0;
     int stuckTimer = 0;
     Vec2 prevPos;
+    // RWX BaseUnit.targetRotation / .direction: heading the hull is still turning toward,
+    // and its angular velocity (ramped by [movement] turnAcceleration).
+    float targetFacing = 0, turnVel = 0;
+    bool hasFacingTarget = false;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
