@@ -1,0 +1,5 @@
+out/obj/
+out/*.exe
+out/*.dll
+out/*.txt
+build.log
