@@ -107,6 +107,21 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
     DrawRectangleLines(0, 0, g.map.worldW(), g.map.worldH(), BLACK);
 }
 
+// Draw one frame of a horizontal sprite-sheet (RWX total_frames) centered at pos, rotated rotDeg (clockwise).
+static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2 pos, float targetW, float rotDeg, Color col) {
+    if (frames < 1) frames = 1;
+    if (frame < 0 || frame >= frames) frame = 0;
+    float fw = tex.width / (float)frames;
+    Rectangle src{ frame * fw, 0, fw, (float)tex.height };
+    float w = targetW, h = targetW * (tex.height / (fw > 0 ? fw : 1));
+    Rectangle dst{ pos.x, pos.y, w, h };
+    Vector2 org{ w / 2, h / 2 };
+    DrawTexturePro(tex, src, dst, org, rotDeg, col);
+}
+
+// RWX sprites face up (north); screen angle a (y-down) maps to raylib clockwise rotation a_deg + 90.
+static float spriteRot(float angleRad) { return angleRad * 180.0f / 3.14159265f + 90.0f; }
+
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
@@ -116,20 +131,15 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (u.underConstruction && u.tpl->isBuilding) col = Color{ 255, 255, 255, 140 };
     if (t.isStatic()) col = Fade(col, 1.0f);
 
+    int frames = std::max(1, t.totalFrames);
+    int anim = frames > 1 ? (int)(GetTime() * 5.0f) % frames : 0;
+
     Texture2D tex;
     Vector2 pv{ u.pos.x, u.pos.y };
     if (loaded(t, 0, tex)) {
-        float w = scale, h = scale * (tex.height / (float)std::max(1, tex.width));
-        // body rotation for moving units (tanks), buildings drawn upright
-        float rot = (t.isStatic() || t.isFixedFiring) ? 0 : -(u.facing * 180.0f / 3.14159265f) - 90.0f;
-        if (t.imageTurret.empty() || t.imageTurret == "NONE") {
-            // combined sprite: rotate whole thing to facing
-            rot = -(u.facing * 180.0f / 3.14159265f) - 90.0f;
-            if (t.isStatic()) rot = 0;
-        } else rot = -(u.facing * 180.0f / 3.14159265f) - 90.0f;
-        if (t.isStatic()) rot = 0;
-        Vector2 org{ w / 2, h / 2 };
-        DrawTextureEx(tex, Vector2{ pv.x - org.x, pv.y - org.y }, rot, w / tex.width, col);
+        int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
+        float rot = t.isStatic() ? 0 : spriteRot(u.facing);
+        drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale, rot, col);
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
     }
@@ -137,16 +147,14 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!t.imageTurret.empty() && t.imageTurret != "NONE") {
         Texture2D tur;
         if (loaded(t, 1, tur)) {
-            float ts = scale * 0.7f;
-            Vector2 org{ tur.width / 2.0f * (ts / tur.width), tur.height / 2.0f * (ts / tur.width) };
-            float rot = -(u.turretRot * 180.0f / 3.14159265f) - 90.0f;
-            DrawTextureEx(tur, Vector2{ pv.x - org.x, pv.y - org.y }, rot, ts / tur.width, col);
+            int ef = (frames > 1 && tur.width % frames == 0) ? frames : 1;
+            float rot = spriteRot(u.turretRot);
+            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, pv, scale * 0.7f * t.turretImageScale, rot, col);
         }
     }
     // team ring under selection
     if (u.selected) {
-        DrawCircleV(pv, r + 3, Color{ 60, 220, 90, 255 });
-        DrawCircleLines((int)u.pos.x, (int)u.pos.y, r + 3, Color{ 60, 220, 90, 255 });
+        DrawCircleLines((int)pv.x, (int)pv.y, r + 3, Color{ 60, 220, 90, 255 });
     }
     // hp bar
     if (u.hp < u.maxHp || u.selected || t.isBuilding) {

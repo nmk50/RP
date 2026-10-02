@@ -2,4 +2,6 @@ out/obj/
 out/*.exe
 out/*.dll
 out/*.txt
+out/*.png
+out/*.ps1
 build.log
