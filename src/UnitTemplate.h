@@ -9,6 +9,10 @@ enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF };
 
 struct TurretTpl {
     float x = 0, y = 0;
+    // RWX [turret_N]: size/barrelY = muzzle distance along the aim (defaults to [attack] turretSize),
+    // barrelX = lateral offset, image_drawOffsetX/Y = turret sprite shift relative to the pivot.
+    float barrelY = -1, barrelX = 0;
+    float drawOffsetX = 0, drawOffsetY = 0;
     int projectile = 0;      // index into projectiles (1-based like RWX, 0 = none/nano)
     bool invisible = false;
     bool canShoot = true;
@@ -76,11 +80,13 @@ struct UnitTemplate {
     std::vector<UnitAction> actions;
 
     bool placeOnlyOnResPool = false;
+    bool placeOnlyOnWater = false; // RWX SeaFactory: must sit on water
     float creditIncomeRate = 0; // for extractors
     bool useAsBuilder = false, useAsAttacker = false, useAsHarvester = false;
 
     // resolved texture id (raylib), -1 until loaded / missing
     int texId = -1, texWreakId = -1, texTurretId = -1;
+    mutable int texFrameWpx = 0; // body sprite frame width in px (set by renderer, for pivot scaling)
 
     bool blocksGround() const { return moveType == MoveType::NONE; } // buildings/static
     bool isStatic() const { return moveType == MoveType::NONE; }

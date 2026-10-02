@@ -61,6 +61,12 @@ public:
         const MapTile& t = tiles[y * w + x];
         return !(t.water || t.lava || t.blocked) && !occupied(x, y);
     }
+    // RWX BaseBuilding: seaFactory / water-movement buildings must sit on water
+    bool canPlaceWaterBuilding(int x, int y) const {
+        if (!inBounds(x, y)) return false;
+        const MapTile& t = tiles[y * w + x];
+        return t.water && !t.lava && !occupied(x, y);
+    }
 
     bool loadTmx(const std::string& path, std::string* err = nullptr);
 };

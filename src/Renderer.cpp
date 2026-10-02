@@ -144,6 +144,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (loaded(t, 0, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
         baseFrameW = tex.width / (float)ef;
+        t.texFrameWpx = (int)baseFrameW;
         float rot = t.isStatic() ? 0 : spriteRot(u.facing);
         drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale, rot, col);
     } else {
@@ -158,7 +159,17 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             const TurretTpl& tt = t.turrets.empty() ? kZeroTurret : t.turrets[0];
             float k = baseFrameW > 0 ? (scale * t.imageScale) / baseFrameW : 1.0f;
             Vec2 tp = turretPivot(u, tt, k);
-            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, scale * 0.7f * t.turretImageScale, rot, col);
+            // RWX GameViewUtils: turret keeps its own native aspect vs the body (turretImageScale, not body scale)
+            float turW = baseFrameW > 0
+                ? (tur.width / (float)ef) * t.turretImageScale * (scale / baseFrameW)
+                : scale * 0.7f * t.turretImageScale;
+            // image_drawOffsetX/Y shifts the turret sprite along aim / perpendicular in sprite space
+            if (tt.drawOffsetX != 0 || tt.drawOffsetY != 0) {
+                float a = u.turretRot;
+                Vec2 aim{ std::cos(a), std::sin(a) }, right{ -std::sin(a), std::cos(a) };
+                tp = tp + (aim * tt.drawOffsetY - right * tt.drawOffsetX) * k;
+            }
+            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, turW, rot, col);
         }
     }
     // team ring under selection

@@ -191,7 +191,7 @@ static void handlePlacement(Game& g, Vec2 world) {
         int minx = tx + t->footL, miny = ty + t->footU;
         bool ok = true;
         for (int y = miny; y < miny + fh && ok; ++y) for (int x = minx; x < minx + fw && ok; ++x)
-            if (!g.map.inBounds(x, y) || !g.map.canPlaceBuilding(x, y)) ok = false;
+            if (!g.map.inBounds(x, y) || !(t->placeOnlyOnWater ? g.map.canPlaceWaterBuilding(x, y) : g.map.canPlaceBuilding(x, y))) ok = false;
         if (ok && !g.buildingSpotFree(Vec2{ (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE }, *t)) ok = false;
         // RWX: ghost turns red off the resource pool (center-tile rule, same as orderBuild)
         if (ok && t->placeOnlyOnResPool && !(g.map.inBounds(tx, ty) && g.map.at(tx, ty).resource)) ok = false;
@@ -216,6 +216,7 @@ int main() {
     SetTraceLogCallback(LogToFile);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(SW, SH, "RP - Rusted Warfare C++ remake");
+    SetExitKey(KEY_NULL); // ESC cancels placement, must not close the window
     SetTargetFPS(120);
 
     g_assetsRoot = "../assets";

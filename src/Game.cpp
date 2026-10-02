@@ -245,7 +245,7 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     int fw = tpl->footprintTilesW(), fh = tpl->footprintTilesH();
     int minx = tx + tpl->footL, miny = ty + tpl->footU;
     for (int y = miny; y < miny + fh; ++y) for (int x = minx; x < minx + fw; ++x)
-        if (!map.inBounds(x, y) || !map.canPlaceBuilding(x, y)) return false;
+        if (!map.inBounds(x, y) || !(tpl->placeOnlyOnWater ? map.canPlaceWaterBuilding(x, y) : map.canPlaceBuilding(x, y))) return false;
     if (tpl->placeOnlyOnResPool) {
         // RWX ResourceExtractor.canPlaceAtCurrentPosition: only the center tile must be a resource pool
         if (!map.inBounds(tx, ty) || !map.at(tx, ty).resource) return false;
@@ -257,6 +257,20 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     if (bid < 0) { reward(b->team, tpl->price); return false; }
     b->constructingId = bid;
     return true;
+}
+
+// nearest water tile to `from` within `radiusPx` (ships must launch from water)
+static Vec2 findWaterSpawn(Game& g, Vec2 from, float radiusPx) {
+    int cx = (int)(from.x / TILE_SIZE), cy = (int)(from.y / TILE_SIZE);
+    int r = (int)(radiusPx / TILE_SIZE) + 1;
+    float best = 1e18f; Vec2 bp = from;
+    for (int y = cy - r; y <= cy + r; ++y) for (int x = cx - r; x <= cx + r; ++x) {
+        if (!g.map.inBounds(x, y) || !g.map.at(x, y).water) continue;
+        Vec2 p{ (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE };
+        float d = from.dist(p);
+        if (d < best) { best = d; bp = p; }
+    }
+    return bp;
 }
 
 bool Game::orderProduce(int factoryId, const std::string& unitName) {
@@ -349,6 +363,7 @@ void Game::updateUnit(Unit& u) {
         if (u.prodProgress >= 1.0f) {
             u.prodProgress = 0; std::string name = u.prodQueue.front(); u.prodQueue.erase(u.prodQueue.begin());
             Vec2 sp = u.hasRally ? u.rallyPoint : u.pos + Vec2{ 0, (tpl.footprintTilesH() / 2 + 1.5f) * TILE_SIZE };
+            if (item && item->isWaterUnit()) sp = findWaterSpawn(*this, sp, tpl.radius + TILE_SIZE * 2.0f);
             spawnUnit(name, u.team, sp);
         }
     }
@@ -513,9 +528,12 @@ void Game::fire(Unit& u, Unit& target) {
     if (pi < 0) { pt.directDamage = 10; pt.speed = 6; pt.life = 60; }
     Projectile p;
     Vec2 aim{ std::cos(u.turretRot), std::sin(u.turretRot) };
-    // RWX barrel tip = turret pivot + aim * barrelY (defaults to [core] turretSize)
-    float barrel = tpl.turretSize > 0 ? tpl.turretSize : tpl.radius * 0.8f;
-    p.pos = turretPivot(u, tur, 1.0f) + aim * barrel;
+    Vec2 right{ -aim.y, aim.x };
+    // RWX CustomUnit.D(i): muzzle = pivot + aim*barrelY + right*barrelX; barrelY defaults to [attack] turretSize.
+    // Offsets are sprite px; scale with the drawn body (renderer uses k = displayRadius*2*imageScale / frameW).
+    float barrelY = tur.barrelY >= 0 ? tur.barrelY : (tpl.turretSize > 0 ? tpl.turretSize : tpl.radius * 0.8f);
+    float k = tpl.texFrameWpx > 0 ? (tpl.displayRadius * 2.0f * tpl.imageScale) / tpl.texFrameWpx : 1.0f;
+    p.pos = turretPivot(u, tur, k) + (aim * barrelY + right * tur.barrelX) * k;
     p.team = u.team; p.sourceId = u.id; p.targetId = target.id; p.dest = target.pos;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
     p.speed = pt.speed; p.life = pt.life; p.frame = pt.frame; p.drawSize = pt.drawSize;

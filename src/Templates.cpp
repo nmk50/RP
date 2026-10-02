@@ -95,6 +95,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         auto fp = parseCSV(c->get("footprint", c->get("constructionfootprint", "0,0,0,0")));
         if (fp.size() >= 4) { t.footL = (int)fp[0]; t.footU = (int)fp[1]; t.footR = (int)fp[2]; t.footD = (int)fp[3]; }
         t.placeOnlyOnResPool = c->getBool("placeonlyonrespool", c->getBool("placeonlyonrespools", c->getBool("placeonlyonresource", false)));
+        t.placeOnlyOnWater = c->getBool("placeonlyonwater", false);
         std::string gen = c->get("generation_resources");
         if (gen.empty()) gen = c->get("resourcegeneration");
         // "credits=8" -> 8
@@ -204,6 +205,11 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             const IniSection& s = *e.second;
             tt.x = (float)s.getNum("x", 0);
             tt.y = (float)s.getNum("y", 0);
+            // RWX TurretConfig: size is an alias of barrelY; default barrelY = [attack] turretSize (-1 sentinel)
+            tt.barrelY = s.getNum("barrely", s.getNum("size", -1));
+            tt.barrelX = (float)s.getNum("barrelx", 0);
+            tt.drawOffsetX = (float)s.getNum("image_drawoffsetx", 0);
+            tt.drawOffsetY = (float)s.getNum("image_drawoffsety", 0);
             tt.projectile = (int)s.getNum("projectile", 0);
             tt.invisible = s.getBool("invisible", false);
             tt.canShoot = s.getBool("canshoot", true);
