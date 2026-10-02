@@ -95,6 +95,15 @@ bool Game::init(const std::string& mapPath, std::string* err) {
 Unit* Game::get(int id) { for (auto& u : units) if (u.id == id) return &u; return nullptr; }
 const Unit* Game::get(int id) const { for (auto& u : units) if (u.id == id) return &u; return nullptr; }
 
+// RW: building tiles get path cost -1; mark/unmark footprint tiles
+static void markBuildingOcc(TileMap& map, const Unit& u, int delta) {
+    if (!u.tpl || !u.tpl->isStatic()) return;
+    int cx = (int)(u.pos.x / TILE_SIZE), cy = (int)(u.pos.y / TILE_SIZE);
+    for (int y = cy + u.tpl->footU; y <= cy + u.tpl->footD; ++y)
+        for (int x = cx + u.tpl->footL; x <= cx + u.tpl->footR; ++x)
+            map.markOcc(x, y, delta);
+}
+
 int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underConstruction) {
     const UnitTemplate* tpl = g_templates.find(ToLower(tplKey));
     if (!tpl) return -1;
@@ -104,11 +113,13 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.tpl = tpl;
     u.team = team;
     u.pos = pos;
+    u.prevPos = pos;
     u.hp = u.maxHp = tpl->maxHp;
     u.footprint[0] = tpl->footL; u.footprint[1] = tpl->footU; u.footprint[2] = tpl->footR; u.footprint[3] = tpl->footD;
     u.turretRot = -1.5708f;
     u.underConstruction = underConstruction;
     units.push_back(u);
+    if (tpl->isStatic()) markBuildingOcc(map, units.back(), +1);
     return u.id;
 }
 
@@ -116,18 +127,63 @@ bool Game::canAfford(int team, float cost) { Team* t = teamOf(*this, team); retu
 void Game::spend(int team, float cost) { Team* t = teamOf(*this, team); if (t) t->credits -= cost; }
 void Game::reward(int team, float credits) { Team* t = teamOf(*this, team); if (t) t->credits += credits; }
 
+static bool passableAt(Game& g, Vec2 p, MoveType mt) {
+    int x = (int)(p.x / TILE_SIZE), y = (int)(p.y / TILE_SIZE);
+    switch (mt) {
+        case MoveType::AIR: case MoveType::HOVER: return g.map.inBounds(x, y);
+        case MoveType::WATER: return g.map.walkableWater(x, y);
+        default: return g.map.walkableLand(x, y);
+    }
+}
+
+// Bresenham-style straight-line check; RW skips A* entirely when this passes
+static bool losClear(Game& g, Vec2 a, Vec2 b, MoveType mt) {
+    float d = a.dist(b);
+    int n = (int)(d / (TILE_SIZE * 0.5f)) + 1;
+    for (int i = 0; i <= n; ++i) {
+        float t = (float)i / n;
+        Vec2 p{ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t };
+        if (!passableAt(g, p, mt)) return false;
+    }
+    return true;
+}
+
 static void computePath(Game& g, Unit& u, Vec2 target) {
+    MoveType mt = u.tpl->moveType;
+    u.moveGoal = target; u.hasGoal = true; u.repathTimer = 30; u.stuckTimer = 0;
+    u.path.clear(); u.pathIdx = 0;
+    if (mt == MoveType::AIR || mt == MoveType::HOVER) { u.path.push_back(target); return; }
+    if (losClear(g, u.pos, target, mt)) {
+        Vec2 d = target - u.pos; float len = d.len();
+        int n = (int)(len / TILE_SIZE);
+        for (int i = 1; i <= n; ++i) {
+            float k = (float)i * TILE_SIZE;
+            if (k >= len) break;
+            u.path.push_back(u.pos + d * (k / len));
+        }
+        u.path.push_back(target); // last waypoint = exact click point (RW :4216-4231)
+        return;
+    }
     int sx = (int)(u.pos.x / TILE_SIZE), sy = (int)(u.pos.y / TILE_SIZE);
     int gx = (int)(target.x / TILE_SIZE), gy = (int)(target.y / TILE_SIZE);
-    u.path = findPath(g.map, sx, sy, gx, gy, u.tpl->moveType);
-    u.pathIdx = 0;
+    u.path = findPath(g.map, sx, sy, gx, gy, mt);
+    if (u.path.empty()) { u.hasGoal = false; return; }
+    if (passableAt(g, target, mt)) u.path.back() = target;
 }
 
 void Game::orderMove(std::vector<int> ids, Vec2 target) {
+    int k = 0;
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic()) continue;
         u->orderTargetId = -1; u->attackMove = false; u->constructingId = -1; u->targetUnitId = -1;
-        computePath(*this, *u, target);
+        Vec2 t = target;
+        if (k > 0) { // RW formation scatter: golden-angle offsets around the click point
+            float ang = (float)k * 2.39996f;
+            float rad = 6.0f + u->tpl->radius * 1.5f * std::sqrt((float)k);
+            t = target + Vec2{ std::cos(ang) * rad, std::sin(ang) * rad };
+        }
+        computePath(*this, *u, t);
+        k++;
     }
 }
 
@@ -191,6 +247,20 @@ bool Game::orderProduce(int factoryId, const std::string& unitName) {
     return true;
 }
 
+bool Game::orderUpgrade(int unitId, int actionIdx) {
+    Unit* u = get(unitId);
+    if (!u || !u->tpl || u->underConstruction || u->upgradeIdx >= 0) return false;
+    const auto& acts = u->tpl->actions;
+    if (actionIdx < 0 || actionIdx >= (int)acts.size()) return false;
+    const UnitAction& a = acts[actionIdx];
+    if (!g_templates.find(ToLower(a.convertTo))) return false;
+    if (!canAfford(u->team, a.price)) return false;
+    spend(u->team, a.price);
+    u->upgradeIdx = actionIdx;
+    u->upgradeProgress = 0;
+    return true;
+}
+
 std::vector<Unit*> Game::selectedUnits() { std::vector<Unit*> r; for (auto& u : units) if (u.selected) r.push_back(&u); return r; }
 
 std::vector<Unit*> Game::findUnitsInRect(int team, Vec2 a, Vec2 b) {
@@ -236,9 +306,11 @@ void Game::update() {
         }
     }
     for (auto& e : effects) { e.t += 1.0f / TICK_RATE; if (e.t >= e.dur) e.dead = true; }
+    for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
     units.erase(std::remove_if(units.begin(), units.end(), [](const Unit& u) { return u.dead; }), units.end());
     projectiles.erase(std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.dead; }), projectiles.end());
     effects.erase(std::remove_if(effects.begin(), effects.end(), [](const Effect& e) { return e.dead; }), effects.end());
+    particles.erase(std::remove_if(particles.begin(), particles.end(), [](const Particle& p) { return p.dead; }), particles.end());
     if (tick % 30 == 0) runAI();
     checkWinLoss();
 }
@@ -273,6 +345,43 @@ void Game::updateUnit(Unit& u) {
                 float rate = (tpl.nanoBuildSpeed > 0 ? tpl.nanoBuildSpeed : 1.0f) * target;
                 bs->buildProgress = std::min(1.0f, bs->buildProgress + rate);
                 if (bs->buildProgress >= 1.0f) bs->underConstruction = false;
+                // nano particle: builder -> building, every 5 ticks (RW OrderableUnit nano effect)
+                if (tick % 5 == 0 && particles.size() < 100) {
+                    Vec2 tp = bs->pos + Vec2{ g_rng.range(-8, 8), g_rng.range(-8, 8) };
+                    Vec2 dd = tp - u.pos;
+                    float spd = g_rng.range(2, 4);
+                    Particle p;
+                    p.pos = u.pos;
+                    p.vel = dd * (spd / std::max(dd.len(), 0.001f));
+                    p.dur = std::min(60.0f, dd.len() / spd);
+                    particles.push_back(p);
+                }
+            }
+        }
+    }
+
+    // self upgrade action progress (RWX [action_upgrade*]: converts the unit in place)
+    if (u.upgradeIdx >= 0) {
+        if (u.upgradeIdx >= (int)tpl.actions.size()) u.upgradeIdx = -1;
+        else {
+            const UnitAction& a = tpl.actions[u.upgradeIdx];
+            u.upgradeProgress += a.buildSpeed;
+            if (u.upgradeProgress >= 1.0f) {
+                const UnitTemplate* nt = g_templates.find(ToLower(a.convertTo));
+                if (nt) {
+                    float frac = u.maxHp > 0 ? u.hp / u.maxHp : 1.0f;
+                    bool wasStatic = u.isStatic();
+                    if (wasStatic) markBuildingOcc(map, u, -1);
+                    u.tpl = nt;
+                    u.tplKey = ToLower(nt->name);
+                    u.maxHp = nt->maxHp;
+                    u.hp = nt->maxHp * frac;
+                    u.footprint[0] = nt->footL; u.footprint[1] = nt->footU; u.footprint[2] = nt->footR; u.footprint[3] = nt->footD;
+                    if (nt->isStatic()) markBuildingOcc(map, u, +1);
+                    effects.push_back({ u.pos, 0, 0.4f, nt->radius * 1.5f, false });
+                }
+                u.upgradeIdx = -1;
+                u.upgradeProgress = 0;
             }
         }
     }
@@ -291,15 +400,48 @@ void Game::updateUnit(Unit& u) {
     }
     Unit* tgt = combatTarget >= 0 ? get(combatTarget) : nullptr;
 
+    if (!u.isStatic() && u.repathTimer > 0) u.repathTimer--;
     if (!u.isStatic() && u.pathIdx < (int)u.path.size()) {
         Vec2 wp = u.path[u.pathIdx];
-        Vec2 d = wp - u.pos; float dist = d.len(); float sp = tpl.moveSpeed;
-        if (dist <= sp + 1.0f) { u.pathIdx++; if (u.pathIdx >= (int)u.path.size()) { u.path.clear(); u.pathIdx = 0; } }
-        else {
-            u.pos = u.pos + d.norm() * sp; u.animFrame += 0.2f;
-            float want = std::atan2(d.y, d.x);
-            u.facing = lerpAngle(u.facing, want, tpl.maxTurnSpeed * 0.05236f);
+        bool last = u.pathIdx + 1 >= (int)u.path.size();
+        float sp = tpl.moveSpeed;
+        float dist = wp.dist(u.pos);
+        float arrive = last ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7
+        if (dist <= std::max(arrive, sp)) {
+            u.pathIdx++;
+            if (u.pathIdx >= (int)u.path.size()) { u.path.clear(); u.pathIdx = 0; u.hasGoal = false; }
+        } else {
+            // early switch when the next waypoint is already nearer (RW :2832-2839)
+            if (!last) {
+                Vec2 nx = u.path[u.pathIdx + 1];
+                if (nx.dist(u.pos) < dist - 1.0f) { u.pathIdx++; wp = u.path[u.pathIdx]; last = u.pathIdx + 1 >= (int)u.path.size(); dist = wp.dist(u.pos); }
+            }
+            Vec2 dir = (wp - u.pos).norm();
+            // wall sliding (RW applyPositionChange); if trapped on a blocked tile, allow escape
+            Vec2 np = u.pos + dir * sp;
+            bool trapped = !passableAt(*this, u.pos, tpl.moveType);
+            if (trapped || passableAt(*this, np, tpl.moveType)) u.pos = np;
+            else {
+                Vec2 nxp{ np.x, u.pos.y }, nyp{ u.pos.x, np.y };
+                if (passableAt(*this, nxp, tpl.moveType)) u.pos = nxp;
+                else if (passableAt(*this, nyp, tpl.moveType)) u.pos = nyp;
+            }
+            u.animFrame += 0.2f;
+            // body turns toward the waypoint at maxTurnSpeed deg/tick (RW rotateToward)
+            float want = std::atan2(dir.y, dir.x);
+            float diff = want - u.facing;
+            while (diff > 3.14159265f) diff -= 6.2831853f;
+            while (diff < -3.14159265f) diff += 6.2831853f;
+            float step = tpl.maxTurnSpeed * 0.0174533f;
+            u.facing += std::max(-step, std::min(step, diff));
+            // stuck recovery (RW blockedRecoveryTime / pathRetryTimer)
+            if (u.pos.dist(u.prevPos) < 0.35f) u.stuckTimer++; else u.stuckTimer = 0;
+            u.prevPos = u.pos;
+            if (u.stuckTimer > 200 && dist < 60.0f) { u.stuckTimer = 0; if (!last) u.pathIdx++; }
+            else if (u.stuckTimer > 90 && u.repathTimer <= 0) { u.stuckTimer = 0; computePath(*this, u, u.hasGoal ? u.moveGoal : wp); }
         }
+    } else if (!u.isStatic() && u.hasGoal && u.repathTimer <= 0 && u.pos.dist(u.moveGoal) > 8.0f) {
+        computePath(*this, u, u.moveGoal); // retry after blockage cleared
     }
 
     if (u.shootCooldown > 0) u.shootCooldown -= 1;
@@ -312,7 +454,7 @@ void Game::updateUnit(Unit& u) {
     }
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;
-    if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f)
+    if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f)
         computePath(*this, u, tgt->pos);
 }
 
@@ -362,6 +504,7 @@ void Game::damage(Unit& target, float dmg) {
 void Game::killUnit(Unit& u) {
     if (u.dead) return;
     u.dead = true;
+    if (u.tpl && u.tpl->isStatic()) markBuildingOcc(map, u, -1);
     bool big = u.tpl && u.tpl->radius > 20;
     effects.push_back({ u.pos, 0, big ? 0.6f : 0.35f, u.tpl ? u.tpl->radius * 1.2f : 12, big });
     for (auto& o : units) { if (o.orderTargetId == u.id) o.orderTargetId = -1; if (o.constructingId == u.id) o.constructingId = -1; }

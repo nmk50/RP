@@ -150,6 +150,7 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
     }
     if (w <= 0 || h <= 0) { if (err) *err = "bad dims"; return false; }
     tiles.assign((size_t)w * h, MapTile{});
+    buildOcc.assign((size_t)w * h, 0);
 
     std::string base = dirName(path);
     std::vector<TileSetInfo> sets;

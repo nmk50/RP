@@ -128,7 +128,9 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     float r = std::max(6.0f, t.displayRadius);
     float scale = (r * 2.0f);
     Color col = WHITE;
-    if (u.underConstruction && u.tpl->isBuilding) col = Color{ 255, 255, 255, 140 };
+    // RW BaseBuilding.java:301 unfinished buildings tint green with alpha ramp 40->240
+    if (u.underConstruction && u.tpl->isBuilding)
+        col = Color{ 140, 255, 140, (uint8_t)(40 + 200 * std::max(0.0f, std::min(1.0f, u.buildProgress))) };
     if (t.isStatic()) col = Fade(col, 1.0f);
 
     int frames = std::max(1, t.totalFrames);
@@ -169,6 +171,13 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             DrawRectangle((int)p.x, (int)p.y + 5, (int)(bw * bp), 3, Color{ 240, 220, 90, 255 });
         }
     }
+    // upgrade-in-progress bar (RWX self action queue)
+    if (u.upgradeIdx >= 0) {
+        float bw = r * 2.0f;
+        Vector2 p{ pv.x - r, pv.y - (r + 13) };
+        DrawRectangle((int)p.x, (int)p.y, (int)bw, 3, Color{ 30, 30, 30, 200 });
+        DrawRectangle((int)p.x, (int)p.y, (int)(bw * std::min(1.0f, u.upgradeProgress)), 3, Color{ 60, 200, 210, 255 });
+    }
 }
 
 void Renderer::drawWorld(Game& g, const ViewState& view) {
@@ -191,6 +200,14 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         float rad = e.radius * (0.5f + prog);
         Color ec = Color{ (uint8_t)(255), (uint8_t)(200 - 120 * prog), (uint8_t)(120 - 100 * prog), (uint8_t)(220 * (1 - prog)) };
         DrawCircleV(Vector2{ e.pos.x, e.pos.y }, rad, ec);
+    }
+    // nano build particles (green flecks flying builder -> building, RW effects.png frame 6)
+    for (auto& p : g.particles) {
+        float prog = p.dur > 0 ? std::min(1.0f, p.t / p.dur) : 1.0f;
+        float rad = 2.5f + 10.0f * prog;
+        uint8_t a = (uint8_t)(200 * (1 - prog));
+        Color pc = p.reclaim ? Color{ 200, 40, 40, a } : Color{ 80, 200, 40, a };
+        DrawCircleV(Vector2{ p.pos.x, p.pos.y }, rad, pc);
     }
     // command marker
     if (view.cmdMarkerOn) {

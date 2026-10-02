@@ -28,6 +28,7 @@ class TileMap {
 public:
     int w = 0, h = 0;
     std::vector<MapTile> tiles; // w*h
+    std::vector<int> buildOcc;  // per-tile count of buildings occupying it (RW: cost -1)
     std::vector<SpawnPoint> spawns;
     std::string name;
 
@@ -35,13 +36,20 @@ public:
     const MapTile& at(int x, int y) const { return tiles[y * w + x]; }
     bool inBounds(int x, int y) const { return x >= 0 && y >= 0 && x < w && y < h; }
 
+    void setSize(int nw, int nh) { w = nw; h = nh; tiles.assign((size_t)w * h, MapTile{}); buildOcc.assign((size_t)w * h, 0); }
+    void markOcc(int x, int y, int delta) { if (inBounds(x, y) && (size_t)y * w + x < buildOcc.size()) buildOcc[(size_t)y * w + x] += delta; }
+    bool occupied(int x, int y) const {
+        if (!inBounds(x, y) || (size_t)y * w + x >= buildOcc.size()) return false;
+        return buildOcc[(size_t)y * w + x] > 0;
+    }
+
     float worldW() const { return (float)w * TILE_SIZE; }
     float worldH() const { return (float)h * TILE_SIZE; }
 
     bool walkableLand(int x, int y) const {
         if (!inBounds(x, y)) return false;
         const MapTile& t = tiles[y * w + x];
-        return !(t.water || t.lava || t.blocked);
+        return !(t.water || t.lava || t.blocked) && !occupied(x, y);
     }
     bool walkableAir(int x, int y) const { return inBounds(x, y); }
     bool walkableWater(int x, int y) const {
@@ -51,7 +59,7 @@ public:
     bool canPlaceBuilding(int x, int y) const {
         if (!inBounds(x, y)) return false;
         const MapTile& t = tiles[y * w + x];
-        return !(t.water || t.lava || t.blocked);
+        return !(t.water || t.lava || t.blocked) && !occupied(x, y);
     }
 
     bool loadTmx(const std::string& path, std::string* err = nullptr);

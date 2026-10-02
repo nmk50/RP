@@ -32,6 +32,15 @@ struct Unit {
     bool dead = false;
     float animFrame = 0;
     int footprint[4] = { 0,0,0,0 };
+    // self upgrade action (RWX [action_upgrade*])
+    int upgradeIdx = -1;
+    float upgradeProgress = 0;
+    // movement state (RWX-style follow/repath/stuck recovery)
+    Vec2 moveGoal;
+    bool hasGoal = false;
+    int repathTimer = 0;
+    int stuckTimer = 0;
+    Vec2 prevPos;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
@@ -56,6 +65,14 @@ struct Effect {
     Vec2 pos; float t = 0, dur = 0.3f; float radius = 10; bool large = false; bool dead = false;
 };
 
+// nano build particle: flies from builder to the target building (RWX OrderableUnit nano effect)
+struct Particle {
+    Vec2 pos, vel;
+    float t = 0, dur = 20;
+    bool reclaim = false; // red when reclaiming, green when building
+    bool dead = false;
+};
+
 struct Team {
     int id = 0;
     std::string name;
@@ -71,6 +88,7 @@ public:
     std::vector<Unit> units;
     std::vector<Projectile> projectiles;
     std::vector<Effect> effects;
+    std::vector<Particle> particles;
     std::vector<Team> teams;
     long tick = 0;
     bool gameOver = false;
@@ -94,6 +112,7 @@ public:
     void orderStop(std::vector<int> ids);
     bool orderBuild(int builderId, const std::string& unitName, int tx, int ty);
     bool orderProduce(int factoryId, const std::string& unitName);
+    bool orderUpgrade(int unitId, int actionIdx);
     bool buildingSpotFree(Vec2 center, const UnitTemplate& t) const;
     bool canAfford(int team, float cost);
     void spend(int team, float cost);

@@ -103,6 +103,50 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         parseBuildLinks(*c, "canBuild", t.canBuild);
         parseBuildLinks(*c, "builtFrom", t.builtFrom);
     }
+    // self actions: [action_upgradeT2] sections and core action_N_* keys (RWX upgrade form)
+    {
+        auto parseSpeed = [](const std::string& v, float def) -> float {
+            std::string s = ToLower(Trim(v));
+            if (!s.empty() && s.back() == 's') { float secs = (float)atof(s.c_str()); return secs > 0 ? 1.0f / (secs * TICK_RATE) : def; }
+            try { return (float)std::stof(s); } catch (...) { return def; }
+        };
+        for (IniSection* s : ini.startingWith("action_")) {
+            UnitAction a;
+            a.convertTo = Trim(s->get("convertto"));
+            if (a.convertTo.empty()) continue;
+            a.price = (float)s->getNum("price", 0);
+            a.buildSpeed = parseSpeed(s->get("buildspeed", ""), 0.001f);
+            a.pos = (int)s->getNum("pos", 0);
+            a.text = s->get("text", "");
+            t.actions.push_back(a);
+        }
+        if (const IniSection* c2 = ini.find("core")) {
+            std::map<int, UnitAction> byIdx;
+            for (auto& kv : c2->kv) {
+                std::string lk = ToLower(kv.first);
+                if (lk.rfind("action_", 0) != 0) continue;
+                size_t p2 = lk.find('_', 7);
+                if (p2 == std::string::npos) continue;
+                int idx = atoi(lk.substr(7, p2 - 7).c_str());
+                if (idx <= 0) continue;
+                std::string key = lk.substr(p2 + 1);
+                UnitAction& a = byIdx[idx];
+                if (key == "convertto") a.convertTo = Trim(kv.second);
+                else if (key == "price") a.price = (float)atof(kv.second.c_str());
+                else if (key == "buildspeed") a.buildSpeed = parseSpeed(kv.second, 0.001f);
+                else if (key == "text") a.text = kv.second;
+                else if (key == "pos") a.pos = (int)atoi(kv.second.c_str());
+            }
+            for (auto& kv : byIdx) if (!kv.second.convertTo.empty()) t.actions.push_back(kv.second);
+        }
+        for (auto& a : t.actions) {
+            if (!a.text.empty() && a.text.rfind("i:", 0) != 0) continue; // literal label
+            size_t n = 0; while (n < a.convertTo.size() && n < t.name.size() && a.convertTo[n] == t.name[n]) n++;
+            std::string rest = a.convertTo.substr(n);
+            a.text = rest.empty() ? "Upgrade" : ("Upgrade " + rest);
+        }
+        std::sort(t.actions.begin(), t.actions.end(), [](const UnitAction& x, const UnitAction& y) { return x.pos < y.pos; });
+    }
     if (const IniSection* g = ini.find("graphics")) {
         t.image = g->get("image");
         t.imageWreak = g->get("image_wreak");

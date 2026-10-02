@@ -30,6 +30,15 @@ struct ProjectileTpl {
 
 struct BuildOption { std::string unitName; float pos = 1; };
 
+// [action_upgradeT2] / action_N_* self-actions, e.g. unit upgrades (RWX displayType:upgrade)
+struct UnitAction {
+    std::string convertTo;
+    std::string text;
+    float price = 0;
+    float buildSpeed = 0.001f; // per-tick progress
+    int pos = 0;
+};
+
 struct UnitTemplate {
     std::string name;
     std::string overrideName;
@@ -64,6 +73,7 @@ struct UnitTemplate {
     std::vector<ProjectileTpl> projectiles;
     std::vector<BuildOption> canBuild;
     std::vector<BuildOption> builtFrom;
+    std::vector<UnitAction> actions;
 
     bool placeOnlyOnResPool = false;
     float creditIncomeRate = 0; // for extractors

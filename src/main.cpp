@@ -114,29 +114,50 @@ static void renderHUD(Game& g, Camera2D& cam) {
         cam.target = { (m.x - mm.x) / sx, (m.y - mm.y) / sy };
     }
 
-    // ---- build / produce panel (bottom) ----
-    auto opts = buildableOptions(g);
-    if (!opts.empty()) {
+    // ---- build / produce / upgrade panel (bottom) ----
+    struct PBtn { bool upgrade; std::string label; float price; std::string key; };
+    std::vector<PBtn> btns;
+    for (auto* it : buildableOptions(g)) btns.push_back({ false, it->displayText, it->price, it->name });
+    for (auto* u : g.selectedUnits()) {
+        if (u->team != g.playerTeam() || !u->tpl) continue;
+        for (auto& a : u->tpl->actions) {
+            bool dup = false;
+            for (auto& o : btns) if (o.upgrade && o.key == a.convertTo) dup = true;
+            if (!dup) btns.push_back({ true, a.text, a.price, a.convertTo });
+        }
+    }
+    if (!btns.empty()) {
         Rectangle panel{ 8, SH - ui.panelH - 8, SW - 16 - mmW, ui.panelH };
         DrawRectangleRec(panel, Color{ 12, 16, 20, 210 });
         DrawRectangleLinesEx(panel, 1, GRAY);
         if (CheckCollisionPointRec(GetMousePosition(), panel)) ui.overPanel = true;
         float bw = 96, gap = 8;
         int cols = (int)((panel.width - 16) / (bw + gap));
-        for (size_t i = 0; i < opts.size(); ++i) {
-            const UnitTemplate* it = opts[i];
+        for (size_t i = 0; i < btns.size(); ++i) {
+            PBtn& b = btns[i];
             int cx = (int)i % cols, cy = (int)i / cols;
             Rectangle btn{ panel.x + 12 + cx * (bw + gap), panel.y + 34 + cy * 46, bw, 42 };
             bool hover = CheckCollisionPointRec(GetMousePosition(), btn) && !ui.overMinimap;
-            bool afford = me && me->credits >= it->price;
-            DrawRectangleRec(btn, afford ? (hover ? Color{ 60, 90, 120, 255 } : Color{ 40, 60, 85, 255 }) : Color{ 50, 40, 40, 255 });
+            bool afford = me && me->credits >= b.price;
+            Color base = b.upgrade ? Color{ 19, 101, 94, 255 } : Color{ 40, 60, 85, 255 };
+            Color hot = b.upgrade ? Color{ 39, 202, 189, 255 } : Color{ 60, 90, 120, 255 };
+            DrawRectangleRec(btn, afford ? (hover ? hot : base) : Color{ 50, 40, 40, 255 });
             DrawRectangleLinesEx(btn, 1, afford ? LIGHTGRAY : DARKGRAY);
-            std::string label = it->displayText.size() > 12 ? it->displayText.substr(0, 11) + "." : it->displayText;
+            std::string label = b.label.size() > 12 ? b.label.substr(0, 11) + "." : b.label;
             DrawText(label.c_str(), btn.x + 4, btn.y + 3, 14, afford ? WHITE : GRAY);
-            DrawText((std::to_string((int)it->price) + "$").c_str(), btn.x + 4, btn.y + 24, 14, afford ? Color{ 240, 220, 90, 255 } : GRAY);
+            DrawText((std::to_string((int)b.price) + "$").c_str(), btn.x + 4, btn.y + 24, 14, afford ? Color{ 240, 220, 90, 255 } : GRAY);
             if (hover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && afford) {
-                if (it->isBuilding) { ui.placing = true; ui.placingName = it->name; }
-                else { for (auto* u : g.selectedUnits()) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, it->name); }
+                if (b.upgrade) {
+                    for (auto* u : g.selectedUnits()) {
+                        if (!u->tpl) continue;
+                        for (size_t k = 0; k < u->tpl->actions.size(); ++k)
+                            if (ToLower(u->tpl->actions[k].convertTo) == ToLower(b.key)) { g.orderUpgrade(u->id, (int)k); break; }
+                    }
+                } else if (g_templates.find(ToLower(b.key)) && g_templates.find(ToLower(b.key))->isBuilding) {
+                    ui.placing = true; ui.placingName = b.key;
+                } else {
+                    for (auto* u : g.selectedUnits()) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, b.key);
+                }
             }
         }
         DrawText("Build / Production", panel.x + 8, panel.y + 8, 18, LIGHTGRAY);
@@ -188,7 +209,7 @@ int main() {
     std::string err;
     if (!game.init(MAP_PATH_DEFAULT, &err)) {
         TraceLog(LOG_WARNING, TextFormat("Map load failed: %s - using fallback terrain", err.c_str()));
-        game.map.w = 80; game.map.h = 60; game.map.tiles.assign(game.map.w * game.map.h, MapTile{});
+        game.map.setSize(80, 60);
         for (auto& t : game.map.tiles) t.color = TC_LAND;
         // carve a river
         for (int y = 0; y < game.map.h; ++y) { int wx = game.map.w / 2 + (int)(std::sin(y * 0.3f) * 4); for (int x = wx - 1; x <= wx + 1; ++x) if (game.map.inBounds(x, y)) { game.map.at(x, y).water = true; game.map.at(x, y).color = TC_WATER; } }
