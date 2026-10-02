@@ -94,7 +94,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.energyUse = (float)c->getNum("energyusage", 0);
         auto fp = parseCSV(c->get("footprint", c->get("constructionfootprint", "0,0,0,0")));
         if (fp.size() >= 4) { t.footL = (int)fp[0]; t.footU = (int)fp[1]; t.footR = (int)fp[2]; t.footD = (int)fp[3]; }
-        t.placeOnlyOnResPool = c->getBool("placeonlyonrespools", c->getBool("placeonlyonresource", false));
+        t.placeOnlyOnResPool = c->getBool("placeonlyonrespool", c->getBool("placeonlyonrespools", c->getBool("placeonlyonresource", false)));
         std::string gen = c->get("generation_resources");
         if (gen.empty()) gen = c->get("resourcegeneration");
         // "credits=8" -> 8

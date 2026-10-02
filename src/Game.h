@@ -111,7 +111,8 @@ public:
     // orders
     void orderMove(std::vector<int> ids, Vec2 target);
     void orderAttackMove(std::vector<int> ids, Vec2 target);
-    void orderAttackTarget(std::vector<int> ids, int targetId);
+    int  orderAttackTarget(std::vector<int> ids, int targetId); // returns #units assigned
+    bool orderConstruct(std::vector<int> builderIds, int buildingId);
     void orderStop(std::vector<int> ids);
     bool orderBuild(int builderId, const std::string& unitName, int tx, int ty);
     bool orderProduce(int factoryId, const std::string& unitName);

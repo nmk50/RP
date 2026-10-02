@@ -193,6 +193,8 @@ static void handlePlacement(Game& g, Vec2 world) {
         for (int y = miny; y < miny + fh && ok; ++y) for (int x = minx; x < minx + fw && ok; ++x)
             if (!g.map.inBounds(x, y) || !g.map.canPlaceBuilding(x, y)) ok = false;
         if (ok && !g.buildingSpotFree(Vec2{ (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE }, *t)) ok = false;
+        // RWX: ghost turns red off the resource pool (center-tile rule, same as orderBuild)
+        if (ok && t->placeOnlyOnResPool && !(g.map.inBounds(tx, ty) && g.map.at(tx, ty).resource)) ok = false;
         ui.placingValid = ok;
     }
 }
@@ -310,11 +312,21 @@ int main() {
             else {
                 auto sel = game.selectedUnits();
                 if (!sel.empty()) {
-                    // enemy at point?
+                    // enemy at point? (RWX-style generous click radius)
                     Unit* enemy = nullptr; float bd = 1e9f;
-                    for (auto& u : game.units) if (u.tpl && game.isEnemy(game.playerTeam(), u.team)) { float d = world.dist(u.pos); if (d < std::max(14.0f, u.tpl->radius) && d < bd) { bd = d; enemy = &u; } }
+                    for (auto& u : game.units) if (u.tpl && game.isEnemy(game.playerTeam(), u.team)) { float d = world.dist(u.pos); if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < bd) { bd = d; enemy = &u; } }
+                    // half-built friendly building with builders selected -> resume construction (RWX repair branch)
+                    Unit* site = nullptr; float sd = 1e9f;
+                    bool anyBuilder = false;
+                    for (auto* s : sel) if (s->tpl && s->tpl->isBuilder) anyBuilder = true;
+                    if (anyBuilder)
+                        for (auto& u : game.units) if (u.tpl && u.team == game.playerTeam() && u.tpl->isBuilding && u.underConstruction) {
+                            float d = world.dist(u.pos);
+                            if (d < std::max(24.0f, u.tpl->radius) && d < sd) { sd = d; site = &u; }
+                        }
                     std::vector<int> ids; for (auto* s : sel) ids.push_back(s->id);
-                    if (enemy) game.orderAttackTarget(ids, enemy->id);
+                    if (enemy && game.orderAttackTarget(ids, enemy->id) > 0) {} // attack order taken
+                    else if (site && game.orderConstruct(ids, site->id)) {}
                     else if (IsKeyDown(KEY_LEFT_CONTROL)) game.orderAttackMove(ids, world);
                     else game.orderMove(ids, world);
                     ui.markerOn = true; ui.markerPos = worldV; ui.markerT = 0;

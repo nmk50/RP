@@ -192,13 +192,36 @@ void Game::orderAttackMove(std::vector<int> ids, Vec2 target) {
     for (int id : ids) { Unit* u = get(id); if (u && u->tpl && !u->isStatic()) u->attackMove = true; }
 }
 
-void Game::orderAttackTarget(std::vector<int> ids, int targetId) {
-    Unit* tgt = get(targetId); if (!tgt) return;
+int Game::orderAttackTarget(std::vector<int> ids, int targetId) {
+    Unit* tgt = get(targetId); if (!tgt) return 0;
+    int assigned = 0;
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic() || !u->tpl->canAttack) continue;
         u->orderTargetId = targetId; u->attackMove = false; u->constructingId = -1;
-        if (u->pos.dist(tgt->pos) > u->tpl->attackRange * 0.9f) computePath(*this, *u, tgt->pos);
+        if (u->pos.dist(tgt->pos) > u->tpl->attackRange * 0.9f) {
+            // RWX engagement: stop at range instead of walking into the target
+            float stop = std::max(20.0f, u->tpl->attackRange * 0.8f - tgt->tpl->radius);
+            Vec2 away = (u->pos - tgt->pos).norm();
+            computePath(*this, *u, tgt->pos + away * stop);
+        }
+        assigned++;
     }
+    return assigned;
+}
+
+// resume construction of a half-built friendly building (RWX repair branch on right-click)
+bool Game::orderConstruct(std::vector<int> ids, int buildingId) {
+    Unit* bs = get(buildingId);
+    if (!bs || bs->dead || !bs->tpl || !bs->tpl->isBuilding) return false;
+    if (!bs->underConstruction || bs->buildProgress >= 1.0f) return false;
+    for (int id : ids) {
+        Unit* u = get(id);
+        if (!u || !u->tpl || !u->tpl->isBuilder || u->team != bs->team) continue;
+        u->constructingId = buildingId; u->orderTargetId = -1; u->attackMove = false;
+        u->path.clear(); u->pathIdx = 0; u->hasGoal = false;
+        return true; // one builder per site, like RWX
+    }
+    return false;
 }
 
 void Game::orderStop(std::vector<int> ids) {
@@ -224,10 +247,8 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     for (int y = miny; y < miny + fh; ++y) for (int x = minx; x < minx + fw; ++x)
         if (!map.inBounds(x, y) || !map.canPlaceBuilding(x, y)) return false;
     if (tpl->placeOnlyOnResPool) {
-        bool res = false;
-        for (int y = miny; y < miny + fh && !res; ++y) for (int x = minx; x < minx + fw && !res; ++x)
-            if (map.inBounds(x, y) && map.at(x, y).resource) res = true;
-        if (!res) return false;
+        // RWX ResourceExtractor.canPlaceAtCurrentPosition: only the center tile must be a resource pool
+        if (!map.inBounds(tx, ty) || !map.at(tx, ty).resource) return false;
     }
     Vec2 center{ (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE };
     if (!buildingSpotFree(center, *tpl)) return false;
@@ -360,6 +381,18 @@ void Game::updateUnit(Unit& u) {
         }
     }
 
+    // RWX: idle builders auto-acquire nearby unfinished friendly buildings
+    if (tpl.isBuilder && u.constructingId < 0 && u.path.empty() && !u.hasGoal && u.orderTargetId < 0 && tick % 20 == 0) {
+        Unit* best = nullptr; float bd = 260.0f;
+        for (auto& o : units) {
+            if (o.team != u.team || o.dead || !o.tpl || !o.tpl->isBuilding) continue;
+            if (!o.underConstruction || o.buildProgress >= 1.0f) continue;
+            float d = u.pos.dist(o.pos);
+            if (d < bd) { bd = d; best = &o; }
+        }
+        if (best) u.constructingId = best->id;
+    }
+
     // self upgrade action progress (RWX [action_upgrade*]: converts the unit in place)
     if (u.upgradeIdx >= 0) {
         if (u.upgradeIdx >= (int)tpl.actions.size()) u.upgradeIdx = -1;
@@ -457,8 +490,11 @@ void Game::updateUnit(Unit& u) {
     }
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;
-    if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f)
-        computePath(*this, u, tgt->pos);
+    if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f) {
+        float stop = std::max(20.0f, tpl.attackRange * 0.8f - tgt->tpl->radius);
+        Vec2 away = (u.pos - tgt->pos).norm();
+        computePath(*this, u, tgt->pos + away * stop);
+    }
 }
 
 // RWX turret pivot: [turret_N] x/y are sprite-space offsets (sprite faces up, y down);
