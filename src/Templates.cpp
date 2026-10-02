@@ -231,7 +231,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
 
 void TemplateStore::loadAll(const std::string& assetsRoot) {
     struct Dir { std::string sub; };
-    const char* roots[] = { "units", "builtin_mods" };
+    // builtin_mods are optional mods, disabled by default in RWX (builtin_mods_enabled) - not loaded
+    const char* roots[] = { "units" };
     std::vector<std::pair<std::string, std::string>> aliases; // aliasKey -> realKey
     for (const char* sub : roots) {
         std::string base = assetsRoot + "/" + sub;

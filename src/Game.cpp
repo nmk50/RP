@@ -268,7 +268,10 @@ void Game::updateUnit(Unit& u) {
             float d = u.pos.dist(bs->pos);
             if (d > tpl.nanoRange) computePath(*this, u, bs->pos + Vec2{ 0, -TILE_SIZE * 2 });
             else {
-                bs->buildProgress = std::min(1.0f, bs->buildProgress + (tpl.nanoBuildSpeed > 0 ? tpl.nanoBuildSpeed * 0.5f : 0.004f));
+                // RWX: nanoBuildSpeed multiplies with the target's buildSpeed (per-tick rate)
+                float target = bs->tpl->buildSpeed > 0 ? bs->tpl->buildSpeed : 0.001f;
+                float rate = (tpl.nanoBuildSpeed > 0 ? tpl.nanoBuildSpeed : 1.0f) * target;
+                bs->buildProgress = std::min(1.0f, bs->buildProgress + rate);
                 if (bs->buildProgress >= 1.0f) bs->underConstruction = false;
             }
         }

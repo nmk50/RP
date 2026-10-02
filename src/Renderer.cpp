@@ -210,6 +210,14 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         }
     }
     EndMode2D();
+
+    // selection drag box (screen space)
+    if (view.selActive) {
+        float x0 = std::min(view.selA.x, view.selB.x), y0 = std::min(view.selA.y, view.selB.y);
+        float w = std::fabs(view.selA.x - view.selB.x), h = std::fabs(view.selA.y - view.selB.y);
+        DrawRectangle((int)x0, (int)y0, (int)w, (int)h, Color{ 90, 220, 90, 40 });
+        DrawRectangleLines((int)x0, (int)y0, (int)w, (int)h, Color{ 90, 220, 90, 255 });
+    }
 }
 
 bool Renderer::unitTexture(const std::string& name, int which, Texture2D& out) {
