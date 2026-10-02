@@ -30,8 +30,15 @@ struct ProjectileTpl {
     float directDamage = 0, areaDamage = 0, areaRadius = 0;
     float speed = 6;
     int life = 60;
-    int frame = 0;           // sprite frame in projectiles sheet
+    // RWX [projectile_N] sprite: frame indexes the single-row sheet (frame index -1 = plain coloured
+    // dot, ProjectileTemplate.java:84). drawType picks the sheet: 0 projectiles.png (20px cells),
+    // 1 projectiles_large.png (60px), 2 projectiles2.png. shadowFrame draws the same frame in black
+    // on the ground. color tints the sprite (RWX "color : #RRGGBB" / "#AARRGGBB").
+    int frame = -1;
+    int drawType = 0;
+    int shadowFrame = -1;
     float drawSize = 1;
+    uint32_t color = 0xFFFFFFFF;
     bool largeHit = false;
     bool explodeOnHit = false;
     bool pushForce = false;

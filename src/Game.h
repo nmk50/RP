@@ -70,8 +70,11 @@ struct Projectile {
     Vec2 dest;
     float speed = 6;
     int life = 60;
-    int frame = 0;
+    int frame = -1;
+    int drawType = 0;
+    int shadowFrame = -1;
     float drawSize = 1;
+    uint32_t color = 0xFFFFFFFF;   // 0xRRGGBBAA sprite tint
     bool explodeOnHit = false;
     bool largeHit = false;
     bool dead = false;

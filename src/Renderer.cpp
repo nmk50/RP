@@ -256,11 +256,29 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     for (auto& u : g.units) if (u.tpl && u.tpl->isStatic()) drawUnit(g, u, view.cam);
     for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic()) drawUnit(g, u, view.cam);
 
-    // projectiles
+    // projectiles: RWX draws the [projectile_N] frame from a single-row sheet — projectiles.png has
+    // 20px cells, drawType 1 = projectiles_large.png (60px), 2 = projectiles2.png — rotated by the
+    // travel angle + 90 and scaled to cell*drawSize (Projectile.java:1688-1711 + GameViewUtils.java:100).
+    // frame : -1 keeps the plain tinted dot instead.
     for (auto& p : g.projectiles) {
-        float s = 3.0f * p.drawSize;
-        Color pc = p.team == g.playerTeam() ? Color{ 255, 240, 120, 255 } : Color{ 255, 150, 90, 255 };
-        DrawCircleV(Vector2{ p.pos.x, p.pos.y }, s, pc);
+        Color tint{ (uint8_t)(p.color >> 24), (uint8_t)((p.color >> 16) & 0xFF),
+                    (uint8_t)((p.color >> 8) & 0xFF), (uint8_t)p.color };
+        const char* sheet = p.drawType == 1 ? "projectiles_large.png"
+                          : (p.drawType == 2 ? "projectiles2.png" : "projectiles.png");
+        Texture2D tex;
+        if (p.frame < 0 || !shared(sheet, tex)) {
+            // unframed: RWX draws a filled dot of radius drawSize in the projectile colour
+            DrawCircleV(Vector2{ p.pos.x, p.pos.y }, std::max(1.0f, p.drawSize), tint);
+            continue;
+        }
+        int cell = std::max(1, tex.height);
+        int frames = std::max(1, tex.width / cell);
+        auto clampFrame = [&](int f) { return f < 0 ? 0 : std::min(frames - 1, f); };
+        float ang = spriteRot(std::atan2(p.vel.y, p.vel.x));
+        Vector2 pos{ p.pos.x, p.pos.y };
+        if (p.shadowFrame >= 0)
+            drawSpriteFrame(tex, frames, clampFrame(p.shadowFrame), pos, cell * p.drawSize, ang, Color{ 0, 0, 0, 128 });
+        drawSpriteFrame(tex, frames, clampFrame(p.frame), pos, cell * p.drawSize, ang, tint);
     }
     // RWX explosion: explode_big.png strip (13 frames), alpha 0.7 fading over the last 10 ticks
     Texture2D ex;

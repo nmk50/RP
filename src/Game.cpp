@@ -624,7 +624,9 @@ void Game::fire(Unit& u, Unit& target) {
     p.pos = turretPivot(u, tur, k) + (aim * barrelY + right * tur.barrelX) * k;
     p.team = u.team; p.sourceId = u.id; p.targetId = target.id; p.dest = target.pos;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
-    p.speed = pt.speed; p.life = pt.life; p.frame = pt.frame; p.drawSize = pt.drawSize;
+    p.speed = pt.speed; p.life = pt.life;
+    p.frame = pt.frame; p.drawType = pt.drawType; p.shadowFrame = pt.shadowFrame;
+    p.drawSize = pt.drawSize; p.color = pt.color;
     p.explodeOnHit = pt.explodeOnHit || pt.areaDamage > 0; p.largeHit = pt.largeHit;
     p.vel = (target.pos - p.pos).norm() * p.speed;
     projectiles.push_back(p);

@@ -11,6 +11,28 @@ static std::vector<float> parseCSV(const std::string& s) {
     return out;
 }
 
+// RWX colour strings are Android style: #RGB, #RRGGBB or #AARRGGBB. Stored here as 0xRRGGBBAA.
+static uint32_t parseRgba(const std::string& raw) {
+    std::string h = Trim(raw);
+    if (!h.empty() && h[0] == '#') h = h.substr(1);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    auto get = [&](size_t i, size_t len) -> int {
+        int v = 0;
+        for (size_t j = 0; j < len; ++j) { int n = nib(h[i + j]); if (n < 0) return -1; v = v * 16 + n; }
+        return len == 1 ? v * 17 : v;
+    };
+    auto cmp = [&](size_t i, size_t len) -> uint32_t { int v = get(i, len); return v < 0 ? 255u : (uint32_t)v; };
+    if (h.size() == 3) return (cmp(0, 1) << 24) | (cmp(1, 1) << 16) | (cmp(2, 1) << 8) | 255;
+    if (h.size() == 6) return (cmp(0, 2) << 24) | (cmp(2, 2) << 16) | (cmp(4, 2) << 8) | 255;
+    if (h.size() == 8) return (cmp(2, 2) << 24) | (cmp(4, 2) << 16) | (cmp(6, 2) << 8) | cmp(0, 2);
+    return 0xFFFFFFFF;
+}
+
 static MoveType parseMoveType(const std::string& s) {
     std::string v = ToLower(Trim(s));
     if (v == "land") return MoveType::LAND;
@@ -262,8 +284,11 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.areaRadius = (float)s.getNum("arearadius", 0);
             p.speed = (float)s.getNum("speed", 6);
             p.life = (int)s.getNum("life", 60);
-            p.frame = (int)s.getNum("frame", 0);
+            p.frame = (int)s.getNum("frame", -1);
+            p.drawType = (int)s.getNum("drawtype", 0);
+            p.shadowFrame = (int)s.getNum("shadowframe", -1);
             p.drawSize = (float)s.getNum("drawsize", 1);
+            p.color = parseRgba(s.get("color", "#FFFFFF"));
             p.largeHit = s.getBool("largehiteffect", false);
             std::string exp = ToLower(s.get("explodeeffect", ""));
             p.explodeOnHit = p.areaDamage > 0 || p.areaRadius > 0;
