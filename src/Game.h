@@ -45,6 +45,9 @@ struct Unit {
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
 
+// world-space turret pivot; sprite-space (x,y) offset rotated with the body, k = px scale
+Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k);
+
 struct Projectile {
     Vec2 pos, vel;
     int team = 0;

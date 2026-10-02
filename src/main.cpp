@@ -22,7 +22,7 @@ static void LogToFile(int logLevel, const char* text, va_list args) {
 Renderer g_render;
 
 struct UI {
-    float panelH = 120;
+    float panelH = 132;
     bool overPanel = false;
     bool overMinimap = false;
     // placement
@@ -161,6 +161,22 @@ static void renderHUD(Game& g, Camera2D& cam) {
             }
         }
         DrawText("Build / Production", panel.x + 8, panel.y + 8, 18, LIGHTGRAY);
+        // production queue readout (RWX shows queued units with progress)
+        for (auto* u : g.selectedUnits()) {
+            if (!u->tpl || !u->tpl->isFactory || u->prodQueue.empty()) continue;
+            std::string q = "Queue:";
+            int shown = 0;
+            for (auto& name : u->prodQueue) {
+                if (shown >= 4) { q += " +"; q += std::to_string((int)u->prodQueue.size() - shown); break; }
+                const UnitTemplate* it = g_templates.find(name);
+                q += " ";
+                q += it ? it->displayText : name;
+                if (shown == 0) q += " " + std::to_string((int)(u->prodProgress * 100)) + "%";
+                shown++;
+            }
+            DrawText(q.c_str(), panel.x + 200, panel.y + 8, 18, Color{ 250, 190, 40, 255 });
+            break;
+        }
     }
 }
 

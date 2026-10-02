@@ -122,6 +122,8 @@ static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2
 // RWX sprites face up (north); screen angle a (y-down) maps to raylib clockwise rotation a_deg + 90.
 static float spriteRot(float angleRad) { return angleRad * 180.0f / 3.14159265f + 90.0f; }
 
+static const TurretTpl kZeroTurret{};
+
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
@@ -138,20 +140,25 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
 
     Texture2D tex;
     Vector2 pv{ u.pos.x, u.pos.y };
+    float baseFrameW = 0;
     if (loaded(t, 0, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
+        baseFrameW = tex.width / (float)ef;
         float rot = t.isStatic() ? 0 : spriteRot(u.facing);
         drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale, rot, col);
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
     }
-    // turret
+    // turret: pivot offset lives in sprite space and rotates with the hull (RWX [turret_N] x/y)
     if (!t.imageTurret.empty() && t.imageTurret != "NONE") {
         Texture2D tur;
         if (loaded(t, 1, tur)) {
             int ef = (frames > 1 && tur.width % frames == 0) ? frames : 1;
             float rot = spriteRot(u.turretRot);
-            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, pv, scale * 0.7f * t.turretImageScale, rot, col);
+            const TurretTpl& tt = t.turrets.empty() ? kZeroTurret : t.turrets[0];
+            float k = baseFrameW > 0 ? (scale * t.imageScale) / baseFrameW : 1.0f;
+            Vec2 tp = turretPivot(u, tt, k);
+            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, scale * 0.7f * t.turretImageScale, rot, col);
         }
     }
     // team ring under selection
@@ -169,6 +176,14 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         if (t.isBuilding && u.underConstruction) {
             float bp = std::min(1.0f, u.buildProgress);
             DrawRectangle((int)p.x, (int)p.y + 5, (int)(bw * bp), 3, Color{ 240, 220, 90, 255 });
+        }
+        // RWX production bar: yellow progress + queue count while a factory is building a unit
+        if (t.isFactory && u.operational() && !u.prodQueue.empty()) {
+            Vector2 p{ pv.x - r, pv.y - (r + 13) };
+            DrawRectangle((int)p.x, (int)p.y, (int)bw, 3, Color{ 30, 30, 30, 200 });
+            DrawRectangle((int)p.x, (int)p.y, (int)(bw * std::min(1.0f, u.prodProgress)), 3, Color{ 250, 190, 40, 255 });
+            if (u.prodQueue.size() > 1)
+                DrawText(std::to_string(u.prodQueue.size()).c_str(), (int)(pv.x + r + 3), (int)p.y - 3, 12, Color{ 250, 190, 40, 255 });
         }
     }
     // upgrade-in-progress bar (RWX self action queue)

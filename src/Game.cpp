@@ -451,11 +451,22 @@ void Game::updateUnit(Unit& u) {
         float dist = u.pos.dist(tgt->pos);
         bool aimed = tpl.isFixedFiring || std::fabs(lerpAngle(u.turretRot, want, 1e9f) - u.turretRot) < 0.5f;
         if (dist <= tpl.attackRange + tgt->tpl->radius && aimed && u.shootCooldown <= 0) { fire(u, *tgt); u.shootCooldown = tpl.shootDelay; }
+    } else if (!u.isStatic() && !tpl.turrets.empty()) {
+        // RWX: with no target the turret tracks the hull so it stays glued while moving
+        u.turretRot = lerpAngle(u.turretRot, u.facing, tpl.turretTurnSpeed * 0.05236f);
     }
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;
     if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f)
         computePath(*this, u, tgt->pos);
+}
+
+// RWX turret pivot: [turret_N] x/y are sprite-space offsets (sprite faces up, y down);
+// the pivot must rotate with the body so the turret stays glued to the hull.
+Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k) {
+    if (u.isStatic()) return u.pos + Vec2{ tur.x * k, tur.y * k };
+    float cs = std::cos(u.facing), sn = std::sin(u.facing);
+    return u.pos + Vec2{ -tur.x * sn - tur.y * cs, tur.x * cs - tur.y * sn } * k;
 }
 
 void Game::fire(Unit& u, Unit& target) {
@@ -465,7 +476,10 @@ void Game::fire(Unit& u, Unit& target) {
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
     if (pi < 0) { pt.directDamage = 10; pt.speed = 6; pt.life = 60; }
     Projectile p;
-    p.pos = u.pos + Vec2{ std::cos(u.turretRot), std::sin(u.turretRot) } * (tpl.radius * 0.8f);
+    Vec2 aim{ std::cos(u.turretRot), std::sin(u.turretRot) };
+    // RWX barrel tip = turret pivot + aim * barrelY (defaults to [core] turretSize)
+    float barrel = tpl.turretSize > 0 ? tpl.turretSize : tpl.radius * 0.8f;
+    p.pos = turretPivot(u, tur, 1.0f) + aim * barrel;
     p.team = u.team; p.sourceId = u.id; p.targetId = target.id; p.dest = target.pos;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
     p.speed = pt.speed; p.life = pt.life; p.frame = pt.frame; p.drawSize = pt.drawSize;
