@@ -327,6 +327,11 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.instant = s.getBool("instant", false);
             p.wobbleAmp = (float)s.getNum("wobbleamplitude", 0);
             p.wobbleFreq = timeTicks("wobblefrequency", s, 5);
+            // CustomProjectileTemplate.java:194-196 with ProjectileTemplate.java:109-111 defaults. RWX
+            // throws above 1500 (CustomProjectileTemplate.java:202-203); clamping keeps a bad mod loading.
+            p.autoRetarget = s.getBool("autotargetingondeadtarget", false);
+            p.autoRetargetRange = std::min(1500.0f, (float)s.getNum("autotargetingondeadtargetrange", 120));
+            p.autoRetargetLead = (float)s.getNum("autotargetingondeadtargetlead", 15);
             p.areaExpandTime = (float)s.getNum("areaexpaintime", p.areaExpandTime);
             p.buildingDamageMult = (float)s.getNum("buildingdamagemultiplier", 1);
             p.shieldDamageMult = (float)s.getNum("shielddamagemultiplier", 1);

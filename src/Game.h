@@ -94,6 +94,13 @@ struct Projectile {
     float damage = 0, areaDamage = 0, areaRadius = 0;
     int sourceId = -1;
     int targetId = -1;      // homing unit (-1 = move to dest)
+    // RWX Projectile.aG/autoTargetingOnDeadTarget: once the chased unit is gone the shot re-locks on
+    // the nearest enemy around the point lead px ahead of its heading (Projectile.java:699-702,
+    // 1776-1820). The search needs the firing barrel's domains because the barrel's own state is not
+    // reachable from a projectile id.
+    bool autoRetarget = false;
+    float autoRetargetRange = 120, autoRetargetLead = 15;
+    bool atkFly = false, atkLand = true, atkSea = false;
     Vec2 dest;
     float speed = 6;
     int life = 60;

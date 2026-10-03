@@ -931,6 +931,10 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     if (pt.speedSpread > 0) p.speed += g_rng.range(-pt.speedSpread, pt.speedSpread);
     p.wobbleAmp = pt.wobbleAmp; p.wobbleFreq = pt.wobbleFreq;
     p.wobblePhase = g_rng.range(0.0f, 1.0f);   // RWX Projectile.I
+    p.autoRetarget = pt.autoRetarget;
+    p.autoRetargetRange = pt.autoRetargetRange;
+    p.autoRetargetLead = pt.autoRetargetLead;
+    p.atkFly = tur.canAttackFlying; p.atkLand = tur.canAttackLand; p.atkSea = tur.canAttackUnderwater;
     p.buildingMult = pt.buildingDamageMult;
     p.shieldMult = pt.shieldDamageMult;
     p.deflectMult = pt.shieldDeflectMult;
@@ -954,6 +958,28 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     projectiles.push_back(p);
 }
 
+// RWX Projectile.a(range, lead, tags):1776-1820, reached from update:699-702 whenever the chased unit
+// is gone and the weapon sets autoTargetingOnDeadTarget. The search centre is the point `lead` px in
+// front of the shot along its own heading (az), not the shot itself, and the nearest enemy the firing
+// barrel could engage wins. RWX also filters on the shooter's tech level and tags
+// (updateRepairOrReclaim..:1798-1803); no shipped weapon uses those, so this keeps the domain test.
+static Unit* retargetShot(Game& g, Projectile& p) {
+    Vec2 dir{ std::cos(p.heading), std::sin(p.heading) };
+    Vec2 at = p.pos + dir * p.autoRetargetLead;
+    Unit* best = nullptr;
+    float bestD = p.autoRetargetRange * p.autoRetargetRange;
+    for (auto& u : g.units) {
+        if (!u.tpl || u.dead || !u.operational() || !g.isEnemy(p.team, u.team)) continue;
+        bool fly = u.tpl->isAirUnit(), sea = u.tpl->isWaterUnit();
+        if (!((fly && p.atkFly) || (!fly && !sea && p.atkLand) || (sea && p.atkSea))) continue;
+        float dx = at.x - u.pos.x, dy = at.y - u.pos.y;
+        float d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = &u; }
+    }
+    if (best) p.targetId = best->id;
+    return best;
+}
+
 // RWX Projectile.update: the shot owns a heading and moves along it, so a shot with turnSpeed >= 0
 // only curves at that rate and can miss; turnSpeed < 0 (the default) re-aims every tick. The step is
 // clamped to the target distance, which also zeroes the gap so the following hit test lands it
@@ -969,6 +995,9 @@ void Game::updateProjectile(Projectile& p) {
     }
     Unit* t = p.targetId >= 0 ? get(p.targetId) : nullptr;
     if (t && t->dead) t = nullptr;
+    // RWX update:699-702: a weapon with autoTargetingOnDeadTarget re-locks every tick it has no live
+    // target; the rest keep chasing the corpse and land on its last position.
+    if (!t && p.autoRetarget) t = retargetShot(*this, p);
     // RWX keeps chasing the corpse, so a shot whose target dies mid-flight still lands where it died.
     if (t) p.dest = t->pos;
     Vec2 aim = t ? t->pos : p.dest;

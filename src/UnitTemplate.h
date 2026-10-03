@@ -72,6 +72,10 @@ struct ProjectileTpl {
     bool instant = false;
     // wobbleAmplitude (px per tick sideways) / wobbleFrequency (ticks per full sine)
     float wobbleAmp = 0, wobbleFreq = 5;
+    // autoTargetingOnDeadTarget: once the chased unit is gone the shot looks for a new enemy around
+    // the point lead px ahead of its own heading, within range (Projectile.java:699-702, 1776-1820).
+    bool autoRetarget = false;
+    float autoRetargetRange = 120, autoRetargetLead = 15;
     // areaExpandTime: the splash ring grows from nothing to areaRadius over these ticks and each
     // unit is caught once (Projectile.b(f2):1443 with the Projectile.ap list)
     float areaExpandTime = -1;
