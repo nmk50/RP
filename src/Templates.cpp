@@ -4,6 +4,7 @@
 #include <raylib.h>
 #include <set>
 #include <sstream>
+#include <functional>
 
 static std::vector<float> parseCSV(const std::string& s) {
     std::vector<float> out; std::stringstream ss(s); std::string tok;
@@ -86,6 +87,47 @@ static void applyCopyFrom(IniFile& ini, const std::string& iniPath, int depth) {
         IniSection& d = ini.getOrCreate(s.name);
         for (auto& kv : s.kv) if (!d.has(kv.first)) d.set(kv.first, kv.second);
     }
+}
+
+static std::vector<std::string> splitNames(const std::string& s) {
+    std::vector<std::string> out; std::stringstream ss(s); std::string tok;
+    while (std::getline(ss, tok, ',')) { tok = Trim(tok); if (!tok.empty()) out.push_back(tok); }
+    return out;
+}
+
+// RWX time keys (shootDelay, warmup, wobbleFrequency, ...) take an optional 's' postfix which
+// IniFile.parseUnitValue:761 turns into 60 ticks.
+static float timeTicks(const std::string& key, const IniSection& s, float def) {
+    std::string v = ToLower(Trim(s.get(key, "")));
+    if (v.empty()) return def;
+    float mult = 1.0f;
+    if (v.back() == 's') { v.pop_back(); mult = TICK_RATE; }
+    try { return std::stof(v) * mult; } catch (...) { return def; }
+}
+
+// RWX [section] @copyFromSection : A, B — fill a section from the named template sections, keys it
+// already has winning; each template is itself expanded, 10 levels at most
+// (CustomUnitConfigParser.readAllCustomUnitConfigs:379-404).
+static void expandFromSection(IniFile& ini, const std::string& dstName, const std::string& srcName, int depth) {
+    if (depth > 10) return;
+    IniSection* src = ini.find(srcName);
+    IniSection* dst = ini.find(dstName);
+    if (!src || !dst) return;
+    std::vector<std::pair<std::string, std::string>> keys = src->kv;   // dst may be src
+    for (auto& kv : keys) {
+        if (ToLower(kv.first) == "@copyfromsection") continue;
+        if (!dst->has(kv.first)) dst->set(kv.first, kv.second);
+    }
+    for (auto& next : splitNames(src->get("@copyfromsection")))
+        expandFromSection(ini, dstName, next, depth + 1);
+}
+
+static void applyCopyFromSections(IniFile& ini) {
+    std::vector<std::string> marked;
+    for (auto& s : ini.sections) if (s.has("@copyfromsection")) marked.push_back(s.name);
+    for (auto& n : marked)
+        for (auto& src : splitNames(ini.find(n)->get("@copyfromsection")))
+            expandFromSection(ini, n, src, 0);
 }
 
 static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
@@ -192,7 +234,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.canAttackUnderwater = a->getBool("canattackunderwaterunits", false);
         t.isFixedFiring = a->getBool("isfixedfiring", false);
         t.attackRange = (float)a->getNum("maxattackrange", 0);
-        t.shootDelay = (float)a->getNum("shootdelay", 60);
+        t.shootDelay = timeTicks("shootdelay", *a, 60);
         t.turretSize = (float)a->getNum("turretsize", 0);
         t.turretTurnSpeed = (float)a->getNum("turretturnspeed", 3);
     }
@@ -217,70 +259,18 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         if (!t.isBuilder && !t.isBuilding && (t.nanoRange > 0 || t.nanoBuildSpeed > 0)) t.isBuilder = true;
     }
 
-    // turrets: gather by index, apply copyFrom, then read
+    // [projectile_<name>] is keyed by whatever follows the underscore, case-insensitively, and the
+    // numbering a turret could otherwise refer to is simply the order the sections appear in the file
+    // (CustomUnitConfigParser.java:2058-2092). Parsing them before the turrets keeps the name lookup
+    // complete by the time a turret asks for `projectile: <name>`.
+    std::map<std::string, int> projIdx;
     {
-        std::map<int, const IniSection*> tsec;
-        for (auto& sp : ini.startingWith("turret_")) {
-            int idx = atoi(sp->name.c_str() + 7);
-            tsec[idx] = sp;
-        }
-        int maxIdx = tsec.empty() ? 0 : tsec.rbegin()->first;
-        std::vector<TurretTpl> arr(maxIdx + 1);
-        std::vector<bool> present(maxIdx + 1, false);
-        for (auto& e : tsec) {
-            int idx = e.first;
-            TurretTpl tt;
-            const IniSection& s = *e.second;
-            tt.x = (float)s.getNum("x", 0);
-            tt.y = (float)s.getNum("y", 0);
-            // RWX TurretConfig: size is an alias of barrelY; default barrelY = [attack] turretSize (-1 sentinel)
-            tt.barrelY = s.getNum("barrely", s.getNum("size", -1));
-            tt.barrelX = (float)s.getNum("barrelx", 0);
-            tt.drawOffsetX = (float)s.getNum("image_drawoffsetx", 0);
-            tt.drawOffsetY = (float)s.getNum("image_drawoffsety", 0);
-            tt.projectile = (int)s.getNum("projectile", 0);
-            tt.invisible = s.getBool("invisible", false);
-            tt.canShoot = s.getBool("canshoot", true);
-            tt.turnSpeed = (float)s.getNum("turnspeed", t.turretTurnSpeed);
-            tt.warmup = (float)s.getNum("warmup", 0);
-            tt.idleDir = (float)s.getNum("idledir", 0);
-            tt.shouldResetTurret = s.getBool("shouldresetturret", true);
-            // RWX shoot_flame accepts a comma list; only the built-in flame sizes are rendered here
-            {
-                std::string fl = ToLower(s.get("shoot_flame", ""));
-                size_t comma = fl.find(','); if (comma != std::string::npos) fl = Trim(fl.substr(0, comma));
-                if (fl == "small") tt.shootFlame = 1;
-                else if (fl == "medium") tt.shootFlame = 2;
-                else if (fl == "large") tt.shootFlame = 3;
-            }
-            if (s.has("canattackflyingunits")) tt.canAttackFlying = s.getBool("canattackflyingunits", true); else tt.canAttackFlying = t.canAttackFlying;
-            if (s.has("canattacklandunits")) tt.canAttackLand = s.getBool("canattacklandunits", true); else tt.canAttackLand = t.canAttackLand;
-            tt.canAttackUnderwater = s.getBool("canattackunderwaterunits", false);
-            // copyFrom another turret index
-            if (s.has("copyfrom")) {
-                int from = (int)s.getNum("copyfrom", 0);
-                if (from >= 0 && from <= maxIdx && present[from]) tt = arr[from];
-            }
-            arr[idx] = tt; present[idx] = true;
-        }
-        for (size_t i = 1; i < arr.size(); ++i)
-            if (present[i]) t.turrets.push_back(arr[i]);
-    }
-
-    // projectiles: gather by index
-    {
-        std::map<int, const IniSection*> psec;
-        for (auto& sp : ini.startingWith("projectile_")) {
-            int idx = atoi(sp->name.c_str() + 11);
-            psec[idx] = sp;
-        }
-        int maxIdx = psec.empty() ? 0 : psec.rbegin()->first;
-        std::vector<ProjectileTpl> arr(maxIdx + 1);
-        std::vector<bool> present(maxIdx + 1, false);
-        ProjectileTpl def; def.life = (int)t.attackRange;
-        for (auto& e : psec) {
-            int idx = e.first; const IniSection& s = *e.second;
-            ProjectileTpl p = def;
+        for (auto* sp : ini.startingWith("projectile_")) {
+            const IniSection& s = *sp;
+            std::string key = ToLower(Trim(s.name.substr(11)));
+            if (key.empty() || projIdx.count(key)) continue;   // RWX rejects a repeated name outright
+            projIdx[key] = (int)t.projectiles.size();
+            ProjectileTpl p;
             p.directDamage = (float)s.getNum("directdamage", 0);
             p.areaDamage = (float)s.getNum("areadamage", 0);
             p.areaRadius = (float)s.getNum("arearadius", 0);
@@ -301,17 +291,84 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.speedSpread = (float)s.getNum("speedspread", 0);
             p.instant = s.getBool("instant", false);
             p.wobbleAmp = (float)s.getNum("wobbleamplitude", 0);
-            p.wobbleFreq = (float)s.getNum("wobblefrequency", 5);
+            p.wobbleFreq = timeTicks("wobblefrequency", s, 5);
             p.areaExpandTime = (float)s.getNum("areaexpaintime", p.areaExpandTime);
             p.buildingDamageMult = (float)s.getNum("buildingdamagemultiplier", 1);
-            if (s.has("copyfrom")) {
-                int from = (int)s.getNum("copyfrom", 0);
-                if (from >= 0 && from <= maxIdx && present[from]) { ProjectileTpl b = arr[from]; p.directDamage = s.has("directdamage") ? p.directDamage : b.directDamage; arr[idx] = p; present[idx] = true; continue; }
-            }
-            arr[idx] = p; present[idx] = true;
+            t.projectiles.push_back(p);
         }
-        for (size_t i = 1; i < arr.size(); ++i)
-            if (present[i]) t.projectiles.push_back(arr[i]);
+        if (t.projectiles.empty()) {
+            // RWX hands a unit with no [projectile_*] a stand-in named "1" carrying directDamage 10
+            projIdx["1"] = 0;
+            ProjectileTpl p; p.directDamage = 10;
+            t.projectiles.push_back(p);
+        }
+    }
+
+    // [turret_<name>]: same suffix keying. `copyFrom: <name>` starts from another turret's values and
+    // this section's own keys are then applied on top (TurretConfig.java:310-333) - which is also why
+    // x/y alone are always read from the section itself and never inherited.
+    {
+        std::vector<const IniSection*> tsec;
+        std::map<std::string, int> turIdx;
+        for (auto* sp : ini.startingWith("turret_")) {
+            std::string key = ToLower(Trim(sp->name.substr(7)));
+            if (key.empty() || turIdx.count(key)) continue;
+            turIdx[key] = (int)tsec.size();
+            tsec.push_back(sp);
+        }
+        std::vector<TurretTpl> arr(tsec.size());
+        std::vector<char> done(tsec.size(), 0), visiting(tsec.size(), 0);
+        std::function<void(int)> parseTurret = [&](int i) {
+            if (done[i] || visiting[i]) return;
+            visiting[i] = 1;
+            const IniSection& s = *tsec[i];
+            TurretTpl tt;
+            bool copied = false;
+            if (s.has("copyfrom")) {
+                auto it = turIdx.find(ToLower(Trim(s.get("copyfrom"))));
+                if (it != turIdx.end() && it->second != i) {
+                    parseTurret(it->second);            // RWX resolves a forward reference too
+                    if (done[it->second]) { tt = arr[it->second]; copied = true; }
+                }
+            }
+            if (!copied) {                             // [attack] defaults, not inherited by a copy
+                tt.turnSpeed = t.turretTurnSpeed;
+                tt.canAttackFlying = t.canAttackFlying;
+                tt.canAttackLand = t.canAttackLand;
+            }
+            tt.x = (float)s.getNum("x", 0);
+            tt.y = (float)s.getNum("y", 0);
+            // size is an alias of barrelY; the -1 sentinel means "[attack] turretSize", see fire()
+            if (s.has("barrely") || s.has("size"))
+                tt.barrelY = (float)s.getNum("barrely", s.getNum("size", -1));
+            if (s.has("barrelx")) tt.barrelX = (float)s.getNum("barrelx", 0);
+            if (s.has("image_drawoffsetx")) tt.drawOffsetX = (float)s.getNum("image_drawoffsetx", 0);
+            if (s.has("image_drawoffsety")) tt.drawOffsetY = (float)s.getNum("image_drawoffsety", 0);
+            if (s.has("projectile")) {
+                auto it = projIdx.find(ToLower(Trim(s.get("projectile"))));
+                if (it != projIdx.end()) tt.projectile = it->second;
+            }
+            if (s.has("invisible")) tt.invisible = s.getBool("invisible", false);
+            if (s.has("canshoot")) tt.canShoot = s.getBool("canshoot", true);
+            if (s.has("turnspeed")) tt.turnSpeed = (float)s.getNum("turnspeed", tt.turnSpeed);
+            if (s.has("warmup")) tt.warmup = timeTicks("warmup", s, tt.warmup);
+            if (s.has("idledir")) tt.idleDir = (float)s.getNum("idledir", 0);
+            if (s.has("shouldresetturret")) tt.shouldResetTurret = s.getBool("shouldresetturret", true);
+            if (s.has("canattackflyingunits")) tt.canAttackFlying = s.getBool("canattackflyingunits", true);
+            if (s.has("canattacklandunits")) tt.canAttackLand = s.getBool("canattacklandunits", true);
+            if (s.has("canattackunderwaterunits")) tt.canAttackUnderwater = s.getBool("canattackunderwaterunits", false);
+            // RWX shoot_flame accepts a comma list; only the built-in flame sizes are rendered here
+            if (s.has("shoot_flame")) {
+                std::string fl = ToLower(s.get("shoot_flame", ""));
+                size_t comma = fl.find(','); if (comma != std::string::npos) fl = Trim(fl.substr(0, comma));
+                tt.shootFlame = fl == "small" ? 1 : fl == "medium" ? 2 : fl == "large" ? 3 : 0;
+            }
+            arr[i] = tt;
+            visiting[i] = 0;
+            done[i] = 1;
+        };
+        for (size_t i = 0; i < tsec.size(); ++i) parseTurret((int)i);
+        for (size_t i = 0; i < tsec.size(); ++i) if (done[i]) t.turrets.push_back(arr[i]);
     }
 
     if (const IniSection* ai = ini.find("ai")) {
@@ -319,9 +376,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.useAsAttacker = ai->getBool("useasattacker", false);
         t.useAsHarvester = ai->getBool("useasharvester", false) || t.creditIncomeRate > 0;
     }
-    // If attack enabled but no turrets defined, synthesize a default turret using projectile_1
+    // If attack enabled but no turrets defined, synthesize RWX's fallback turret ("1", first projectile)
     if (t.canAttack && t.turrets.empty()) {
-        TurretTpl tt; tt.projectile = t.projectiles.empty() ? 0 : 1;
+        TurretTpl tt;
         tt.canAttackFlying = t.canAttackFlying; tt.canAttackLand = t.canAttackLand;
         tt.turnSpeed = t.turretTurnSpeed;
         t.turrets.push_back(tt);
@@ -345,6 +402,7 @@ void TemplateStore::loadAll(const std::string& assetsRoot) {
             if (!ParseIni(path, ini)) continue;
             if (!ini.find("core")) continue;
             applyCopyFrom(ini, path, 0);
+            applyCopyFromSections(ini);
             UnitTemplate t = buildTemplate(ini, path);
             if (t.name.empty()) continue;
             byName[ToLower(t.name)] = t;

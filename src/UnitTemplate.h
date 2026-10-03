@@ -13,7 +13,9 @@ struct TurretTpl {
     // barrelX = lateral offset, image_drawOffsetX/Y = turret sprite shift relative to the pivot.
     float barrelY = -1, barrelX = 0;
     float drawOffsetX = 0, drawOffsetY = 0;
-    int projectile = 0;      // index into projectiles (1-based like RWX, 0 = none/nano)
+    // RWX TurretConfig.projectileId: index into the unit's projectiles, chosen by the
+    // [projectile_<name>] section a turret names with `projectile: <name>`
+    int projectile = 0;
     bool invisible = false;
     bool canShoot = true;
     float turnSpeed = 4.0f;

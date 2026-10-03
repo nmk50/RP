@@ -629,9 +629,9 @@ Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k) {
 void Game::fire(Unit& u, Unit& target) {
     const UnitTemplate& tpl = *u.tpl;
     TurretTpl tur = tpl.turrets.empty() ? TurretTpl{} : tpl.turrets[0];
-    int pi = (tur.projectile > 0 && tur.projectile <= (int)tpl.projectiles.size()) ? tur.projectile - 1 : -1;
+    int pi = (tur.projectile >= 0 && tur.projectile < (int)tpl.projectiles.size()) ? tur.projectile : -1;
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
-    if (pi < 0) { pt.directDamage = 10; pt.speed = 6; pt.life = 60; }
+    if (pi < 0) pt.directDamage = 10;   // RWX's stand-in [projectile_1] for a unit with none at all
     Projectile p;
     Vec2 aim{ std::cos(u.turretRot), std::sin(u.turretRot) };
     Vec2 right{ -aim.y, aim.x };
