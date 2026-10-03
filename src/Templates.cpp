@@ -233,6 +233,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.canAttackLand = a->getBool("canattacklandunits", true);
         t.canAttackUnderwater = a->getBool("canattackunderwaterunits", false);
         t.isFixedFiring = a->getBool("isfixedfiring", false);
+        t.turretRotateWithBody = a->getBool("turretrotatewithbody", true);
         t.attackRange = (float)a->getNum("maxattackrange", 0);
         t.shootDelay = timeTicks("shootdelay", *a, 60);
         t.turretSize = (float)a->getNum("turretsize", 0);
@@ -342,6 +343,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (s.has("barrely") || s.has("size"))
                 tt.barrelY = (float)s.getNum("barrely", s.getNum("size", -1));
             if (s.has("barrelx")) tt.barrelX = (float)s.getNum("barrelx", 0);
+            if (s.has("barreloffsetx_onoddshots")) tt.barrelXOdd = (float)s.getNum("barreloffsetx_onoddshots", 0);
+            if (s.has("image")) tt.image = Trim(s.get("image", ""));
             if (s.has("image_drawoffsetx")) tt.drawOffsetX = (float)s.getNum("image_drawoffsetx", 0);
             if (s.has("image_drawoffsety")) tt.drawOffsetY = (float)s.getNum("image_drawoffsety", 0);
             if (s.has("projectile")) {
@@ -351,7 +354,32 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (s.has("invisible")) tt.invisible = s.getBool("invisible", false);
             if (s.has("canshoot")) tt.canShoot = s.getBool("canshoot", true);
             if (s.has("turnspeed")) tt.turnSpeed = (float)s.getNum("turnspeed", tt.turnSpeed);
+            if (s.has("turnspeedacceleration")) tt.turnAccel = (float)s.getNum("turnspeedacceleration", tt.turnAccel);
+            if (s.has("turnspeeddeceleration")) tt.turnDecel = (float)s.getNum("turnspeeddeceleration", tt.turnDecel);
+            // TurretConfig.m: `delay` is this barrel's own shoot delay, and linkDelayWithTurret hands
+            // the job over to the parent barrel (RWX writes 9000 in that case).
+            if (s.has("delay")) tt.shootDelay = timeTicks("delay", s, tt.shootDelay);
             if (s.has("warmup")) tt.warmup = timeTicks("warmup", s, tt.warmup);
+            if (s.has("warmupcalldownrate")) tt.warmCallDown = (float)s.getNum("warmupcalldownrate", tt.warmCallDown);
+            if (s.has("warmupnoreset")) tt.warmNoReset = s.getBool("warmupnoreset", false);
+            // 99999 is RWX's "no limit" sentinel (TurretConfig.java:484-496), not a real range.
+            if (s.has("limitingrange")) {
+                float lr = (float)s.getNum("limitingrange", 0);
+                if (lr > 0 && lr < 99999.0f) tt.range = lr;
+            }
+            if (s.has("limitingminrange")) tt.minRange = (float)s.getNum("limitingminrange", tt.minRange);
+            if (s.has("canattackmaxangle")) tt.maxAngle = (float)s.getNum("canattackmaxangle", tt.maxAngle);
+            if (s.has("recoiloffset")) tt.recoil = (float)s.getNum("recoiloffset", tt.recoil);
+            if (s.has("recoilouttime")) tt.recoilOut = (float)s.getNum("recoilouttime", tt.recoilOut);
+            if (s.has("recoilreturntime")) tt.recoilReturn = timeTicks("recoilreturntime", s, tt.recoilReturn);
+            if (s.has("attachedto")) {
+                auto it = turIdx.find(ToLower(Trim(s.get("attachedto"))));
+                if (it != turIdx.end() && it->second != i) tt.attached = it->second;
+            }
+            if (s.has("linkdelaywithturret")) {
+                auto it = turIdx.find(ToLower(Trim(s.get("linkdelaywithturret"))));
+                if (it != turIdx.end() && it->second != i) tt.linkDelay = it->second;
+            }
             if (s.has("idledir")) tt.idleDir = (float)s.getNum("idledir", 0);
             if (s.has("shouldresetturret")) tt.shouldResetTurret = s.getBool("shouldresetturret", true);
             if (s.has("canattackflyingunits")) tt.canAttackFlying = s.getBool("canattackflyingunits", true);
@@ -382,6 +410,29 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         tt.canAttackFlying = t.canAttackFlying; tt.canAttackLand = t.canAttackLand;
         tt.turnSpeed = t.turretTurnSpeed;
         t.turrets.push_back(tt);
+    }
+    // RWX CustomUnitConfigParser:2142-2193 - when every shooting barrel sets its own limitingRange,
+    // [attack] maxAttackRange is raised to the largest of them so the unit's target search still
+    // reaches the long barrels; each barrel then enforces its own range on top of that.
+    {
+        float widest = 0; bool any = false, all = true;
+        for (auto& tt : t.turrets) if (tt.canShoot) {
+            if (tt.range > 0) { any = true; if (tt.range > widest) widest = tt.range; }
+            else all = false;
+        }
+        if (any && all && widest > t.attackRange) t.attackRange = widest;
+    }
+    // Fill in the values RWX only applies once a section has been read (TurretConfig.java:344-351,
+    // 484-501): a barrel without its own `delay` inherits [attack] shootDelay, an attachedTo barrel
+    // never runs its own timer, and limitingRange falls back to the unit's maxAttackRange.
+    for (size_t i = 0; i < t.turrets.size(); ++i) {
+        TurretTpl& tt = t.turrets[i];
+        if (tt.attached >= (int)t.turrets.size()) tt.attached = -1;
+        if (tt.linkDelay >= (int)t.turrets.size()) tt.linkDelay = -1;
+        if (tt.linkDelay >= 0) tt.shootDelay = 9000;
+        else if (tt.shootDelay < 0) tt.shootDelay = t.shootDelay;
+        if (tt.range <= 0) tt.range = t.attackRange;
+        if (tt.turnDecel < 0) tt.turnDecel = tt.turnAccel;
     }
     t.isFactory = t.isBuilding && !t.canBuild.empty();
     return t;

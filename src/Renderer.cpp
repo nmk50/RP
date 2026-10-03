@@ -67,7 +67,7 @@ void Renderer::close() {
 bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     std::string nm;
     if (which == 0) nm = t.image;
-    else if (which == 1) nm = t.imageTurret;
+    else if (which == 1) return byName(t, t.imageTurret, out);
     else nm = t.imageWreak;
     if (nm.empty() || nm == "NONE" || nm == "AUTO") return false;
     std::string key = nm + "|" + t.sourceDir + "|" + std::to_string(which);
@@ -75,7 +75,24 @@ bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     if (it != cache_.end()) { out = it->second; return it->second.id != missing_.id; }
     // resolve
     UnitTemplate tmp = t;
-    if (which == 1) { tmp.image = t.imageTurret; } else if (which == 2) { tmp.image = t.imageWreak; }
+    if (which == 2) { tmp.image = t.imageWreak; }
+    std::string path = resolveImage(tmp);
+    Texture2D tex = missing_;
+    if (!path.empty()) { tex = LoadTexture(path.c_str()); }
+    cache_[key] = tex;
+    out = tex;
+    return tex.id != missing_.id;
+}
+
+// RWX CustomUnit.d(i):691 - a barrel with [turret_N] image draws that sprite, and barrels that name
+// the same file share one load.
+bool Renderer::byName(const UnitTemplate& t, const std::string& nm, Texture2D& out) {
+    if (nm.empty() || nm == "NONE" || nm == "AUTO") return false;
+    std::string key = nm + "|" + t.sourceDir + "|1";
+    auto it = cache_.find(key);
+    if (it != cache_.end()) { out = it->second; return it->second.id != missing_.id; }
+    UnitTemplate tmp = t;
+    tmp.image = nm;
     std::string path = resolveImage(tmp);
     Texture2D tex = missing_;
     if (!path.empty()) { tex = LoadTexture(path.c_str()); }
@@ -141,8 +158,6 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
     DrawRectangleLines(0, 0, g.map.worldW(), g.map.worldH(), BLACK);
 }
 
-static const TurretTpl kZeroTurret{};
-
 // RWX image_shadow: AUTO = the body frame with RGB forced to black, shifted by shadowOffsetX/Y world px.
 // Drawn in its own pass so one unit's shadow never stains a neighbour's sprite.
 void Renderer::drawUnitShadow(const Unit& u) {
@@ -185,39 +200,43 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
     }
-    // turret: pivot offset lives in sprite space and rotates with the hull (RWX [turret_N] x/y)
-    if (!t.imageTurret.empty() && t.imageTurret != "NONE") {
-        Texture2D tur;
-        if (loaded(t, 1, tur)) {
+    // RWX GameViewUtils.a(OrderableUnit):154-194 - every [turret_N] is drawn at its own pivot F(i),
+    // rotated by its own aim, with its own sprite and recoil; a barrel with no image of its own
+    // falls back to [graphics] image_turret.
+    if (!t.turrets.empty()) {
+        float k = baseFrameW > 0 ? (scale * t.imageScale) / baseFrameW : 1.0f;
+        for (size_t i = 0; i < t.turrets.size(); ++i) {
+            const TurretTpl& tt = t.turrets[i];
+            if (tt.invisible) continue;
+            const TurretState* s = (i < u.tur.size()) ? &u.tur[i] : nullptr;
+            float a = s ? s->angle : u.facing;
+            Vec2 aim{ std::cos(a), std::sin(a) }, right{ -aim.y, aim.x };
+            Vec2 tp = turretPivot(u, (int)i, k);
+            float rc = turretRecoil(u, (int)i);
+            if (rc != 0.0f) tp = tp + aim * rc;                       // recoilOffset along the aim
+            if (tt.drawOffsetX != 0 || tt.drawOffsetY != 0)
+                tp = tp + (aim * tt.drawOffsetY - right * tt.drawOffsetX) * k;
+            Texture2D tur;
+            if (!byName(t, tt.image.empty() ? t.imageTurret : tt.image, tur)) continue;
             int ef = (frames > 1 && tur.width % frames == 0) ? frames : 1;
-            float rot = spriteRot(u.turretRot);
-            const TurretTpl& tt = t.turrets.empty() ? kZeroTurret : t.turrets[0];
-            float k = baseFrameW > 0 ? (scale * t.imageScale) / baseFrameW : 1.0f;
-            Vec2 tp = turretPivot(u, tt, k);
             // RWX GameViewUtils: turret keeps its own native aspect vs the body (turretImageScale, not body scale)
             float turW = baseFrameW > 0
                 ? (tur.width / (float)ef) * t.turretImageScale * (scale / baseFrameW)
                 : scale * 0.7f * t.turretImageScale;
-            // image_drawOffsetX/Y shifts the turret sprite along aim / perpendicular in sprite space
-            if (tt.drawOffsetX != 0 || tt.drawOffsetY != 0) {
-                float a = u.turretRot;
-                Vec2 aim{ std::cos(a), std::sin(a) }, right{ -std::sin(a), std::cos(a) };
-                tp = tp + (aim * tt.drawOffsetY - right * tt.drawOffsetX) * k;
+            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, turW, spriteRot(a), col);
+            // RWX shoot_flame: effectTemplates[3] = drawable/flame.png, 20x25 frames, attached to the barrel
+            if (s && s->flameType > 0 && s->flameT > 0) {
+                Texture2D fl;
+                if (shared("flame.png", fl)) {
+                    int total = s->flameType == 1 ? 8 : 10;
+                    float elapsed = (float)total - s->flameT;
+                    int frame = s->flameType == 1 ? (int)(elapsed * 0.5f) : 1 + (int)(elapsed * 0.4f);
+                    int ff = std::max(1, fl.width / 20);
+                    drawSpriteFrame(fl, ff, std::min(ff - 1, frame),
+                        Vector2{ pv.x + s->flameOff.x, pv.y + s->flameOff.y },
+                        20.0f * (s->flameType == 2 ? 0.75f : 1.0f), spriteRot(s->flameAng), col);
+                }
             }
-            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, turW, rot, col);
-        }
-    }
-    // RWX shoot_flame: effectTemplates[3] = drawable/flame.png, 20x25 frames, attached to the shooter
-    if (u.muzzleType && u.muzzleT > 0) {
-        Texture2D fl;
-        if (shared("flame.png", fl)) {
-            int total = u.muzzleType == 1 ? 8 : 10;
-            float elapsed = (float)total - u.muzzleT;
-            int frame = u.muzzleType == 1 ? (int)(elapsed * 0.5f) : 1 + (int)(elapsed * 0.4f);
-            int ef = std::max(1, fl.width / 20);
-            drawSpriteFrame(fl, ef, std::min(ef - 1, frame),
-                Vector2{ pv.x + u.muzzleOff.x, pv.y + u.muzzleOff.y },
-                20.0f * (u.muzzleType == 2 ? 0.75f : 1.0f), spriteRot(u.muzzleAng), col);
         }
     }
     // team ring under selection

@@ -23,6 +23,14 @@ static float angleDiff(float a, float b) {
     return d;
 }
 
+// RWX keeps every angle in (-180, 180] (addRotation:1319-1335); without this the hull and barrel
+// angles drift upward all game and lose precision.
+static float wrapAngle(float a) {
+    while (a > 3.14159265f) a -= 2 * 3.14159265f;
+    while (a <= -3.14159265f) a += 2 * 3.14159265f;
+    return a;
+}
+
 static Team* teamOf(Game& g, int id) { for (auto& t : g.teams) if (t.id == id) return &t; return nullptr; }
 
 // RWX OrderableUnit.isOverLiquid / ScorchMark skip: no ground decal over water.
@@ -40,6 +48,63 @@ static float moveTowards(float v, float to, float step) {
 // RWX Projectile.a:228 - [projectile_N] buildingDamageMultiplier only scales damage dealt to buildings.
 static float damageScale(const Projectile& p, const Unit& u) {
     return (p.buildingMult != 1.0f && u.tpl && u.tpl->isBuilding) ? p.buildingMult : 1.0f;
+}
+
+// Sprite px -> world px, the same factor the renderer draws the body with.
+static float texScale(const UnitTemplate& tpl) {
+    return tpl.texFrameWpx > 0 ? (tpl.displayRadius * 2.0f * tpl.imageScale) / tpl.texFrameWpx : 1.0f;
+}
+
+// RWX OrderableUnit.a(f, angle, i):1351 - the barrel turns at [turret] turnSpeed deg/tick, or ramps
+// to it through turnSpeedAcceleration and brakes with turnSpeedDeceleration, which is what makes a
+// heavy turret lag behind a fast target. RWX does that arithmetic in degrees, so the angular velocity
+// is kept in deg/tick and only the applied step becomes radians. Returns the angle still to cover.
+static float rotateTurret(TurretState& s, const TurretTpl& tur, float want) {
+    float err = angleDiff(s.angle, want);
+    if (err == 0.0f) return 0.0f;
+    float errDeg = err * 57.29578f;
+    float applied;
+    if (tur.turnAccel <= 0.0f) {                            // w(i) <= 0: no inertia, snap at turnSpeed
+        applied = std::fabs(errDeg) > tur.turnSpeed ? (errDeg > 0.0f ? tur.turnSpeed : -tur.turnSpeed) : errDeg;
+        s.angVel = 0.0f;
+    } else {
+        float decel = tur.turnDecel > 0.0f ? tur.turnDecel : tur.turnAccel;
+        float dir = errDeg > 0.0f ? 1.0f : -1.0f;
+        // :1366-1369 within the distance needed to stop, and still moving that way: bleed speed off
+        if (decel > 0.0f && std::fabs(errDeg) < std::fabs(s.angVel) / decel && (s.angVel > 0.0f) == (errDeg > 0.0f))
+            s.angVel = moveTowards(s.angVel, dir * decel, decel);
+        else
+            s.angVel = moveTowards(s.angVel, dir * tur.turnSpeed, tur.turnAccel);
+        applied = s.angVel;
+        if (std::fabs(applied) > std::fabs(errDeg)) { s.angVel = 0.0f; applied = errDeg; }
+    }
+    s.angle = wrapAngle(s.angle + applied * 0.0174533f);
+    return err - applied * 0.0174533f;
+}
+
+// Can this barrel engage that unit at all: RWX checks the target's domain against the turret's own
+// canAttack* flags and, when the section sets limitingRange / limitingMinRange, the distance
+// (CustomUnit.a(TurretConfig, i, baseUnit, ..):1266, TurretConfig.java:484-501).
+static bool turretSees(const Game& g, const Unit& u, int i, const Unit& t) {
+    if (!t.tpl || t.dead || !t.operational() || !g.isEnemy(u.team, t.team)) return false;
+    const TurretTpl& tur = u.tpl->turrets[i];
+    bool fly = t.tpl->isAirUnit(), sea = t.tpl->isWaterUnit(), land = !fly && !sea;
+    if (!((fly && tur.canAttackFlying) || (land && tur.canAttackLand) || (sea && tur.canAttackUnderwater))) return false;
+    float d = u.pos.dist(t.pos);
+    if (tur.range > 0 && d > tur.range) return false;
+    if (tur.minRange > 0 && d < tur.minRange) return false;
+    return true;
+}
+
+// RWX gives each [turret_N] its own UnitMovementData when the unit is built (CustomUnit:1033-1036),
+// aimed along the hull with every timer zeroed. An upgrade that adds barrels only grows the array
+// and keeps the ones already there (BaseUnit:975-986).
+static void initTurrets(Unit& u) {
+    if (!u.tpl) return;
+    size_t n = u.tpl->turrets.size(), old = u.tur.size();
+    if (old == n) return;
+    u.tur.resize(n);
+    for (size_t i = old; i < n; ++i) u.tur[i].angle = u.facing;
 }
 
 bool Game::init(const std::string& mapPath, std::string* err) {
@@ -142,10 +207,10 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.prevPos = pos;
     u.hp = u.maxHp = tpl->maxHp;
     u.footprint[0] = tpl->footL; u.footprint[1] = tpl->footU; u.footprint[2] = tpl->footR; u.footprint[3] = tpl->footD;
-    u.turretRot = -1.5708f;
     // RWX BaseBuilding.java:108: a building's body angle is -90 deg, so its turret idles along the
     // unrotated sprite (north) plus [turret] idleDir.
     if (tpl->isStatic()) u.facing = -1.5708f;
+    initTurrets(u);
     u.underConstruction = underConstruction;
     units.push_back(u);
     if (tpl->isStatic()) markBuildingOcc(map, units.back(), +1);
@@ -523,8 +588,11 @@ void Game::updateUnit(Unit& u) {
                 else u.turnVel += (wantV > u.turnVel ? accel : -accel);
                 float step = u.turnVel;
                 if (std::fabs(step) > std::fabs(diff)) step = diff;
-                u.facing += step;
-                u.turretRot += step;
+                u.facing = wrapAngle(u.facing + step);
+                // RWX addRotation:1325-1337 - with [attack] turretRotateWithBody every barrel is
+                // dragged around by the hull; without it the barrels keep their own world aim.
+                if (tpl.turretRotateWithBody)
+                    for (auto& ts : u.tur) ts.angle = wrapAngle(ts.angle + step);
             }
         }
         float aimErrDeg = std::fabs(angleDiff(u.facing, heading)) * 57.29578f;
@@ -587,28 +655,9 @@ void Game::updateUnit(Unit& u) {
         computePath(*this, u, u.moveGoal); // retry after blockage cleared
     }
 
-    if (u.shootCooldown > 0) u.shootCooldown -= 1;
-    if (tpl.canAttack && u.operational() && tgt) {
-        float want = Vec2::angleTo(u.pos, tgt->pos);
-        // RWX OrderableUnit.java:4750: the barrel fires along the hull when isFixedFiring
-        if (tpl.isFixedFiring) u.turretRot = u.facing;
-        else u.turretRot = lerpAngle(u.turretRot, want, tpl.turretTurnSpeed * 0.05236f);
-        float dist = u.pos.dist(tgt->pos);
-        float tol = tpl.isFixedFiring ? 0.2f : 0.5f;
-        bool aimed = std::fabs(angleDiff(u.turretRot, want)) < tol;
-        if (dist <= tpl.attackRange + tgt->tpl->radius && aimed && u.shootCooldown <= 0) { fire(u, *tgt); u.shootCooldown = tpl.shootDelay; }
-    } else if (!tpl.turrets.empty()) {
-        const TurretTpl& tur = tpl.turrets[0];
-        if (tpl.isFixedFiring) u.turretRot = u.facing;
-        else if (tur.shouldResetTurret) {
-            // RWX OrderableUnit.java:846-857: with no target the turret turns back to C(i) =
-            // hull facing + idleDir; shouldResetTurret:false parks it on its last aim.
-            float rest = u.facing + tur.idleDir * 0.0174533f;
-            if (u.isRotating && tpl.reverseSpeed > 0.95f) rest += 3.14159265f;
-            u.turretRot = lerpAngle(u.turretRot, rest, tur.turnSpeed * 0.05236f);
-        }
-    }
-    if (u.muzzleT > 0) u.muzzleT -= 1;
+    // OrderableUnit.update:865-890 - every barrel keeps its own cooldown, warmup and aim, so the
+    // whole turret pass now runs per [turret_N] instead of on one shared barrel.
+    if (u.operational() && !tpl.turrets.empty()) updateTurrets(u, tgt);
 
     if (u.attackMove && u.path.empty() && combatTarget < 0) u.attackMove = false;
     if (u.orderTargetId >= 0 && tgt && u.path.empty() && !u.isStatic() && u.repathTimer <= 0 && u.pos.dist(tgt->pos) > tpl.attackRange * 0.9f) {
@@ -626,20 +675,183 @@ Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k) {
     return u.pos + Vec2{ -tur.x * sn - tur.y * cs, tur.x * cs - tur.y * sn } * k;
 }
 
-void Game::fire(Unit& u, Unit& target) {
+// RWX OrderableUnit.updateAttackTargeting(:3120) + advanceMovementLevelTowardTarget(:3239): each
+// barrel holds its own target, aims with its own turn speed, charges its own warmup and counts its
+// own delay down, and an attachedTo barrel simply rides along with the turret it is bolted to.
+static constexpr int kMaxTur = 32;   // RWX sizes the per-turret arrays at 31 (MultiTurretPassiveTargetCallback.java:14-24)
+
+void Game::updateTurrets(Unit& u, Unit* unitTarget) {
     const UnitTemplate& tpl = *u.tpl;
-    TurretTpl tur = tpl.turrets.empty() ? TurretTpl{} : tpl.turrets[0];
+    if (tpl.turrets.empty()) return;
+    initTurrets(u);            // an upgrade can swap the template and with it the barrel count
+    // OrderableUnit.supportsIndependentTurretTargets:3067 - a single barrel just takes the unit's
+    // target; with more than one, each picks its own and can shoot something else entirely.
+    const bool independent = tpl.turrets.size() > 1;
+    const int n = std::min((int)tpl.turrets.size(), kMaxTur);
+    float k = texScale(tpl);
+    float turn[kMaxTur] = {};    // each barrel's own turn this tick, applied to the barrels bolted to it
+    Unit* target[kMaxTur] = {};
+    bool anyReady = false;
+    if (u.turretScanTimer > 0) u.turretScanTimer -= 1;        // :3138 moveTowardsZero(turretRotation, f)
+
+    // --- pass 1: timers and aiming (:3151-3202). A linked barrel is not aimed on its own, and the
+    // fire step is deliberately a second loop (:3203-3214) so every parent is settled first.
+    for (int i = 0; i < n; ++i) {
+        const TurretTpl& tur = tpl.turrets[i];
+        TurretState& s = u.tur[i];
+        // rotation counts down both ways, so the -10 "out of range" penalty clears on its own (:868)
+        s.cooldown = moveTowards(s.cooldown, 0.0f, 1.0f);
+        if (s.flameT > 0) s.flameT -= 1.0f;
+        s.active = false;                                    // :3151-3153, re-decided by the aim below
+        if (tur.attached >= 0) continue;                     // follows its parent in pass 2
+
+        // RWX getTargetSearchRange() is 0 for a unit that cannot attack, so a builder's or
+        // harvester's barrels never acquire a target and just rest along the hull.
+        Unit* t = nullptr;
+        if (tpl.canAttack) {
+            if (!independent) {
+                if (unitTarget && turretSees(*this, u, i, *unitTarget)) t = unitTarget;
+            } else {
+                Unit* own = get(s.targetId);
+                if (own && turretSees(*this, u, i, *own)) t = own;
+                else if (unitTarget && turretSees(*this, u, i, *unitTarget)) t = unitTarget;
+                // MultiTurretPassiveTargetCallback:71, run at most once per sweep interval (:3140-3142)
+                else if (u.turretScanTimer == 0) t = nearestInTurretRange(u, i);
+            }
+        }
+        target[i] = t;
+        s.targetId = t ? t->id : -1;
+
+        float before = s.angle, residual;
+        if (tpl.isFixedFiring) {
+            residual = rotateTurret(s, tur, u.facing);       // OrderableUnit.a:3185-3197
+        } else if (t) {
+            Vec2 pv = turretPivot(u, i, k);
+            residual = rotateTurret(s, tur, std::atan2(t->pos.y - pv.y, t->pos.x - pv.x));
+        } else if (tur.shouldResetTurret) {
+            // no target at all: walk back to C(i) = hull angle + idleDir (:846-857)
+            float rest = u.facing + tur.idleDir * 0.0174533f;
+            if (u.isRotating && tpl.reverseSpeed > 0.95f) rest += 3.14159265f;
+            residual = rotateTurret(s, tur, rest);
+        } else {
+            residual = 0.0f;                                 // shouldResetTurret:false parks it here
+        }
+        turn[i] = angleDiff(before, s.angle);
+        if (std::fabs(residual) * 57.29578f < tur.maxAngle) s.active = true;   // canAttackMaxAngle
+    }
+    // :3141 - after a sweep the unit arms the next one, staggered by its position so a whole army
+    // does not re-query on the same tick.
+    if (tpl.canAttack && independent && !unitTarget && u.turretScanTimer == 0)
+        u.turretScanTimer = 20 + (int)std::fmod(u.pos.x, 5.0f) + (int)std::fmod(u.pos.y, 5.0f);
+
+    // --- pass 2: warmup and firing (advanceMovementLevelTowardTarget:3239-3282)
+    for (int i = 0; i < n; ++i) {
+        const TurretTpl& tur = tpl.turrets[i];
+        TurretState& s = u.tur[i];
+        Unit* t = target[i];
+        int pvt = tur.attached;
+        if (pvt >= 0 && pvt < n) {
+            // RWX CustomUnit.a(i, f):1341-1350 - the parent's turn this tick is added to the child,
+            // so a barrel bolted to another aims and recoils with it instead of lagging behind.
+            s.angle = wrapAngle(s.angle + turn[pvt]);
+            s.angVel = u.tur[pvt].angVel;
+            s.active = u.tur[pvt].active;
+            t = target[pvt];
+            s.targetId = t ? t->id : -1;
+        }
+        if (!s.active || !t || s.cooldown != 0.0f || !tur.canShoot) continue;
+        anyReady = true;
+        bool ready;
+        if (tur.warmNoReset) {
+            s.warm = std::min(s.warm + 1.0f, tur.warmup);
+            ready = true;
+        } else if (s.warm < tur.warmup) {
+            s.warm += 1.0f;
+            ready = false;
+        } else {
+            ready = true;
+        }
+        if (!ready) continue;
+        s.cooldown = tur.shootDelay;
+        if (!tur.warmNoReset) s.warm = 0;
+        fire(u, *t, i);
+        s.flip = !s.flip;
+        // linkDelayWithTurret barrels never run their own timer; the shot that leads them restarts
+        // theirs, but only once they are at least half a delay behind (:1323-1328).
+        for (int j = 0; j < n; ++j) {
+            if (j == i || tpl.turrets[j].linkDelay != i) continue;
+            if (u.tur[j].cooldown < 9000.0f - (tur.shootDelay * 0.5f - tpl.turrets[j].warmup))
+                u.tur[j].cooldown = 0.0f;
+        }
+        // a barrel bolted to a decoration turret gives that turret its recoil kick (:1329-1333)
+        if (pvt >= 0 && !tpl.turrets[pvt].canShoot && tpl.turrets[pvt].recoil != 0.0f)
+            u.tur[pvt].cooldown = tpl.turrets[pvt].shootDelay;
+    }
+    // warmupCallDownRate: an interrupted charge leaks away while nothing is lined up to fire (:3227)
+    if (!anyReady)
+        for (int i = 0; i < n; ++i)
+            u.tur[i].warm = moveTowards(u.tur[i].warm, 0.0f, tpl.turrets[i].warmCallDown);
+}
+
+Unit* Game::nearestInTurretRange(const Unit& u, int i) const {
+    Unit* best = nullptr; float bd = 1e18f;
+    for (auto& o : units) {
+        if (o.dead || &o == &u || !turretSees(*this, u, i, o)) continue;
+        float d = u.pos.dist(o.pos);
+        if (d < bd) { bd = d; best = const_cast<Unit*>(&o); }
+    }
+    return best;
+}
+
+// RWX CustomUnit.a(i, false):2870 - an attachedTo turret is bolted to its parent's pivot and turns
+// with it, so the sprite x/y offsets are applied in the parent's frame instead of the hull's.
+Vec2 turretPivot(const Unit& u, int i, float k) {
+    const UnitTemplate& tpl = *u.tpl;
+    if (i < 0 || i >= (int)tpl.turrets.size()) return u.pos;
+    const TurretTpl& tur = tpl.turrets[i];
+    if (tur.attached < 0 || tur.attached == i) return turretPivot(u, tur, k);
+    Vec2 base = turretPivot(u, tur.attached, k);
+    // turretPivot() reads the hull heading; rotate the offset into the parent barrel's frame instead
+    float pa = (tur.attached < (int)u.tur.size()) ? u.tur[tur.attached].angle : 0.0f;
+    float cs = std::cos(pa - u.facing), sn = std::sin(pa - u.facing);
+    return base + Vec2{ cs * tur.y + sn * tur.x, -sn * tur.y + cs * tur.x } * k;
+}
+
+// RWX CustomUnit.a(i, false):2891-2902 - the barrel slides along its own aim by recoilOffset over
+// recoilOutTime ticks and back over recoilReturnTime, timed from the shot that started it.
+float turretRecoil(const Unit& u, int i) {
+    if (i < 0 || i >= (int)u.tur.size() || !u.tpl) return 0.0f;
+    const TurretTpl& tur = u.tpl->turrets[i];
+    const TurretState& s = u.tur[i];
+    if (tur.recoil == 0.0f || s.cooldown <= 0.0f) return 0.0f;
+    float since = tur.shootDelay - s.cooldown;
+    if (since < 0.0f) return 0.0f;
+    if (tur.recoilOut <= 0.0f || since < tur.recoilOut)
+        return tur.recoilOut > 0.0f ? (since / tur.recoilOut) * tur.recoil : tur.recoil;
+    float back = since - tur.recoilOut;
+    if (tur.recoilReturn <= 0.0f) return 0.0f;
+    if (back < tur.recoilReturn) return tur.recoil - (back / tur.recoilReturn) * tur.recoil;
+    return 0.0f;
+}
+
+void Game::fire(Unit& u, Unit& target, int ti) {
+    const UnitTemplate& tpl = *u.tpl;
+    if (ti < 0 || ti >= (int)tpl.turrets.size()) return;
+    const TurretTpl& tur = tpl.turrets[ti];
+    TurretState& s = u.tur[ti];
     int pi = (tur.projectile >= 0 && tur.projectile < (int)tpl.projectiles.size()) ? tur.projectile : -1;
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
     if (pi < 0) pt.directDamage = 10;   // RWX's stand-in [projectile_1] for a unit with none at all
     Projectile p;
-    Vec2 aim{ std::cos(u.turretRot), std::sin(u.turretRot) };
+    Vec2 aim{ std::cos(s.angle), std::sin(s.angle) };
     Vec2 right{ -aim.y, aim.x };
     // RWX CustomUnit.D(i): muzzle = pivot + aim*barrelY + right*barrelX; barrelY defaults to [attack] turretSize.
     // Offsets are sprite px; scale with the drawn body (renderer uses k = displayRadius*2*imageScale / frameW).
     float barrelY = tur.barrelY >= 0 ? tur.barrelY : (tpl.turretSize > 0 ? tpl.turretSize : tpl.radius * 0.8f);
-    float k = tpl.texFrameWpx > 0 ? (tpl.displayRadius * 2.0f * tpl.imageScale) / tpl.texFrameWpx : 1.0f;
-    p.pos = turretPivot(u, tur, k) + (aim * barrelY + right * tur.barrelX) * k;
+    float k = texScale(tpl);
+    float bx = tur.barrelX;
+    if (tur.barrelXOdd != 0.0f && s.flip) bx += tur.barrelXOdd;    // barrelOffsetX_onOddShots
+    p.pos = turretPivot(u, ti, k) + (aim * barrelY + right * bx) * k;
     p.team = u.team; p.sourceId = u.id; p.targetId = target.id; p.dest = target.pos;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
     p.speed = pt.speed; p.life = pt.life;
@@ -649,7 +861,7 @@ void Game::fire(Unit& u, Unit& target) {
     p.largeHit = pt.largeHit;
     // RWX Projectile.az is set from the turret's aim line, not from the target's position
     // (CustomUnit.java:1371), and the shot then flies along that heading.
-    p.heading = u.turretRot;
+    p.heading = s.angle;
     p.turnSpeed = pt.turnSpeed;
     p.speedTarget = pt.targetSpeed; p.speedAccel = pt.targetSpeedAccel;
     if (pt.speedSpread > 0) p.speed += g_rng.range(-pt.speedSpread, pt.speedSpread);
@@ -661,10 +873,10 @@ void Game::fire(Unit& u, Unit& target) {
     if (tur.shootFlame) {
         // RWX EffectManager.createFlameEffect(2): small plays frames 0..3 at 0.5/tick (8 ticks),
         // large/medium frames 1..4 at 0.4/tick (10 ticks); the flame is attached to the shooter.
-        u.muzzleType = tur.shootFlame;
-        u.muzzleT = tur.shootFlame == 1 ? 8.0f : 10.0f;
-        u.muzzleAng = u.turretRot;
-        u.muzzleOff = p.pos - u.pos;
+        s.flameType = tur.shootFlame;
+        s.flameT = tur.shootFlame == 1 ? 8.0f : 10.0f;
+        s.flameAng = s.angle;
+        s.flameOff = p.pos - u.pos;
     }
     if (pt.instant) {
         // RWX update:841,979: an instant shot never moves, it lands on the firing tick.

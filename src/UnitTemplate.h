@@ -12,14 +12,32 @@ struct TurretTpl {
     // RWX [turret_N]: size/barrelY = muzzle distance along the aim (defaults to [attack] turretSize),
     // barrelX = lateral offset, image_drawOffsetX/Y = turret sprite shift relative to the pivot.
     float barrelY = -1, barrelX = 0;
+    float barrelXOdd = 0;     // barrelOffsetX_onOddShots: sideways jump on every other shot
     float drawOffsetX = 0, drawOffsetY = 0;
     // RWX TurretConfig.projectileId: index into the unit's projectiles, chosen by the
     // [projectile_<name>] section a turret names with `projectile: <name>`
     int projectile = 0;
+    // [turret_N] image, empty = the unit's [graphics] image_turret (CustomUnit.d(i):691)
+    std::string image;
     bool invisible = false;
     bool canShoot = true;
     float turnSpeed = 4.0f;
+    // turnSpeedAcceleration (w(i), -1 = snap to the turn speed): the barrel has angular inertia and
+    // may overshoot, which is what makes heavy turrets lag behind a fast target.
+    float turnAccel = -1, turnDecel = -1;
+    // RWX UnitMovementData.rotation countdown: TurretConfig.m, from `delay` or [attack] shootDelay.
+    // linkDelayWithTurret sets 9000 so the parent's barrage is what restarts this barrel's timer.
+    float shootDelay = -1;
     float warmup = 0;
+    float warmCallDown = 4;   // warmupCallDownRate: how fast an interrupted charge bleeds off
+    bool warmNoReset = false; // warmupNoReset: the charge survives between barrages
+    // limitingRange / limitingMinRange / canAttackMaxAngle: what this barrel may hit and how well it
+    // must be aligned (5 deg by default) before it is considered aimed.
+    float range = 0, minRange = 0, maxAngle = 5;
+    // recoilOffset / recoilOutTime / recoilReturnTime: the barrel slides along its aim after a shot
+    float recoil = 0, recoilOut = 0, recoilReturn = 0;
+    // attachedTo / linkDelayWithTurret, resolved to turret indexes (-1 = none)
+    int attached = -1, linkDelay = -1;
     // RWX [turret_N]: idle rest angle relative to the hull, and whether the turret returns to it
     float idleDir = 0;
     bool shouldResetTurret = true;
@@ -103,6 +121,8 @@ struct UnitTemplate {
     bool canAttack = false;
     bool canAttackFlying = false, canAttackLand = true, canAttackUnderwater = false;
     bool isFixedFiring = false;
+    // [attack] turretRotateWithBody: the hull's turn is added to every barrel's aim (default true)
+    bool turretRotateWithBody = true;
     float attackRange = 0, shootDelay = 60, turretSize = 0, turretTurnSpeed = 3;
 
     MoveType moveType = MoveType::NONE;

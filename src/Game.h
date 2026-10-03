@@ -6,6 +6,23 @@
 #include "TileMap.h"
 #include "UnitTemplate.h"
 
+// One barrel's runtime state. RWX keeps this in UnitMovementData[] movementLevels, one entry per
+// [turret_N], so every barrel aims, warms up, counts its own delay and picks its own target
+// (OrderableUnit.syncAttackTargetToMovementLevels / advanceMovementLevelTowardTarget).
+struct TurretState {
+    float angle = 0;       // movementLevels[i].targetX, world radians
+    float angVel = 0;      // .velocityX, deg/tick while turnSpeedAcceleration is in use
+    float cooldown = 0;    // .rotation, ticks left before this barrel may fire again
+    float warm = 0;        // .speed, warmup ticks charged
+    bool active = false;   // .isActive: aimed well enough to fire
+    bool flip = false;     // .m: alternates each shot, drives barrelOffsetX_onOddShots
+    int targetId = -1;     // .targetUnit
+    // shoot_flame is attached to the shooter, so it keeps its own offset and angle while it plays
+    int flameType = 0;
+    float flameT = 0, flameAng = 0;
+    Vec2 flameOff;
+};
+
 struct Unit {
     int id = -1;
     std::string tplKey;
@@ -13,7 +30,10 @@ struct Unit {
     int team = 0;
     Vec2 pos;
     float facing = 0;        // body direction (radians)
-    float turretRot = 0;     // current turret angle
+    std::vector<TurretState> tur;   // one entry per tpl->turrets
+    // RWX OrderableUnit.turretRotation: a 20-29 tick countdown between passive target sweeps, so an
+    // army of multi-barrel units does not re-query the whole map every tick.
+    int turretScanTimer = 0;
     float hp = 1, maxHp = 1;
     std::vector<Vec2> path;  // world-space waypoints
     int pathIdx = 0;
@@ -26,7 +46,6 @@ struct Unit {
     float prodProgress = 0;
     bool underConstruction = false;
     float buildProgress = 0; // 0..1 for buildings being constructed
-    float shootCooldown = 0;
     Vec2 rallyPoint; bool hasRally = false;
     bool selected = false;
     bool dead = false;
@@ -49,17 +68,16 @@ struct Unit {
     // negative while flip-turning; isRotating marks the >100 deg reverse-and-pivot manoeuvre.
     float throttle = 0;
     bool isRotating = false;
-    // RWX shoot_flame: the flame effect is attached to the unit, so it keeps its offset from the
-    // firing turret and its angle while it plays.
-    int muzzleType = 0;
-    float muzzleT = 0, muzzleAng = 0;
-    Vec2 muzzleOff;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
 
 // world-space turret pivot; sprite-space (x,y) offset rotated with the body, k = px scale
 Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k);
+// the same for turret i of a live unit, following the attachedTo chain (CustomUnit.a(i, false):2870)
+Vec2 turretPivot(const Unit& u, int i, float k);
+// barrel slide along its own aim, recoilOutTime/recoilReturnTime ticks after a shot
+float turretRecoil(const Unit& u, int i);
 
 struct Projectile {
     Vec2 pos, vel;
@@ -189,7 +207,9 @@ private:
     void killUnit(Unit& u);
     void explode(Vec2 at, bool big, float scale = 1.0f);
     void addScorch(Vec2 at);
-    void fire(Unit& u, Unit& target);
+    void updateTurrets(Unit& u, Unit* unitTarget);
+    Unit* nearestInTurretRange(const Unit& u, int i) const;
+    void fire(Unit& u, Unit& target, int ti);
     void runAI();
     std::vector<Unit*> queryNearestEnemy(int team, Vec2 pos, float maxDist, const UnitTemplate* shooter);
 };
