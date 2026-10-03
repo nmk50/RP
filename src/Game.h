@@ -94,6 +94,17 @@ struct Unit {
     // Everything below 4 px still counts as ground for collisions, targeting and splashes
     // (CustomUnit.i():636-638), and at or below -1 a unit is submerged (Q():641-643).
     float posZ = 0, heightPhase = 0;
+    // RWX CustomUnit.update:1672-1768: a hull that dies above the ground with [movement]
+    // slowDeathFall is not finished -- it keeps descending (`fallVel` is the frameAnimationDelay that
+    // stands in for the falling velocity here), slides on its last movement step, trails smoke, and
+    // only turns into a wreck or disappears once posZ reaches 0. `smokeTimer` and `debrisTimer` are
+    // unitAnimationRotation (:1684, a puff every 9 ticks) and unitAnimationOffset (:1702, every 7).
+    bool deathFalling = false;
+    // e():946-951 gives a non-slowDeathFall hull that dies in the air its image_wreak texture right at
+    // death, so the thing that falls is already a burnt wreck.
+    bool corpseWreck = false;
+    float fallVel = 0;
+    int smokeTimer = 0, debrisTimer = 0;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
     bool airborne() const { return tpl && tpl->moveType == MoveType::AIR && posZ >= 4.0f; }
@@ -180,6 +191,17 @@ struct Effect {
     float frameSpeed = 0.5f;  // frames per tick
     float life = 26.0f;       // ticks before it is dropped (flames: 13 / frameSpeed)
     bool trail = false;       // smoke puff rather than a flame
+    // RWX Effect.Q, the per-tick drift of a puff: a projectile trail sinks 0.1 px/tick (Projectile:934)
+    // while a dying hull's smoke is pinned at Q=0 (CustomUnit:1699).
+    float sink = 0;
+    // RWX Effect.ap, the frame picked out of the sheet. A fire puff takes a random one of fire.png's four
+    // 20px cells (EffectEmitter.java:97-118, whose aq=7 is that sheet per EffectManager.java:735-744).
+    int frame = 0;
+    bool fire = false;
+    // RWX Effect.G and the fade-in length Effect.t for a puff (Effect.java:437, 521-526). The projectile
+    // trail runs 0.5 -> 1.2 over 70 ticks fading in for 5; the death smoke is 0.9 -> 1.2 over 60 with no
+    // fade-in at all.
+    float puffFrom = 0.5f, puffTo = 1.2f, puffFadeIn = 5.0f;
     bool dead = false;
 };
 
@@ -262,6 +284,8 @@ public:
 
 private:
     void updateUnit(Unit& u);
+    // the CustomUnit.java:1672-1768 descent of a corpse that died above the ground
+    void updateDeathFall(Unit& u);
     // RWX OrderableUnit.updateAllUnitCollisions:451-509 -- the per-tick soft-collision pass that keeps
     // overlapping hulls apart, replacing a symmetric push.
     void resolveSoftCollisions();

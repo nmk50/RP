@@ -203,6 +203,15 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // RWX draws the hull at posY - posZ (CustomUnit.java:2416), while its shadow stays flat on the
     // ground: OrderableUnit.drawShadow:4414-4425 deliberately does not subtract the height.
     Vector2 pv{ u.pos.x, u.pos.y - u.posZ };
+    // A non-slowDeathFall hull that dies above the ground has already been given image_wreak as its
+    // base texture (CustomUnit.e():946-951), so what falls is the burnt wreck sprite, turrets, shield
+    // and health bar all gone from the frame it died (:2414-2424 draws a wreck as the bare texture).
+    Texture2D wt;
+    if (u.dead && u.corpseWreck && loaded(t, 2, wt)) {
+        drawSpriteFrame(wt, 1, 0, pv, scale * t.imageScale,
+                        t.isStatic() ? 0 : spriteRot(u.facing), WHITE);
+        return;
+    }
     float baseFrameW = 0;
     if (loaded(t, 0, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
@@ -347,12 +356,40 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
                 if (!e.trail) continue;
                 float el = e.t - e.delay;
                 if (el < 0) continue;
-                float a = el < 5.0f ? 0.5f * (el / 5.0f) : 0.5f * std::max(0.0f, (70.0f - el) / 65.0f);
-                float sz = 25.0f * (0.5f + 0.7f * std::min(1.0f, el / 70.0f));
+                // Effect.java:521-526: E=0.5, fading in over t ticks and then out over the remaining
+                // W-t; :437 scales lerp(G, F, 1 - V/W).
+                float in = e.puffFadeIn;
+                float a = (in > 0.0f && el < in) ? 0.5f * (el / in)
+                    : 0.5f * std::max(0.0f, (e.life - el) / std::max(1.0f, e.life - in));
+                float sz = 25.0f * (e.puffFrom + (e.puffTo - e.puffFrom) * std::min(1.0f, el / e.life));
                 DrawTexturePro(puffs, Rectangle{ 1, 1, 25, 25 },
                                Rectangle{ e.pos.x, e.pos.y, sz, sz }, Vector2{ sz / 2, sz / 2 },
                                e.rot * 57.29578f + 90.0f,   // Effect.java:541 draws at Y + 90
                                Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
+            }
+        }
+    }
+    // A falling hull's fire puffs (CustomUnit.java:1702-1714): EffectEmitter.b picks aq=7, which is
+    // fire.png's 20px row (EffectManager.java:735-744), and a random one of its four frames. E stays at
+    // its default 1 and s=true/t=10 fade it in over the first 10 ticks, r=true then fades the remaining
+    // 40 (Effect.java:521-526), while R=0.2 turns the sprite (:366) -- here as a random start angle.
+    {
+        Texture2D ftex;
+        bool any = false;
+        for (auto& e : g.effects) if (e.fire) { any = true; break; }
+        if (any && shared("fire.png", ftex)) {
+            float cell = (float)ftex.height;
+            int frames = std::max(1, ftex.width / (int)cell);
+            for (auto& e : g.effects) {
+                if (!e.fire) continue;
+                float el = e.t - e.delay;
+                if (el < 0) continue;
+                float a = el < 10.0f ? el / 10.0f
+                    : std::max(0.0f, (e.life - el) / std::max(1.0f, e.life - 10.0f));
+                int f = std::min(frames - 1, e.frame);
+                DrawTexturePro(ftex, Rectangle{ f * cell, 0, cell, cell },
+                               Rectangle{ e.pos.x, e.pos.y, cell, cell }, Vector2{ cell / 2, cell / 2 },
+                               e.rot * 57.29578f, Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
             }
         }
     }
@@ -404,7 +441,7 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         const int kFrames = 13;
         float fw = ex.width / (float)kFrames;
         for (auto& e : g.effects) {
-            if (e.trail) continue;
+            if (e.trail || e.fire) continue;
             float el = e.t - e.delay;
             if (el < 0) continue;
             float a = 0.7f * std::max(0.0f, std::min(1.0f, (e.life - el) / 10.0f));

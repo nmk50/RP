@@ -185,6 +185,17 @@ struct UnitTemplate {
     // +-targetHeightDrift around it; both default to 35 and 1.5 for air and 0 otherwise. A negative
     // heightChangeRate (-1, the default) asks for the automatic ease-out climb instead of a fixed rate.
     float targetHeight = 0, targetHeightDrift = 0, heightChangeRate = -1, startingHeightOffset = 0;
+    // [movement] fallingAccelerationDead (:2007, default 0.06) is the gravity a corpse picks up on its
+    // way down; [movement] slowDeathFall (:1957, default false) instead descends at a steady
+    // 0.017 px/tick^2 while the hull still has rotation or velocity, sliding on its last step, and only
+    // then swaps to image_wreak / disappears at touchdown (CustomUnit.java:1672-1768).
+    // slowDeathFallSmoke (:1958, default true) trails smoke on that descent.
+    float fallingAccelerationDead = 0.06f;
+    bool slowDeathFall = false, slowDeathFallSmoke = true;
+    // [core] explodeOnDeathGroundCollision (:1800, default true, and the historical
+    // explodeOnDeathGroundCollosion spelling is still read as its alias): a corpse that hit the ground
+    // with speed (frameAnimationDelay > 0.5) detonates there (CustomUnit.java:1734-1748).
+    bool explodeOnDeathGroundCollision = true;
 
     float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0.2f;
     // RWX repair gates: CustomUnitConfigParser.java:1746-1747 (both default false) and :1732

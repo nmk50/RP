@@ -175,6 +175,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.fogSight = (float)c->getNum("fogofwarsightrange", 0);
         t.energyUse = (float)c->getNum("energyusage", 0);
         t.explodeOnDeath = c->getBool("explodeondeath", true);
+        // :1800 the crash-on-touchdown flag, read through its historical misspelling as an alias.
+        t.explodeOnDeathGroundCollision =
+            c->getBool("explodeondeathgroundcollision", c->getBool("explodeondeathgroundcollosion", true));
         t.hideScorchMark = c->getBool("hidescorchmark", false);
         auto fp = parseCSV(c->get("footprint", c->get("constructionfootprint", "0,0,0,0")));
         if (fp.size() >= 4) { t.footL = (int)fp[0]; t.footU = (int)fp[1]; t.footR = (int)fp[2]; t.footD = (int)fp[3]; }
@@ -286,6 +289,12 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         // :2006 heightChangeRate; the -1 default is the "use the automatic ease-out" sentinel.
         t.heightChangeRate = (float)m->getNum("heightchangerate", -1);
         t.startingHeightOffset = (float)m->getNum("startingheightoffset", 0);
+        // :1957-1958, :2007 the falling corpse: slowDeathFall glides instead of dropping, and only a
+        // hull that had neither rotation nor velocity (or no slowDeathFall at all) accelerates at
+        // fallingAccelerationDead.
+        t.slowDeathFall = m->getBool("slowdeathfall", false);
+        t.slowDeathFallSmoke = m->getBool("slowdeathfallsmoke", true);
+        t.fallingAccelerationDead = (float)m->getNum("fallingaccelerationdead", 0.06);
     }
     if (t.isBuilding) t.moveType = MoveType::NONE;
 

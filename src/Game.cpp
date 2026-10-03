@@ -459,10 +459,15 @@ void Game::update() {
     for (size_t i = 0; i < units.size(); ++i) updateUnit(units[i]);
     for (auto& p : projectiles) updateProjectile(p);
     resolveSoftCollisions();
-    // A trail puff sinks 0.1 px/tick (Effect.java:364-366 applying the Q set at Projectile:934).
-    for (auto& e : effects) { e.t += 1; if (e.trail) e.pos.y += 0.1f; if (e.t - e.delay >= e.life) e.dead = true; }
+    // A puff drifts by its own Effect.Q per tick (Effect.java:364-366); only the projectile trail sets
+    // one, at 0.1 (Projectile:934).
+    for (auto& e : effects) { e.t += 1; e.pos.y += e.sink; if (e.t - e.delay >= e.life) e.dead = true; }
     for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
-    units.erase(std::remove_if(units.begin(), units.end(), [](const Unit& u) { return u.dead; }), units.end());
+    // A dead unit only leaves the list when its death fall is over -- CustomUnit keeps the falling hull
+    // as a live game object until it touches down (:1672, and the object is dropped at :1731 / by the
+    // isDeathFallComplete path at :1752).
+    units.erase(std::remove_if(units.begin(), units.end(), [](const Unit& u) {
+        return u.dead && !u.deathFalling; }), units.end());
     projectiles.erase(std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.dead; }), projectiles.end());
     effects.erase(std::remove_if(effects.begin(), effects.end(), [](const Effect& e) { return e.dead; }), effects.end());
     particles.erase(std::remove_if(particles.begin(), particles.end(), [](const Particle& p) { return p.dead; }), particles.end());
@@ -595,7 +600,11 @@ static void updateHeight(Unit& u, const UnitTemplate& tpl) {
 }
 
 void Game::updateUnit(Unit& u) {
-    if (u.dead || !u.tpl) return;
+    if (!u.tpl) return;
+    // A corpse that died above the ground does not update as a unit any more -- no height, no shield, no
+    // orders -- it only falls (CustomUnit.update:1672-1768, and :1770-1772 returns for every other dead
+    // unit before the live part of update starts).
+    if (u.dead) { if (u.deathFalling) updateDeathFall(u); return; }
     const UnitTemplate& tpl = *u.tpl;
     u.moved = false;
     updateHeight(u, tpl);
@@ -1219,6 +1228,7 @@ void Game::updateProjectile(Projectile& p) {
                 Effect e;
                 // RWX builds the puff at the shot's drawn position, which is posY - posZ.
                 e.pos = Vec2{ p.pos.x, p.pos.y - p.posZ }; e.trail = true; e.life = 70.0f;
+                e.sink = 0.1f;      // Projectile:934 Q = 0.1
                 // Projectile:939 Y = randomFloatInRange(-180, 180) degrees
                 e.rot = g_rng.range(-3.14159265f, 3.14159265f);
                 effects.push_back(e);
@@ -1366,12 +1376,78 @@ void Game::removeUnit(Unit& u) {
 void Game::killUnit(Unit& u) {
     if (u.dead) return;
     bool big = u.tpl && u.tpl->radius > 20;
+    // CustomUnit.e():943-952 answers whether the death is allowed to keep the object: yes for
+    // slowDeathFall, yes for an image_wreak hull (which shows the wreck sprite from then on), no for
+    // anything else -- and the fall itself is driven purely by height, since update:1673 only asks for
+    // posZ > 0. So a plain hovering hull with a wreck image still drops out of the sky.
+    bool hangs = u.posZ > 0.0f && u.tpl &&
+        (u.tpl->slowDeathFall || !u.tpl->imageWreak.empty());
     removeUnit(u);
-    explode(u.pos, big);
-    // RWX CustomUnit.java:891-893: an exploding unit leaves a permanent mark on the ground.
-    if (u.tpl && u.tpl->explodeOnDeath && !u.tpl->hideScorchMark && !overWater(*this, u.pos)) addScorch(u.pos);
-    // RWX CustomUnit.java:946: with image_wreak the corpse stays behind instead of vanishing.
-    if (u.tpl && !u.tpl->imageWreak.empty()) wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
+    u.deathFalling = hangs;
+    u.corpseWreck = hangs && !u.tpl->slowDeathFall;
+    explode(Vec2{ u.pos.x, u.pos.y - u.posZ }, big);
+    // :922-929 -- only a grounded wreck scorches the ground, and only explodeOnDeath asks for the mark.
+    if (u.tpl && u.tpl->explodeOnDeath && !u.tpl->hideScorchMark && !hangs && !overWater(*this, u.pos))
+        addScorch(u.pos);
+    // RWX CustomUnit.java:946: with image_wreak the corpse stays behind instead of vanishing. A falling
+    // one leaves it at touchdown instead (update:1726-1729).
+    if (u.tpl && !u.tpl->imageWreak.empty() && !hangs)
+        wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
+}
+
+// RWX CustomUnit.update:1672-1768 -- the descent of a corpse that died above the ground.
+void Game::updateDeathFall(Unit& u) {
+    const UnitTemplate& tpl = *u.tpl;
+    // :1674 the slow spiral down only happens while the hull is still flying: RWX asks for a nonzero
+    // rotation (its throttle) or leftover velocity, otherwise the corpse just drops.
+    bool gliding = tpl.slowDeathFall && (u.throttle != 0.0f || u.vel.len() > 1e-6f);
+    // :1675 / :1718 frameAnimationDelay carries the falling speed here: a steady 0.017 px per tick
+    // squared while gliding, otherwise fallingAccelerationDead (default 0.06) keeps adding to it.
+    u.fallVel += gliding ? 0.017f : tpl.fallingAccelerationDead;
+    u.posZ -= u.fallVel;
+
+    if (gliding && tpl.moveType == MoveType::AIR) {
+        // :1677-1679 getMovementDeltaOffset:5136-5146 -- the wreck slides on the step its movement would
+        // have taken, written straight into posX/posY with no passability or collision test.
+        u.pos = u.pos + (tpl.moveSlidingMode ? u.vel
+            : Vec2{ std::cos(u.facing), std::sin(u.facing) } * (tpl.moveSpeed * u.throttle));
+        // :1684-1700 a smoke puff on a 9-tick countdown that resets to a random 1..3
+        if (tpl.slowDeathFallSmoke && ++u.smokeTimer > 9) {
+            u.smokeTimer = (int)g_rng.range(1.0f, 3.0f);
+            Effect e;
+            e.pos = Vec2{ u.pos.x, u.pos.y - u.posZ };
+            e.rot = g_rng.range(-3.14159265f, 3.14159265f);
+            e.trail = true;
+            e.life = 60.0f;             // EffectEmitter-side mirror of W=60
+            e.puffFrom = 0.9f;          // G=0.9 -> F=1.2, and no fade-in (r=true, s unset)
+            e.puffFadeIn = 0.0f;
+            effects.push_back(e);
+        }
+        // :1702-1714 and a fire puff every 7 ticks, jittered +-4 px around the hull
+        if (++u.debrisTimer > 7) {
+            u.debrisTimer = 0;
+            Effect e;
+            e.pos = u.pos + Vec2{ g_rng.range(-4.0f, 4.0f), g_rng.range(-4.0f, 4.0f) };
+            e.pos.y -= u.posZ;
+            e.rot = g_rng.range(-3.14159265f, 3.14159265f);
+            e.fire = true;
+            e.frame = (int)g_rng.range(0.0f, 3.999f);   // EffectEmitter.b: ap = random 0..3
+            e.life = 50.0f;
+            effects.push_back(e);
+        }
+    }
+
+    if (u.posZ > 0.0f) return;
+    // :1721-1733 touchdown: the hull now shows image_wreak, or disappears with no wreck at all.
+    u.posZ = 0.0f;
+    if (!tpl.imageWreak.empty()) wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
+    // :1734-1748 a corpse that had picked up real speed detonates where it landed.
+    if (u.fallVel > 0.5f && tpl.explodeOnDeathGroundCollision) {
+        explode(u.pos, false);
+        if (!overWater(*this, u.pos) && !tpl.hideScorchMark) addScorch(u.pos);
+    }
+    u.fallVel = 0;
+    u.deathFalling = false;
 }
 
 void Game::runAI() {
