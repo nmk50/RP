@@ -180,6 +180,11 @@ struct UnitTemplate {
     // velocity with a 1.41x steering rate and no throttle ramp (:893-918, :3009-3010) -- glide, not
     // strafing. Both default false.
     bool moveIgnoringBody = false, moveSlidingMode = false;
+    // [movement] targetHeight / targetHeightDrift / heightChangeRate / startingHeightOffset
+    // (CustomUnitConfigParser.java:1993-2006). An AIR hull cruises at targetHeight and bobs a sine of
+    // +-targetHeightDrift around it; both default to 35 and 1.5 for air and 0 otherwise. A negative
+    // heightChangeRate (-1, the default) asks for the automatic ease-out climb instead of a fixed rate.
+    float targetHeight = 0, targetHeightDrift = 0, heightChangeRate = -1, startingHeightOffset = 0;
 
     float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0.2f;
     // RWX repair gates: CustomUnitConfigParser.java:1746-1747 (both default false) and :1732

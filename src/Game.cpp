@@ -88,7 +88,10 @@ static float rotateTurret(TurretState& s, const TurretTpl& tur, float want) {
 static bool turretSees(const Game& g, const Unit& u, int i, const Unit& t) {
     if (!t.tpl || t.dead || !t.operational() || !g.isEnemy(u.team, t.team)) return false;
     const TurretTpl& tur = u.tpl->turrets[i];
-    bool fly = t.tpl->isAirUnit(), sea = t.tpl->isWaterUnit(), land = !fly && !sea;
+    // RWX CustomUnit.canAttackUnitType-style domain test (:1296-1314) reads the target's *height*, not
+    // its movement type: airborne means canAttackFlyingUnits, submerged means canAttackUnderwaterUnits,
+    // and everything else -- surface ships included -- is the canAttackLandUnits domain.
+    bool fly = t.airborne(), sea = t.submerged(), land = !fly && !sea;
     if (!((fly && tur.canAttackFlying) || (land && tur.canAttackLand) || (sea && tur.canAttackUnderwater))) return false;
     float d = u.pos.dist(t.pos);
     if (tur.range > 0 && d > tur.range) return false;
@@ -206,6 +209,9 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.pos = pos;
     u.prevPos = pos;
     u.hp = u.maxHp = tpl->maxHp;
+    // [movement] startingHeightOffset is added once, when the config is first applied
+    // (CustomUnit.java:1063-1065), so an air unit without it lifts off from the ground.
+    u.posZ = tpl->startingHeightOffset;
     // RWX CustomUnit.java:1074-1083: a shielded unit comes up with a full bubble, and only
     // [core] startShieldAtZero asks for it to fill up from empty instead.
     u.shieldMax = (float)tpl->maxShield;
@@ -431,7 +437,7 @@ std::vector<Unit*> Game::findEnemyUnits(int team, Vec2 center, float radius, boo
     for (auto& u : units) {
         if (!u.tpl || u.dead) continue;
         if (!isEnemy(team, u.team)) continue;
-        bool isFly = u.tpl->isAirUnit(), isSea = u.tpl->isWaterUnit(), isLand = !isFly && !isSea;
+        bool isFly = u.airborne(), isSea = u.submerged(), isLand = !isFly && !isSea;
         if (!((isFly && flying) || (isLand && land) || (isSea && underwater))) continue;
         if (center.dist(u.pos) <= radius + u.tpl->radius) r.push_back(&u);
     }
@@ -510,15 +516,15 @@ static void softPushPair(Unit& a, Unit& b) {
 // rule that separates overlapping hulls. It replaces a symmetric half-overlap nudge, which ignored
 // mass, terrain group and buildings alike, so a scout could bulldoze a tank across a factory floor.
 void Game::resolveSoftCollisions() {
-    // BaseUnit.bR():944-958 numbers the groups: 3 airborne, 2 submerged, 1 everything else, and -1 for
-    // a unit out of the collision world. RWX reads 3 and 2 off posZ (CustomUnit.java:636-643), which RP
-    // has no model for, so the movement type stands in -- and like RWX that leaves hover units in the
-    // ground group, because only movementType AIR can be airborne.
+    // BaseUnit.bR():944-958 numbers the groups straight off the height: 3 airborne (posZ >= 4),
+    // 2 submerged (posZ <= -1), 1 everything else, and -1 for a unit out of the collision world. A
+    // surface ship is group 1 and shares it with the tanks, exactly as in RWX; only a plane low on its
+    // approach is still down there with them (CustomUnit.i():636-638).
     for (auto& u : units) {
         int group = 1;
         if (!u.tpl || u.dead) group = -1;
-        else if (u.tpl->moveType == MoveType::AIR) group = 3;
-        else if (u.tpl->moveType == MoveType::WATER) group = 2;
+        else if (u.airborne()) group = 3;
+        else if (u.submerged()) group = 2;
         u.collisionGroup = group;
     }
     // Last tick's buffered push is folded in here, before the new overlaps are measured, clamped to
@@ -572,10 +578,27 @@ void Game::resolveSoftCollisions() {
         for (auto& n : near[i]) softPushPair(units[i], *n.other);
 }
 
+// RWX CustomUnit.update:1996-2029, the AIR height pass. The hull bobs on a sine around
+// [movement] targetHeight and eases toward it: the wanted rate is |posZ-2|*0.02+0.2 (so a hull far
+// from the ground climbs fast), but it is clamped to |posZ-desired|*0.015+0.1, which turns the last
+// pixel of the climb into a smooth arrival instead of a jitter across the target. RWX folds these into
+// Utility.distanceSq(:233-241), which despite the name is an approach-with-limit.
+static void updateHeight(Unit& u, const UnitTemplate& tpl) {
+    if (tpl.moveType != MoveType::AIR) return;
+    u.heightPhase += 2.0f;                       // :1996-2000, 2 degrees per tick, wrapping at 360
+    if (u.heightPhase > 360.0f) u.heightPhase -= 360.0f;
+    float want = tpl.targetHeight + std::sin(u.heightPhase * 0.0174533f) * tpl.targetHeightDrift;
+    float raw = tpl.heightChangeRate >= 0.0f ? tpl.heightChangeRate
+                                             : std::fabs(u.posZ - 2.0f) * 0.05f * 0.4f + 0.2f;
+    float limit = std::fabs(u.posZ - want) * 0.05f * 0.3f + 0.1f;
+    u.posZ = moveTowards(u.posZ, want, std::min(raw, limit));
+}
+
 void Game::updateUnit(Unit& u) {
     if (u.dead || !u.tpl) return;
     const UnitTemplate& tpl = *u.tpl;
     u.moved = false;
+    updateHeight(u, tpl);
     if (u.underConstruction && u.buildProgress >= 1.0f) u.underConstruction = false;
     if (tpl.creditIncomeRate > 0 && u.operational() && tick % 10 == 0)
         reward(u.team, tpl.creditIncomeRate * (10.0f / 40.0f));
@@ -1065,6 +1088,10 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     float bx = tur.barrelX;
     if (tur.barrelXOdd != 0.0f && s.flip) bx += tur.barrelXOdd;    // barrelOffsetX_onOddShots
     p.pos = turretPivot(u, ti, k) + (aim * barrelY + right * bx) * k;
+    // RWX Projectile.posZ (:889-900 chases the aim height from the muzzle) starts at the shooter's own
+    // height, and aimZ is the chased unit's live posZ (:754-761). No shipped turret sets [turret]
+    // height, so the muzzle adds nothing on top of that.
+    p.posZ = u.posZ; p.aimZ = target.posZ;
     p.team = u.team; p.sourceId = u.id; p.targetId = target.id; p.dest = target.pos;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
     p.speed = pt.speed; p.life = pt.life;
@@ -1101,7 +1128,9 @@ void Game::fire(Unit& u, Unit& target, int ti) {
         s.flameOff = p.pos - u.pos;
     }
     if (pt.instant) {
-        // RWX update:841,979: an instant shot never moves, it lands on the firing tick.
+        // RWX update:841,979: an instant shot never moves, it lands on the firing tick. It also skips
+        // the height gate, and its burst height aX becomes the target's own posZ (:1026-1036).
+        p.impactZ = target.posZ;
         impact(p, &target, target.pos);
         if (p.expandTotal <= 0) return;   // nothing is left to animate, so no projectile is spawned
     }
@@ -1120,7 +1149,7 @@ static Unit* retargetShot(Game& g, Projectile& p) {
     float bestD = p.autoRetargetRange * p.autoRetargetRange;
     for (auto& u : g.units) {
         if (!u.tpl || u.dead || !u.operational() || !g.isEnemy(p.team, u.team)) continue;
-        bool fly = u.tpl->isAirUnit(), sea = u.tpl->isWaterUnit();
+        bool fly = u.airborne(), sea = u.submerged();
         if (!((fly && p.atkFly) || (!fly && !sea && p.atkLand) || (sea && p.atkSea))) continue;
         float dx = at.x - u.pos.x, dy = at.y - u.pos.y;
         float d = dx * dx + dy * dy;
@@ -1150,6 +1179,9 @@ void Game::updateProjectile(Projectile& p) {
     if (!t && p.autoRetarget) t = retargetShot(*this, p);
     // RWX keeps chasing the corpse, so a shot whose target dies mid-flight still lands where it died.
     if (t) p.dest = t->pos;
+    // :794-801 once there is no unit to follow the aim height drops back to the ground, so a shell that
+    // lost its aircraft sinks to 0 and flies on as a ground shot rather than hovering at 35 px.
+    p.aimZ = t ? t->posZ : 0.0f;
     Vec2 aim = t ? t->pos : p.dest;
     float dist = p.pos.dist(aim);
     float want = std::atan2(aim.y - p.pos.y, aim.x - p.pos.x);
@@ -1159,6 +1191,15 @@ void Game::updateProjectile(Projectile& p) {
     if (dist < step) { step = dist; dist = 0; }
     Vec2 dir{ std::cos(p.heading), std::sin(p.heading) };
     p.pos = p.pos + dir * step;
+    // :889-900 -- part of every step goes into climbing or diving, taken in the same proportion as the
+    // 2D gap still open, so the shot comes in along the straight 3D line rather than arriving on the
+    // ground and only then rising. Once the 2D gap is closed the whole step is available for height.
+    float dz = p.aimZ - p.posZ;
+    if (dz != 0.0f) {
+        float zStep = dist > 0.1f ? std::min(std::fabs(dz) / dist * p.speed, p.speed) : p.speed;
+        p.posZ += std::max(-zStep, std::min(dz, zStep));
+        dz = p.aimZ - p.posZ;
+    }
     if (p.wobbleAmp != 0) {
         float off = std::sin((p.ticks * 360.0f / p.wobbleFreq + p.wobblePhase * 360.0f) * 0.0174533f) * p.wobbleAmp;
         p.pos = p.pos + Vec2{ -dir.y, dir.x } * off;
@@ -1176,16 +1217,20 @@ void Game::updateProjectile(Projectile& p) {
             p.trailT = 0;
             if (effects.size() < 470) {
                 Effect e;
-                e.pos = p.pos; e.trail = true; e.life = 70.0f;
+                // RWX builds the puff at the shot's drawn position, which is posY - posZ.
+                e.pos = Vec2{ p.pos.x, p.pos.y - p.posZ }; e.trail = true; e.life = 70.0f;
                 // Projectile:939 Y = randomFloatInRange(-180, 180) degrees
                 e.rot = g_rng.range(-3.14159265f, 3.14159265f);
                 effects.push_back(e);
             }
         }
     }
-    // RWX lands within a flat 6px of a unit, or within 0.8 of a building's radius (update:961-967)
+    // RWX lands within a flat 6px of a unit, or within 0.8 of a building's radius (update:961-967), and
+    // :971-978 adds the other half of the test -- the height gap has to be under 3 px too, so a shell
+    // that arrives still 20 px below a plane flies straight on past it.
     float hitR = (t && t->tpl && t->tpl->isBuilding) ? std::max(6.0f, t->tpl->radius * 0.8f) : 6.0f;
-    if (dist < hitR) {
+    if (dist < hitR && std::fabs(dz) < 3.0f) {
+        p.impactZ = p.posZ;
         impact(p, t, p.pos);
         if (p.expandTotal <= 0) p.dead = true;
         return;
@@ -1200,15 +1245,18 @@ void Game::updateProjectile(Projectile& p) {
 void Game::impact(Projectile& p, Unit* direct, Vec2 at) {
     p.hit = true;
     p.impactPos = at;
-    p.airBurst = direct && direct->tpl && direct->tpl->moveType == MoveType::AIR;
+    // The flash is drawn where the shot actually detonated, which for a burst against an aircraft is
+    // posZ px above the ground (RWX keeps aX as a height, Projectile.update:1021-1036); the splash
+    // underneath still measures in ground coordinates.
+    Vec2 drawn{ at.x, at.y - p.impactZ };
     // largeHitEffect reads backwards but is literal in RWX: it means "this weapon brings its own
     // hit flash", which swaps the generic seven-flame blast for a small one, plus one flame scaled
     // by the blast radius when that radius exceeds 10px (update:1168-1185).
     if (p.largeHit) {
-        if (p.areaRadius > 10) explode(at, false, p.areaRadius / 25.0f);
-        explode(at, false);
+        if (p.areaRadius > 10) explode(drawn, false, p.areaRadius / 25.0f);
+        explode(drawn, false);
     } else {
-        explode(at, true);
+        explode(drawn, true);
     }
     if (direct && p.damage > 0) damage(*direct, p.damage * damageScale(p, *direct), &p);
     if (p.expandTotal > 0) p.expandT = p.expandTotal;
@@ -1223,7 +1271,9 @@ void Game::splash(Projectile& p, float frac) {
     float ring = p.areaRadius * std::min(1.0f, frac);
     for (auto& u : units) {
         if (!u.tpl || u.dead || !isEnemy(p.team, u.team)) continue;
-        if ((u.tpl->moveType == MoveType::AIR) != p.airBurst) continue;
+        // :1459-1491 -- the burst stays in the domain it went off in, judged by height: aX >= 5 is an
+        // air burst and only aircraft feel it, a ground burst only catches what is still on the ground.
+        if (u.airborne() != (p.impactZ >= 5.0f)) continue;
         float d = u.pos.dist(p.impactPos);
         if (d > ring) continue;
         if (p.expandTotal > 0) {

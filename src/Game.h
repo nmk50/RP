@@ -89,8 +89,15 @@ struct Unit {
     // OrderableUnit.java:873, 920 -- set when the unit had throttle, velocity or a buffered push this
     // tick. A unit that never moves is not asked to resolve collisions at all.
     bool moved = false;
+    // RWX GameObject.posZ (:43, :89) -- height above the ground in px, and the phase of the AIR sine
+    // bob, which RWX keeps in frameAnimationTimer (:1996-2000, +2 deg per tick, wrapping at 360).
+    // Everything below 4 px still counts as ground for collisions, targeting and splashes
+    // (CustomUnit.i():636-638), and at or below -1 a unit is submerged (Q():641-643).
+    float posZ = 0, heightPhase = 0;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
+    bool airborne() const { return tpl && tpl->moveType == MoveType::AIR && posZ >= 4.0f; }
+    bool submerged() const { return posZ <= -1.0f; }
 };
 
 // world-space turret pivot; sprite-space (x,y) offset rotated with the body, k = px scale
@@ -151,7 +158,12 @@ struct Projectile {
     bool hit = false;
     Vec2 impactPos;
     float expandT = 0, expandTotal = 0;
-    bool airBurst = false;                   // RWX impact height: splash stays in that domain
+    // RWX Projectile.posZ / the aim height f3 (Projectile.update:754-801): the shot owns a height too,
+    // chases it along the same 3D line as its 2D step (:889-900), and only lands when the gap is under
+    // 3 px (:971-978) -- an instant weapon skips that gate (:979-982). impactZ is the burst height aX
+    // (:1025, :1035), and a splash stays in the domain it detonated in: at or above 5 px it is an air
+    // burst, which only aircraft feel (:1459-1491).
+    float posZ = 0, aimZ = 0, impactZ = 0;
     std::vector<int> splashHits;             // ap: units already caught by the growing ring
 };
 

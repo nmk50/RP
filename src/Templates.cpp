@@ -278,6 +278,14 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         // :2010-2011, both plain booleans defaulting to false
         t.moveSlidingMode = m->getBool("moveslidingmode", false);
         t.moveIgnoringBody = m->getBool("moveignoringbody", false);
+        // :1993-2006 an AIR hull's cruising height is 35 with a 1.5px sine drift unless the ini says
+        // otherwise; everything else sits on the ground at 0 with no drift.
+        bool isAir = t.moveType == MoveType::AIR;
+        t.targetHeight = (float)m->getNum("targetheight", isAir ? 35 : 0);
+        t.targetHeightDrift = (float)m->getNum("targetheightdrift", isAir ? 1.5 : 0);
+        // :2006 heightChangeRate; the -1 default is the "use the automatic ease-out" sentinel.
+        t.heightChangeRate = (float)m->getNum("heightchangerate", -1);
+        t.startingHeightOffset = (float)m->getNum("startingheightoffset", 0);
     }
     if (t.isBuilding) t.moveType = MoveType::NONE;
 

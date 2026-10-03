@@ -200,7 +200,9 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     int anim = frames > 1 ? (int)(GetTime() * 5.0f) % frames : 0;
 
     Texture2D tex;
-    Vector2 pv{ u.pos.x, u.pos.y };
+    // RWX draws the hull at posY - posZ (CustomUnit.java:2416), while its shadow stays flat on the
+    // ground: OrderableUnit.drawShadow:4414-4425 deliberately does not subtract the height.
+    Vector2 pv{ u.pos.x, u.pos.y - u.posZ };
     float baseFrameW = 0;
     if (loaded(t, 0, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
@@ -234,7 +236,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             float turW = baseFrameW > 0
                 ? (tur.width / (float)ef) * t.turretImageScale * (scale / baseFrameW)
                 : scale * 0.7f * t.turretImageScale;
-            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y }, turW, spriteRot(a), col);
+            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y - u.posZ }, turW, spriteRot(a), col);
             // RWX shoot_flame: effectTemplates[3] = drawable/flame.png, 20x25 frames, attached to the barrel
             if (s && s->flameType > 0 && s->flameT > 0) {
                 Texture2D fl;
@@ -373,7 +375,7 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
                           (uint8_t)((p.lightColor >> 8) & 0xFF), (uint8_t)(0.3f * (p.lightColor & 0xFF)) };
                 BeginBlendMode(BLEND_ADDITIVE);
                 DrawTexturePro(glow, Rectangle{ 0, 0, (float)glow.width, (float)glow.height },
-                               Rectangle{ p.pos.x, p.pos.y, gs, gs }, Vector2{ gs * 0.5f, gs * 0.5f }, 0, gc);
+                               Rectangle{ p.pos.x, p.pos.y - p.posZ, gs, gs }, Vector2{ gs * 0.5f, gs * 0.5f }, 0, gc);
                 EndBlendMode();
             }
         }
@@ -389,10 +391,12 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         int frames = std::max(1, tex.width / cell);
         auto clampFrame = [&](int f) { return f < 0 ? 0 : std::min(frames - 1, f); };
         float ang = spriteRot(std::atan2(p.vel.y, p.vel.x));
+        // Projectile.java:1715-1721 -- the shadow stays on the ground and only appears once the shot is
+        // off it; the sprite itself is drawn posZ px higher.
         Vector2 pos{ p.pos.x, p.pos.y };
-        if (p.shadowFrame >= 0)
+        if (p.shadowFrame >= 0 && p.posZ > 0.0f)
             drawSpriteFrame(tex, frames, clampFrame(p.shadowFrame), pos, cell * p.drawSize, ang, Color{ 0, 0, 0, 128 });
-        drawSpriteFrame(tex, frames, clampFrame(p.frame), pos, cell * p.drawSize, ang, tint);
+        drawSpriteFrame(tex, frames, clampFrame(p.frame), Vector2{ p.pos.x, p.pos.y - p.posZ }, cell * p.drawSize, ang, tint);
     }
     // RWX explosion: explode_big.png strip (13 frames), alpha 0.7 fading over the last 10 ticks
     Texture2D ex;
