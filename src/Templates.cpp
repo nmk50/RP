@@ -318,8 +318,16 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.shadowFrame = (int)s.getNum("shadowframe", -1);
             p.drawSize = (float)s.getNum("drawsize", 1);
             p.color = parseRgba(s.get("color", "#FFFFFF"));
+            // CustomProjectileTemplate.java:142-152 reads trailEffect as a string, so only a literal
+            // "true" arms the built-in puff; "false" and a custom spawn list both leave it off (RWX
+            // lets a spawn list emit its own effects, which RP does not run).
+            p.trail = ToLower(Trim(s.get("traileffect", ""))) == "true";
+            p.trailRate = (float)s.getNum("traileffectrate", 3.0);
+            // :158-160 pre-sets the glow to ARGB 0xFFEEEE00 for trailed shots, and :169 then reads
+            // lightColor with that as its default, so an explicit key still wins.
+            p.lightColor = p.trail ? 0xEEEE00FFu : 0u;
             std::string lc = Trim(s.get("lightcolor", ""));
-            p.lightColor = (lc.empty() || lc == "-1") ? 0u : parseRgba(lc);
+            if (!lc.empty() && lc != "-1") p.lightColor = parseRgba(lc);
             p.lightSize = (float)s.getNum("lightsize", 0.5);
             p.largeHit = s.getBool("largehiteffect", false);
             p.turnSpeed = (float)s.getNum("turnspeed", -1);
@@ -334,7 +342,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.autoRetarget = s.getBool("autotargetingondeadtarget", false);
             p.autoRetargetRange = std::min(1500.0f, (float)s.getNum("autotargetingondeadtargetrange", 120));
             p.autoRetargetLead = (float)s.getNum("autotargetingondeadtargetlead", 15);
-            p.areaExpandTime = (float)s.getNum("areaexpaintime", p.areaExpandTime);
+            // CustomProjectileTemplate.java:235, and the key really is areaExpandTime -- reading the
+            // misspelling here left 7 assets' growing splash ring at the default -1.
+            p.areaExpandTime = (float)s.getNum("areaexpandtime", p.areaExpandTime);
             p.buildingDamageMult = (float)s.getNum("buildingdamagemultiplier", 1);
             p.shieldDamageMult = (float)s.getNum("shielddamagemultiplier", 1);
             // CustomProjectileTemplate.java:232 - the deflection key is spelled wrong in the parser, so

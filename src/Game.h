@@ -111,6 +111,10 @@ struct Projectile {
     uint32_t color = 0xFFFFFFFF;   // 0xRRGGBBAA sprite tint
     uint32_t lightColor = 0;       // 0xRRGGBBAA additive glow, 0 = none
     float lightSize = 0.5f;
+    // RWX Projectile.aM (copied from [projectile_N] trailEffect at CustomUnit.java:1467): while the shot
+    // is flying and drawn it drops a smoke puff every trailEffectRate ticks (update:910-955).
+    bool trail = false;
+    float trailRate = 3.0f, trailT = 0;
     bool largeHit = false;
     bool dead = false;
     // RWX Projectile flight state (Projectile.update): the shot owns a heading that either re-aims
@@ -135,7 +139,9 @@ struct Projectile {
 };
 
 // RWX EffectManager.createSmallExplosion: explode_big.png strip, frames 0..12 at 0.5/tick,
-// with a random spin, scale and (for big explosions) a delayed start.
+// with a random spin, scale and (for big explosions) a delayed start. A projectile smoke puff
+// (EffectType.custom built at Projectile.update:921-939) shares the slot: it is effects.png cell 0,
+// lives 70 ticks, grows 0.5x -> 1.2x and peaks at alpha 0.5.
 struct Effect {
     Vec2 pos;
     float t = 0;              // ticks since spawn
@@ -143,6 +149,8 @@ struct Effect {
     float rot = 0;            // sprite rotation, radians
     float scale = 1;          // 0.8..1 like RWX
     float frameSpeed = 0.5f;  // frames per tick
+    float life = 26.0f;       // ticks before it is dropped (flames: 13 / frameSpeed)
+    bool trail = false;       // smoke puff rather than a flame
     bool dead = false;
 };
 

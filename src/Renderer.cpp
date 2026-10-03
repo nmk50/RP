@@ -320,6 +320,30 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     for (auto& u : g.units) if (u.tpl && u.tpl->isStatic()) drawUnit(g, u, view.cam);
     for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic()) drawUnit(g, u, view.cam);
 
+    // RWX projectile trail (Projectile.update:921-939): effects.png cell 0 is a 25x25 grey puff taken
+    // from the sheet at x=1+26*cell, y=1 (EffectManager.java:665-678). It fades in over 5 ticks to
+    // alpha E=0.5, then fades out linearly to tick 70 (r=true, t=5 -> alpha = 0.5*V/(W-t)), while its
+    // size lerps G=0.5 -> F=1.2 times the 25px cell (Effect.java:436-441,495-526). Drawn under the
+    // shots, which is RWX's layer order for these layer-2 effects.
+    {
+        Texture2D puffs;
+        bool any = false;
+        for (auto& e : g.effects) if (e.trail) { any = true; break; }
+        if (any && shared("effects.png", puffs)) {
+            for (auto& e : g.effects) {
+                if (!e.trail) continue;
+                float el = e.t - e.delay;
+                if (el < 0) continue;
+                float a = el < 5.0f ? 0.5f * (el / 5.0f) : 0.5f * std::max(0.0f, (70.0f - el) / 65.0f);
+                float sz = 25.0f * (0.5f + 0.7f * std::min(1.0f, el / 70.0f));
+                DrawTexturePro(puffs, Rectangle{ 1, 1, 25, 25 },
+                               Rectangle{ e.pos.x, e.pos.y, sz, sz }, Vector2{ sz / 2, sz / 2 },
+                               e.rot * 57.29578f + 90.0f,   // Effect.java:541 draws at Y + 90
+                               Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
+            }
+        }
+    }
+
     // projectiles: RWX draws the [projectile_N] frame from a single-row sheet — projectiles.png has
     // 20px cells, drawType 1 = projectiles_large.png (60px), 2 = projectiles2.png — rotated by the
     // travel angle + 90 and scaled to cell*drawSize (Projectile.java:1688-1711 + GameViewUtils.java:100).
@@ -365,10 +389,10 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         const int kFrames = 13;
         float fw = ex.width / (float)kFrames;
         for (auto& e : g.effects) {
+            if (e.trail) continue;
             float el = e.t - e.delay;
             if (el < 0) continue;
-            float life = 13.0f / e.frameSpeed;
-            float a = 0.7f * std::max(0.0f, std::min(1.0f, (life - el) / 10.0f));
+            float a = 0.7f * std::max(0.0f, std::min(1.0f, (e.life - el) / 10.0f));
             drawSpriteFrame(ex, kFrames, std::min(kFrames - 1, (int)(el * e.frameSpeed)),
                 Vector2{ e.pos.x, e.pos.y }, fw * e.scale, e.rot * 57.29578f,
                 Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });

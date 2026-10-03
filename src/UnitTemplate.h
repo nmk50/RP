@@ -63,6 +63,13 @@ struct ProjectileTpl {
     // (EffectManager.createLightEffect: alpha 0.3, size = texture * lightSize, default 0.5). 0 = off.
     uint32_t lightColor = 0;
     float lightSize = 0.5f;
+    // RWX [projectile_N] trailEffect is read as a *string* (CustomProjectileTemplate.java:142-152):
+    // only an exact "true" turns on the built-in smoke puff, while "false" and a custom spawn list
+    // both leave it off (RWX lets those lists spawn their own effects). trailEffectRate (:157,
+    // default 3 ticks per ProjectileTemplate.java:100) spaces the puffs, and when the flag is on
+    // lightColor is pre-set to ARGB 0xFFEEEE00 before the ini gets a chance to override it (:158-160,169).
+    bool trail = false;
+    float trailRate = 3.0f;
     // RWX [projectile_N] flight model (Projectile.update). turnSpeed (template.O, default -1) is
     // degrees per tick the heading may rotate toward the target; -1 re-aims every tick, 0 flies dead
     // straight. speed ramps toward targetSpeed by targetSpeedAcceleration per tick.

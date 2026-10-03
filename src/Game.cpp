@@ -461,7 +461,8 @@ void Game::update() {
             if (dist < rr && dist > 0.0001f) a.pos = a.pos + d.norm() * (rr - dist) * 0.5f;
         }
     }
-    for (auto& e : effects) { e.t += 1; if (e.t - e.delay >= 13.0f / e.frameSpeed) e.dead = true; }
+    // A trail puff sinks 0.1 px/tick (Effect.java:364-366 applying the Q set at Projectile:934).
+    for (auto& e : effects) { e.t += 1; if (e.trail) e.pos.y += 0.1f; if (e.t - e.delay >= e.life) e.dead = true; }
     for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
     units.erase(std::remove_if(units.begin(), units.end(), [](const Unit& u) { return u.dead; }), units.end());
     projectiles.erase(std::remove_if(projectiles.begin(), projectiles.end(), [](const Projectile& p) { return p.dead; }), projectiles.end());
@@ -931,6 +932,7 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     p.frame = pt.frame; p.drawType = pt.drawType; p.shadowFrame = pt.shadowFrame;
     p.drawSize = pt.drawSize; p.color = pt.color;
     p.lightColor = pt.lightColor; p.lightSize = pt.lightSize;
+    p.trail = pt.trail; p.trailRate = pt.trailRate;
     p.largeHit = pt.largeHit;
     // RWX Projectile.az is set from the turret's aim line, not from the target's position
     // (CustomUnit.java:1371), and the shot then flies along that heading.
@@ -1024,6 +1026,24 @@ void Game::updateProjectile(Projectile& p) {
     }
     p.vel = dir * p.speed;
     p.ticks++;
+    // RWX update:910-955: while the shot is still in the air a trailed weapon drops one puff at its own
+    // position every trailEffectRate ticks. RWX builds these at EffectQuality.low against a 500-slot
+    // pool it refuses above 470 live effects (EffectManager.java:112, 869-880), so the cap here mirrors
+    // that instead of letting a barrage grow without bound. The nuke variant (G/F 0.5 -> 2.1,
+    // update:940-943) is unreachable in RP because no RP weapon sets nukeWeapon.
+    if (p.trail) {
+        p.trailT += 1.0f;
+        if (p.trailT > p.trailRate) {
+            p.trailT = 0;
+            if (effects.size() < 470) {
+                Effect e;
+                e.pos = p.pos; e.trail = true; e.life = 70.0f;
+                // Projectile:939 Y = randomFloatInRange(-180, 180) degrees
+                e.rot = g_rng.range(-3.14159265f, 3.14159265f);
+                effects.push_back(e);
+            }
+        }
+    }
     // RWX lands within a flat 6px of a unit, or within 0.8 of a building's radius (update:961-967)
     float hitR = (t && t->tpl && t->tpl->isBuilding) ? std::max(6.0f, t->tpl->radius * 0.8f) : 6.0f;
     if (dist < hitR) {
@@ -1125,6 +1145,7 @@ void Game::explode(Vec2 at, bool big, float scale) {
         e.rot = g_rng.range(-3.14159265f, 3.14159265f);
         e.scale = g_rng.range(0.8f, 1.0f) * scale;
         e.frameSpeed = big ? g_rng.range(0.3f, 0.6f) : 0.5f;
+        e.life = 13.0f / e.frameSpeed;
         e.delay = big ? g_rng.range(0.0f, 20.0f) : 0.0f;
         effects.push_back(e);
     }
