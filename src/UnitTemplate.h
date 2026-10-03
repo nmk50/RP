@@ -77,6 +77,12 @@ struct ProjectileTpl {
     float areaExpandTime = -1;
     // buildingDamageMultiplier: only scales damage dealt to buildings (Projectile.a:228)
     float buildingDamageMult = 1;
+    // How a shot spends itself against a shielded hull (BaseUnit.setTarget:1567-1589): it drains
+    // shieldDamageMultiplier * damage off the bubble, the part that runs past an empty bubble is cut
+    // by shieldDeflectionMultiplier before it reaches the hull, and hullDamageMultiplier scales that
+    // hull hit (a nuke's EMP variant uses 0). armourIgnoreAmount subtracts from the target's armour.
+    float shieldDamageMult = 1, shieldDeflectMult = 1, hullDamageMult = 1;
+    float armourIgnore = 0;
     bool largeHit = false;
 };
 
@@ -103,6 +109,21 @@ struct UnitTemplate {
 
     float price = 100, maxHp = 100, mass = 1000;
     float radius = 12, displayRadius = 12;
+    // RWX [core] shields (BaseUnit.shield / unitEnergyMax): maxShield is the pool size, shieldRegen
+    // refills it every tick - default 0.25, i.e. 15 per second - and startShieldAtZero leaves a fresh
+    // unit's bubble empty. shieldRenderRadius (default radius) is how big the bubble is drawn, and
+    // the white flash it gets when hit fades at shieldDeflectionDisplayRate per tick.
+    int maxShield = 0;
+    float shieldRegen = 0.25f;
+    bool startShieldAtZero = false;
+    float shieldRenderRadius = 0;
+    float shieldFlashRate = 4.0f;
+    bool shieldOnlyDeflectionFlash = false;   // shieldDisplayOnlyDeflection
+    bool showShieldBar = true;                // [graphics] showShieldBar
+    std::string imageShield;                  // [graphics] image_shield, empty = drawable/shield_mid.png
+    // [core] armour: a flat amount taken off every hit before the shield, with armourMinDamageToKeep
+    // as the floor so weak weapons still chip away.
+    float armour = 0, armourMinKeep = 1;
     int techLevel = 1;
     float buildSpeed = 0.001f;
     bool isBuilding = false, isBuilder = false, isFactory = false;

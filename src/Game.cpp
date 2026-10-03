@@ -206,6 +206,10 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.pos = pos;
     u.prevPos = pos;
     u.hp = u.maxHp = tpl->maxHp;
+    // RWX CustomUnit.java:1074-1083: a shielded unit comes up with a full bubble, and only
+    // [core] startShieldAtZero asks for it to fill up from empty instead.
+    u.shieldMax = (float)tpl->maxShield;
+    u.shield = tpl->startShieldAtZero ? 0.0f : u.shieldMax;
     u.footprint[0] = tpl->footL; u.footprint[1] = tpl->footU; u.footprint[2] = tpl->footR; u.footprint[3] = tpl->footD;
     // RWX BaseBuilding.java:108: a building's body angle is -90 deg, so its turret idles along the
     // unrotated sprite (north) plus [turret] idleDir.
@@ -451,6 +455,18 @@ void Game::updateUnit(Unit& u) {
     if (tpl.creditIncomeRate > 0 && u.operational() && tick % 10 == 0)
         reward(u.team, tpl.creditIncomeRate * (10.0f / 40.0f));
 
+    // RWX CustomUnit.update:1848-1864: the bubble tops itself up by shieldRegen every tick with no
+    // delay after being hit, and the deflection flash fades by 2% of itself plus a flat
+    // shieldDeflectionDisplayRate per tick, which is what makes the bubble linger a moment.
+    if (tpl.maxShield > 0) {
+        u.shield = std::min(u.shield + tpl.shieldRegen, u.shieldMax);
+        if (u.shield < 0.0f) u.shield = 0.0f;
+        if (u.shieldFlash != 0.0f) {
+            u.shieldFlash = std::max(0.0f, u.shieldFlash - u.shieldFlash * 0.02f - tpl.shieldFlashRate);
+            if (u.shieldFlash > 50.0f) u.shieldFlash = 50.0f;
+        }
+    }
+
     if (tpl.isFactory && u.operational() && !u.prodQueue.empty()) {
         const UnitTemplate* item = g_templates.find(u.prodQueue.front());
         u.prodProgress += item ? item->buildSpeed : tpl.buildSpeed;
@@ -518,6 +534,13 @@ void Game::updateUnit(Unit& u) {
                     u.tplKey = ToLower(nt->name);
                     u.maxHp = nt->maxHp;
                     u.hp = nt->maxHp * frac;
+                    // the same proportionality RWX updateStats uses for the bubble (:1079-1083): a unit
+                    // that had no shield gains a full one, one that had it keeps the same fill ratio.
+                    float oldShieldMax = u.shieldMax;
+                    u.shieldMax = (float)nt->maxShield;
+                    if (nt->startShieldAtZero) u.shield = std::min(u.shield, u.shieldMax);
+                    else if (oldShieldMax <= 0.0f) u.shield = u.shieldMax;
+                    else u.shield = (u.shield / oldShieldMax) * u.shieldMax;
                     u.footprint[0] = nt->footL; u.footprint[1] = nt->footU; u.footprint[2] = nt->footR; u.footprint[3] = nt->footD;
                     if (nt->isStatic()) markBuildingOcc(map, u, +1);
                     explode(u.pos, false);
@@ -868,6 +891,10 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     p.wobbleAmp = pt.wobbleAmp; p.wobbleFreq = pt.wobbleFreq;
     p.wobblePhase = g_rng.range(0.0f, 1.0f);   // RWX Projectile.I
     p.buildingMult = pt.buildingDamageMult;
+    p.shieldMult = pt.shieldDamageMult;
+    p.deflectMult = pt.shieldDeflectMult;
+    p.hullMult = pt.hullDamageMult;
+    p.armourIgnore = pt.armourIgnore;
     p.expandTotal = pt.areaExpandTime > 0 ? pt.areaExpandTime : 0.0f;
     p.vel = Vec2{ std::cos(p.heading), std::sin(p.heading) } * p.speed;
     if (tur.shootFlame) {
@@ -945,7 +972,7 @@ void Game::impact(Projectile& p, Unit* direct, Vec2 at) {
     } else {
         explode(at, true);
     }
-    if (direct && p.damage > 0) damage(*direct, p.damage * damageScale(p, *direct));
+    if (direct && p.damage > 0) damage(*direct, p.damage * damageScale(p, *direct), &p);
     if (p.expandTotal > 0) p.expandT = p.expandTotal;
     else splash(p, 1.0f);
 }
@@ -967,13 +994,45 @@ void Game::splash(Projectile& p, float frac) {
             if (seen) continue;
             p.splashHits.push_back(u.id);
         }
-        damage(u, p.areaDamage * std::min(1.0f, 1.0f - d / p.areaRadius + 0.1f) * damageScale(p, u));
+        damage(u, p.areaDamage * std::min(1.0f, 1.0f - d / p.areaRadius + 0.1f) * damageScale(p, u), &p);
     }
 }
 
-void Game::damage(Unit& target, float dmg) {
+// The whole RWX damage pipeline, which RP used to do in one subtraction:
+// CustomUnit.setTarget:4187-4199 takes a flat armour off the hit (never below
+// armourMinDamageToKeep, and armourIgnoreAmount buys that reduction back), then
+// BaseUnit.setTarget:1559-1601 lets the bubble drink shieldMult * damage first - whatever runs past
+// an empty bubble is cut by deflectMult, so a weapon with deflectMult 1 never touches the hull at all
+// - and only the remainder, scaled by hullMult, is subtracted from health.
+void Game::damage(Unit& target, float dmg, const Projectile* p) {
     if (dmg <= 0 || target.dead) return;
-    target.hp -= dmg;
+    const Projectile def;
+    if (!p) p = &def;
+    const UnitTemplate& tpl = *target.tpl;
+    // a building still being built (or repaired back from rubble) takes 75% more (:1561)
+    if (target.underConstruction && target.buildProgress < 1.0f) dmg *= 1.75f;
+    if (tpl.armour > 0.0f && dmg > tpl.armourMinKeep) {
+        float a = tpl.armour - p->armourIgnore;
+        if (a > 0.0f) dmg -= a;
+        if (dmg < tpl.armourMinKeep) dmg = tpl.armourMinKeep;
+    }
+    float toHull = dmg;
+    // :1574 also asks for unit energy to be spent, and RWX never charges that field up for a shield
+    if (target.shield > 0.0f) {
+        float cost = dmg * p->shieldMult;
+        if (target.shield < cost) {
+            toHull = dmg - target.shield * p->deflectMult;
+            target.shieldFlash += target.shield;
+            target.shield = 0.0f;
+        } else {
+            target.shield -= cost;
+            target.shieldFlash += cost;
+            toHull = dmg - dmg * p->deflectMult;
+        }
+    }
+    float hp = toHull * p->hullMult;
+    if (hp <= 0.0f) return;
+    target.hp -= hp;
     if (target.hp <= 0) killUnit(target);
 }
 

@@ -239,12 +239,33 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             }
         }
     }
+    // RWX CustomUnit.c():2491-2521 - the bubble is [graphics] image_shield, or the shared
+    // drawable/shield_mid.png, drawn 1.25x over shieldRenderRadius on top of the whole unit. Its
+    // alpha is how full the pool is plus how recently it soaked a hit, so a shielded unit glows
+    // brighter the moment it is shot at.
+    if (u.shield > 0.0f && t.maxShield > 0) {
+        Texture2D sh;
+        bool custom = !t.imageShield.empty() && byName(t, t.imageShield, sh);
+        if (custom || shared("shield_mid.png", sh)) {
+            float flash = std::min(u.shieldFlash, 50.0f);
+            float a = t.shieldOnlyDeflectionFlash
+                ? (flash / 50.0f) * 0.5f + (std::min(u.shieldFlash, 5.0f) / 5.0f) * 0.2f
+                : 0.09f + (u.shield / u.shieldMax) * 0.4f + (flash / 50.0f) * 0.5f;
+            if (a > 1.0f) a = 1.0f;
+            if (a > 0.0f) {
+                float f = (t.shieldRenderRadius * 2.0f) / (custom ? (float)sh.width : 87.0f) * 1.25f;
+                drawSpriteFrame(sh, 1, 0, pv, sh.width * f, t.isStatic() ? 0 : spriteRot(u.facing),
+                    Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
+            }
+        }
+    }
     // team ring under selection
     if (u.selected) {
         DrawCircleLines((int)pv.x, (int)pv.y, r + 3, Color{ 60, 220, 90, 255 });
     }
     // hp bar
-    if (u.hp < u.maxHp || u.selected || t.isBuilding) {
+    if (u.hp < u.maxHp || u.selected || t.isBuilding ||
+        (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
         float bw = r * 2.0f, bh = 4;
         float frac = std::max(0.0f, u.hp / u.maxHp);
         Vector2 p{ pv.x - r, pv.y - (r + 8) };
@@ -254,6 +275,14 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         if (t.isBuilding && u.underConstruction) {
             float bp = std::min(1.0f, u.buildProgress);
             DrawRectangle((int)p.x, (int)p.y + 5, (int)(bw * bp), 3, Color{ 240, 220, 90, 255 });
+        }
+        // RWX BaseUnit.java:1166-1183: the secondary bar is the bubble's own fill, cyan, stacked just
+        // under the health bar (it is only there while the shield is not full).
+        if (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax) {
+            float by = p.y + 5 + (u.underConstruction ? 5 : 0);
+            float sf = std::max(0.0f, u.shield / u.shieldMax);
+            DrawRectangle((int)p.x, (int)by, (int)bw, 2, Color{ 20, 20, 20, 160 });
+            DrawRectangle((int)p.x, (int)by, (int)(bw * sf), 2, Color{ 23, 179, 207, 200 });
         }
         // RWX production bar: yellow progress + queue count while a factory is building a unit
         if (t.isFactory && u.operational() && !u.prodQueue.empty()) {

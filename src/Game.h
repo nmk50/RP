@@ -35,6 +35,9 @@ struct Unit {
     // army of multi-barrel units does not re-query the whole map every tick.
     int turretScanTimer = 0;
     float hp = 1, maxHp = 1;
+    // RWX BaseUnit.shield / unitEnergyMax / unitShieldMax: the bubble, its capacity and the white
+    // deflection flash it accumulates when a hit is soaked up.
+    float shield = 0, shieldMax = 0, shieldFlash = 0;
     std::vector<Vec2> path;  // world-space waypoints
     int pathIdx = 0;
     bool attackMove = false;
@@ -106,6 +109,9 @@ struct Projectile {
     float wobbleAmp = 0, wobbleFreq = 5, wobblePhase = 0;
     int ticks = 0;
     float buildingMult = 1;                  // ai: buildingDamageMultiplier
+    // ak/al/am/an: how this shot splits its damage between a target's shield and its hull, and how
+    // much of the target's armour it ignores. See Game::damage.
+    float shieldMult = 1, deflectMult = 1, hullMult = 1, armourIgnore = 0;
     // Once the shot lands (bn) the splash ring grows over areaExpandTime ticks (ao/W) centred on
     // the impact point; the projectile itself is no longer drawn (update:1038 sets shouldDraw=false).
     bool hit = false;
@@ -196,7 +202,7 @@ public:
     Vec2 nearestEnemyPos(int team);
     int playerTeam() const { return 0; }
 
-    void damage(Unit& target, float dmg);
+    void damage(Unit& target, float dmg, const Projectile* p = nullptr);
     void impact(Projectile& p, Unit* direct, Vec2 at);
     void splash(Projectile& p, float frac);
     void checkWinLoss();

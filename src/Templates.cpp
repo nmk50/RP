@@ -144,6 +144,16 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.mass = (float)c->getNum("mass", 1000);
         t.radius = (float)c->getNum("radius", 12);
         t.displayRadius = (float)c->getNum("displayradius", t.radius);
+        // CustomUnitConfigParser.java:1682-1688 - maxShield is read as an int with no scaling and
+        // shieldRegen defaults to 0.25 per tick even for units that never get a bubble.
+        t.maxShield = (int)c->getNum("maxshield", 0);
+        t.shieldRegen = (float)c->getNum("shieldregen", 0.25);
+        t.startShieldAtZero = c->getBool("startshieldatzero", false);
+        t.shieldRenderRadius = (float)c->getNum("shieldrenderradius", t.radius);
+        t.shieldFlashRate = (float)c->getNum("shielddeflectiondisplayrate", 4);
+        t.shieldOnlyDeflectionFlash = c->getBool("shielddisplayonlydeflection", false);
+        t.armour = (float)c->getNum("armour", 0);
+        t.armourMinKeep = (float)c->getNum("armourmindamagetokeep", 1);
         t.techLevel = (int)c->getNum("techlevel", 1);
         double bs = c->getNum("buildspeed", 0.001);
         // buildSpeed can be like "65.6s" (seconds) or per-tick float
@@ -221,6 +231,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.imageScale = (float)g->getNum("imagescale", g->getNum("scaleimagesto_scale", 1));
         t.turretImageScale = (float)g->getNum("turretimagescale", 1);
         t.imageShadow = g->get("image_shadow");
+        t.imageShield = g->get("image_shield");
+        t.showShieldBar = g->getBool("showshieldbar", true);
         t.shadowOffX = (float)g->getNum("shadowoffsetx", 0);
         t.shadowOffY = (float)g->getNum("shadowoffsety", 0);
         t.totalFrames = (int)g->getNum("total_frames", 1);
@@ -295,6 +307,13 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.wobbleFreq = timeTicks("wobblefrequency", s, 5);
             p.areaExpandTime = (float)s.getNum("areaexpaintime", p.areaExpandTime);
             p.buildingDamageMult = (float)s.getNum("buildingdamagemultiplier", 1);
+            p.shieldDamageMult = (float)s.getNum("shielddamagemultiplier", 1);
+            // CustomProjectileTemplate.java:232 - the deflection key is spelled wrong in the parser, so
+            // that is the only spelling RWX honours; accept the corrected one as a fallback.
+            p.shieldDeflectMult = (float)s.getNum("shielddefectionmultiplier",
+                s.getNum("shielddeflectionmultiplier", 1));
+            p.hullDamageMult = (float)s.getNum("hulldamagemultiplier", 1);
+            p.armourIgnore = (float)s.getNum("armourignoreamount", 0);
             t.projectiles.push_back(p);
         }
         if (t.projectiles.empty()) {
