@@ -269,6 +269,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.maxTurnSpeed = (float)m->getNum("maxturnspeed", 1);
         t.turnAccel = (float)m->getNum("turnacceleration", 1);
         t.reverseSpeed = (float)m->getNum("reversespeedpercentage", 0.6);
+        // :2010-2011, both plain booleans defaulting to false
+        t.moveSlidingMode = m->getBool("moveslidingmode", false);
+        t.moveIgnoringBody = m->getBool("moveignoringbody", false);
     }
     if (t.isBuilding) t.moveType = MoveType::NONE;
 

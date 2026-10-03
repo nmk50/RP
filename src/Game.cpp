@@ -618,8 +618,12 @@ void Game::updateUnit(Unit& u) {
 
     if (!u.isStatic()) {
         if (u.repathTimer > 0) u.repathTimer--;
-        // RWX air and hover units steer by velocity (moveIgnoringBody), so the hull never gates them
-        bool ignoreBody = tpl.moveType == MoveType::AIR || tpl.moveType == MoveType::HOVER;
+        // [movement] moveIgnoringBody is the key that lets a hull steer apart from its facing
+        // (OrderableUnit.java:876-878). RWX gives air and hover units that behaviour through their
+        // movement type, so those keep the heuristic on top of whatever a mod declares.
+        bool ignoreBody = tpl.moveIgnoringBody || tpl.moveType == MoveType::AIR || tpl.moveType == MoveType::HOVER;
+        // [movement] moveSlidingMode turns the position into an integrated velocity (:893-918)
+        bool sliding = tpl.moveSlidingMode;
         bool pathing = u.pathIdx < (int)u.path.size();
         bool lastNode = pathing && u.pathIdx + 1 >= (int)u.path.size();
         int nodesLeft = pathing ? (int)u.path.size() - u.pathIdx : 0;
@@ -690,15 +694,18 @@ void Game::updateUnit(Unit& u) {
         }
         // :3003-3006 while flipping the unit backs up at reverseSpeedPercentage
         if (u.isRotating && !ignoreBody) want = -want * revPct;
-        float rate = want > u.throttle ? tpl.accel : tpl.decel;
-        if (std::fabs(want - u.throttle) <= rate) u.throttle = want;
-        else u.throttle += (want > u.throttle ? rate : -rate);
+        if (sliding) {
+            u.throttle = want;   // :3009-3010 the accel/decel ramp is skipped altogether
+        } else {
+            float rate = want > u.throttle ? tpl.accel : tpl.decel;
+            if (std::fabs(want - u.throttle) <= rate) u.throttle = want;
+            else u.throttle += (want > u.throttle ? rate : -rate);
+        }
 
-        // position: land and water units drive along the hull, never sideways
-        if (std::fabs(u.throttle) > 1e-4f) {
-            float a = ignoreBody ? bearing : u.facing;
-            Vec2 step{ std::cos(a), std::sin(a) };
-            Vec2 np = u.pos + step * (tpl.moveSpeed * u.throttle);
+        // position: a normal hull drives along its facing and never sideways (:879-892)
+        float a = ignoreBody ? bearing : u.facing;
+        auto stepTo = [&](Vec2 d) {
+            Vec2 np = u.pos + d;
             bool trapped = !passableAt(*this, u.pos, tpl.moveType);
             if (trapped || passableAt(*this, np, tpl.moveType)) u.pos = np;
             else {
@@ -707,6 +714,25 @@ void Game::updateUnit(Unit& u) {
                 else if (passableAt(*this, nyp, tpl.moveType)) u.pos = nyp;
                 else u.throttle *= 0.5f;
             }
+        };
+        if (sliding) {
+            // OrderableUnit.java:893-918: the wanted velocity is dir*moveSpeed*throttle; the gap to it
+            // closes at (accel while throttling, decel otherwise) * 1.41 per tick and snaps once that gap
+            // is inside one step, and a gap wider than the unit's own top speed sheds 5% of the current
+            // velocity first. The position is then just the velocity.
+            Vec2 wantV{ 0, 0 };
+            if (u.throttle != 0.0f) wantV = Vec2{ std::cos(a), std::sin(a) } * (tpl.moveSpeed * u.throttle);
+            float gap = u.vel.dist(wantV);
+            float vRate = (u.throttle != 0.0f ? tpl.accel : tpl.decel) * 1.41f;
+            if (gap > tpl.moveSpeed) u.vel = u.vel * 0.95f;
+            if (gap < vRate) u.vel = wantV;
+            else {
+                float ang = std::atan2(wantV.y - u.vel.y, wantV.x - u.vel.x);
+                u.vel = u.vel + Vec2{ std::cos(ang), std::sin(ang) } * vRate;
+            }
+            if (u.vel.len() > 1e-4f) stepTo(u.vel);
+        } else if (std::fabs(u.throttle) > 1e-4f) {
+            stepTo(Vec2{ std::cos(a), std::sin(a) } * (tpl.moveSpeed * u.throttle));
         }
         if (pathing) {
             float arrive = lastNode ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7

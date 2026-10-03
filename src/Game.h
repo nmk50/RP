@@ -72,6 +72,9 @@ struct Unit {
     // negative while flip-turning; isRotating marks the >100 deg reverse-and-pivot manoeuvre.
     float throttle = 0;
     bool isRotating = false;
+    // RWX BaseUnit.velocityX/velocityY. Only [movement] moveSlidingMode integrates it into the
+    // position (OrderableUnit.java:893-918); a normal hull steps straight off its throttle.
+    Vec2 vel;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };

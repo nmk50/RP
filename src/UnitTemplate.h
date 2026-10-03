@@ -163,6 +163,12 @@ struct UnitTemplate {
     MoveType moveType = MoveType::NONE;
     float moveSpeed = 1, accel = 1, decel = 1, maxTurnSpeed = 1, turnAccel = 1;
     float reverseSpeed = 0.6f; // RWX [movement] reverseSpeedPercentage: allows the flip-turn
+    // [movement] moveIgnoringBody (:2011) steers by the wanted bearing instead of the hull's facing, so
+    // the unit strafes and backs up while the body keeps turning (OrderableUnit.java:876-878,
+    // 2913-2915, 3003-3005). [movement] moveSlidingMode (:2010) instead makes the motion an integrated
+    // velocity with a 1.41x steering rate and no throttle ramp (:893-918, :3009-3010) -- glide, not
+    // strafing. Both default false.
+    bool moveIgnoringBody = false, moveSlidingMode = false;
 
     float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0.2f;
     // RWX repair gates: CustomUnitConfigParser.java:1746-1747 (both default false) and :1732
