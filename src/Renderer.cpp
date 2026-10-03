@@ -420,14 +420,19 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
                           : (p.drawType == 2 ? "projectiles2.png" : "projectiles.png");
         Texture2D tex;
         if (p.frame < 0 || !shared(sheet, tex)) {
-            // unframed: RWX draws a filled dot of radius drawSize in the projectile colour
-            DrawCircleV(Vector2{ p.pos.x, p.pos.y }, std::max(1.0f, p.drawSize), tint);
+            // unframed: RWX draws a filled dot of radius drawSize, its shadow left on the ground and the
+            // dot itself lifted posZ (:1714-1718).
+            if (p.posZ > 0.0f && p.shadowFrame >= 0)
+                DrawCircleV(Vector2{ p.pos.x, p.pos.y }, std::max(1.0f, p.drawSize), Color{ 0, 0, 0, 128 });
+            DrawCircleV(Vector2{ p.pos.x, p.pos.y - p.posZ }, std::max(1.0f, p.drawSize), tint);
             continue;
         }
         int cell = std::max(1, tex.height);
         int frames = std::max(1, tex.width / cell);
         auto clampFrame = [&](int f) { return f < 0 ? 0 : std::min(frames - 1, f); };
-        float ang = spriteRot(std::atan2(p.vel.y, p.vel.x));
+        // Projectile.draw:1702-1711 passes this.aT, the angle a shot's nose is dragged around at
+        // 12 deg/tick (update:1421) and which an arcing shell holds straight up or straight down.
+        float ang = spriteRot(p.drawAngle);
         // Projectile.java:1715-1721 -- the shadow stays on the ground and only appears once the shot is
         // off it; the sprite itself is drawn posZ px higher.
         Vector2 pos{ p.pos.x, p.pos.y };

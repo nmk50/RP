@@ -175,6 +175,23 @@ struct Projectile {
     // (:1025, :1035), and a splash stays in the domain it detonated in: at or above 5 px it is an air
     // burst, which only aircraft feel (:1459-1491).
     float posZ = 0, aimZ = 0, impactZ = 0;
+    // RWX Projectile.w / g.G / g.H (:844-856): the shot's own vertical speed, the height gravity removes
+    // from it each tick, and the acceleration on that vertical speed. A lobbed round needs all three
+    // because the vertical speed never reverses on its own -- what brings it back down is the aim-height
+    // chase (:889-900), which is only allowed once gravity has been subtracted.
+    float velZ = 0, gravity = 0, trueGravity = 0;
+    // aC (:676,754): an unguided shell flies to the frozen point in `dest` rather than to a unit, and
+    // carries no l, so it never lands a direct hit -- only its splash damages (CustomProjectileTemplate
+    //.a():377-405). RWX still reads a unit there once autoTargetingOnDeadTarget re-locks it (:775-785).
+    bool unguided = false;
+    // aH/aI/aJ/aK (:857-888): the arc -- climb to ballisticHeight at the flight speed (aL is pinned to
+    // -1 at spawn, CustomUnit.java:1496), with no horizontal step below ballisticDelayHeight, then dive
+    // once the target is within 20 px. `apex` is aK.
+    bool ballistic = false, ballisticApex = false;
+    float ballisticDelayHeight = 40, ballisticHeight = 60;
+    // aT (:1417-1421): the angle the sprite is drawn at, which chases the flight angle at 12 deg/tick
+    // and is pinned straight up or down during the arc's vertical phases.
+    float drawAngle = 0;
     std::vector<int> splashHits;             // ap: units already caught by the growing ring
 };
 

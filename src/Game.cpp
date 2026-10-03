@@ -1079,6 +1079,36 @@ float turretRecoil(const Unit& u, int i) {
     return 0.0f;
 }
 
+// RWX CustomProjectileTemplate.a():377-405 with BaseUnit.a():2122-2142 -- a targetGround weapon is never
+// guided onto the unit; the shell is handed a point instead. The target's own velocity carries that point
+// up to `life` ticks of flight into it (three fixed-point passes over the flight time at leadSpeed px per
+// tick), it is pulled back onto the shooter's [attack] maxAttackRange circle when the lead would put it
+// out of reach, and targetGroundSpread then scatters it. RWX leaves Projectile.l null here, so a direct
+// hit is impossible for the whole flight and only the splash bites.
+static void aimAtGroundPoint(Projectile& p, const Unit& shooter, const Unit& target,
+                             const ProjectileTpl& pt, float leadSpeed) {
+    float time = 0.0f;
+    if (leadSpeed > 0.1f && target.moved) {
+        for (int i = 0; i < 3; i++)
+            time = p.pos.dist(target.pos + target.vel * time) / leadSpeed;
+    }
+    if (time > (float)pt.life) time = (float)pt.life;
+    Vec2 at = target.pos + target.vel * time;
+    float range = shooter.tpl ? shooter.tpl->attackRange : 0.0f;    // BaseUnit.m()
+    float d = p.pos.dist(at);
+    if (range >= 0.0f && range * range < d * d) {
+        float ang = std::atan2(at.y - p.pos.y, at.x - p.pos.x);
+        at = p.pos + Vec2{ std::cos(ang), std::sin(ang) } * range;
+    }
+    if (pt.targetGroundSpread > 0.0f) {
+        at.x += g_rng.range(-pt.targetGroundSpread, pt.targetGroundSpread);
+        at.y += g_rng.range(-pt.targetGroundSpread, pt.targetGroundSpread);
+    }
+    p.unguided = true;
+    p.targetId = -1;
+    p.dest = at;
+}
+
 void Game::fire(Unit& u, Unit& target, int ti) {
     const UnitTemplate& tpl = *u.tpl;
     if (ti < 0 || ti >= (int)tpl.turrets.size()) return;
@@ -1117,6 +1147,17 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     if (pt.speedSpread > 0) p.speed += g_rng.range(-pt.speedSpread, pt.speedSpread);
     p.wobbleAmp = pt.wobbleAmp; p.wobbleFreq = pt.wobbleFreq;
     p.wobblePhase = g_rng.range(0.0f, 1.0f);   // RWX Projectile.I
+    // The vertical half of the shot's own motion (:844-856) and the arc it may fly (:857-888). A template
+    // that leaves the two ballistic heights at -1 does not overwrite the shot's 40 / 60 defaults
+    // (CustomUnit.java:1490-1495).
+    p.velZ = pt.launchVelZ; p.gravity = pt.gravity; p.trueGravity = pt.trueGravity;
+    p.ballistic = pt.ballistic;
+    p.ballisticDelayHeight = pt.ballisticDelayHeight != -1.0f ? pt.ballisticDelayHeight : 40.0f;
+    p.ballisticHeight = pt.ballisticHeight != -1.0f ? pt.ballisticHeight : 60.0f;
+    // :1417-1419 -- aT starts on the firing angle before it starts chasing it.
+    p.drawAngle = p.heading;
+    if (pt.targetGround)
+        aimAtGroundPoint(p, u, target, pt, pt.targetSpeed != -1.0f ? pt.targetSpeed : p.speed);
     p.autoRetarget = pt.autoRetarget;
     p.autoRetargetRange = pt.autoRetargetRange;
     p.autoRetargetLead = pt.autoRetargetLead;
@@ -1187,34 +1228,70 @@ void Game::updateProjectile(Projectile& p) {
     // target; the rest keep chasing the corpse and land on its last position.
     if (!t && p.autoRetarget) t = retargetShot(*this, p);
     // RWX keeps chasing the corpse, so a shot whose target dies mid-flight still lands where it died.
+    // An unguided shell has no unit to chase and keeps its frozen point (:786-793).
     if (t) p.dest = t->pos;
     // :794-801 once there is no unit to follow the aim height drops back to the ground, so a shell that
     // lost its aircraft sinks to 0 and flies on as a ground shot rather than hovering at 35 px.
     p.aimZ = t ? t->posZ : 0.0f;
-    Vec2 aim = t ? t->pos : p.dest;
+    Vec2 aim = p.dest;
     float dist = p.pos.dist(aim);
     float want = std::atan2(aim.y - p.pos.y, aim.x - p.pos.x);
     p.heading = p.turnSpeed >= 0 ? lerpAngle(p.heading, want, p.turnSpeed * 0.0174533f) : want;
-    if (p.speedTarget > 0) p.speed = moveTowards(p.speed, p.speedTarget, p.speedAccel);
-    float step = p.speed;
-    if (dist < step) { step = dist; dist = 0; }
     Vec2 dir{ std::cos(p.heading), std::sin(p.heading) };
-    p.pos = p.pos + dir * step;
-    // :889-900 -- part of every step goes into climbing or diving, taken in the same proportion as the
-    // 2D gap still open, so the shot comes in along the straight 3D line rather than arriving on the
-    // ground and only then rising. Once the 2D gap is closed the whole step is available for height.
+    // :842-856 -- the shot's own vertical speed lifts it and gravity takes a fixed height off it, both
+    // before the horizontal step, so the arc the rest of the tick reads is already under way. Gravity is
+    // only spent above the ground, and it is the height itself rather than the vertical speed that drops
+    // -- which is why a lobbed round climbs at (velZ - gravity) per tick and never turns over by itself.
+    if (p.velZ != 0.0f) p.posZ += p.velZ;
+    if (p.posZ > 0.0f) {
+        if (p.gravity != 0.0f) p.posZ -= p.gravity;
+        if (p.trueGravity != 0.0f) p.velZ -= p.trueGravity;
+    }
     float dz = p.aimZ - p.posZ;
-    if (dz != 0.0f) {
+    bool stepped = false;
+    float arc = p.heading;              // RWX f29, the angle the sprite is drawn at (:1417-1421)
+    // :857-866 -- an arcing shell may not move sideways until it is over the delay height, so it climbs
+    // out of the barrel. Stepping clamps the gap away, which also hands the whole step to the height.
+    if (!p.ballistic || p.ballisticDelayHeight < p.posZ || p.ballisticApex) {
+        stepped = true;
+        float step = p.speed;
+        if (dist < step) { step = dist; dist = 0; }
+        p.pos = p.pos + dir * step;
+    }
+    if (p.ballistic) {
+        // :867-888 -- the climb goes to ballistic_height at the flight speed and hands over to a dive at
+        // the aim height once the target is within 20 px. Below the delay height the shell is drawn
+        // pointing straight up, and a dive that has not arrived yet points it straight down.
+        float rate = p.speed;           // aL is pinned to -1 at spawn (CustomUnit.java:1496)
+        stepped = true;
+        if (!p.ballisticApex) {
+            p.posZ = moveTowards(p.posZ, p.ballisticHeight, rate);
+            if (p.posZ < p.ballisticDelayHeight) arc = -1.5708f;
+            if (p.posZ >= p.ballisticHeight) p.ballisticApex = true;
+        } else if (dist * dist < 400.0f) {
+            p.posZ = moveTowards(p.posZ, p.aimZ, rate);
+            if (std::fabs(p.aimZ - p.posZ) > 0.5f) arc = 1.5708f;
+        }
+    } else if (dz != 0.0f) {
+        // :889-900 -- part of every step goes into climbing or diving, taken in the same proportion as the
+        // 2D gap still open, so the shot comes in along the straight 3D line rather than arriving on the
+        // ground and only then rising. Once the 2D gap is closed the whole step is available for height.
+        stepped = true;
         float zStep = dist > 0.1f ? std::min(std::fabs(dz) / dist * p.speed, p.speed) : p.speed;
         p.posZ += std::max(-zStep, std::min(dz, zStep));
         dz = p.aimZ - p.posZ;
     }
+    // :902-904 -- only a step that was actually taken spends the ramp, and it is spent after the move.
+    if (stepped && p.speedTarget > 0) p.speed = moveTowards(p.speed, p.speedTarget, p.speedAccel);
     if (p.wobbleAmp != 0) {
         float off = std::sin((p.ticks * 360.0f / p.wobbleFreq + p.wobblePhase * 360.0f) * 0.0174533f) * p.wobbleAmp;
         p.pos = p.pos + Vec2{ -dir.y, dir.x } * off;
     }
     p.vel = dir * p.speed;
     p.ticks++;
+    // :1421 -- the sprite is dragged around at 12 deg/tick, so a shell that just fired off a turning
+    // turret or come off the top of an arc keeps its old nose for a few ticks.
+    p.drawAngle = lerpAngle(p.drawAngle, arc, 12.0f * 0.0174533f);
     // RWX update:910-955: while the shot is still in the air a trailed weapon drops one puff at its own
     // position every trailEffectRate ticks. RWX builds these at EffectQuality.low against a 500-slot
     // pool it refuses above 470 live effects (EffectManager.java:112, 869-880), so the cap here mirrors
@@ -1237,9 +1314,21 @@ void Game::updateProjectile(Projectile& p) {
     }
     // RWX lands within a flat 6px of a unit, or within 0.8 of a building's radius (update:961-967), and
     // :971-978 adds the other half of the test -- the height gap has to be under 3 px too, so a shell
-    // that arrives still 20 px below a plane flies straight on past it.
-    float hitR = (t && t->tpl && t->tpl->isBuilding) ? std::max(6.0f, t->tpl->radius * 0.8f) : 6.0f;
-    if (dist < hitR && std::fabs(dz) < 3.0f) {
+    // that arrives still 20 px below a plane flies straight on past it. A shell that carries its own
+    // vertical speed or gravity gets that window widened by both (:971-974), which is exactly what lets
+    // a lobbed round detonate a few px short of the ground instead of having to touch it.
+    float hitR = 6.0f;
+    if (t && t->tpl) {
+        float r = t->tpl->radius;
+        if (t->tpl->isBuilding) hitR = std::max(6.0f, r * 0.8f);
+        // :764,968-970 -- a shielded hull is read as the bigger target its bubble makes it, 1.1 radii
+        // flat. That overwrites the 6px floor, so a small shielded unit is a tighter target than an
+        // unshielded one.
+        if (t->shield > 10.0f) hitR = r * 1.1f;
+    }
+    float zTol = 3.0f;
+    if (p.velZ != 0.0f || p.gravity != 0.0f) zTol = 3.0f + std::fabs(p.velZ) + std::fabs(p.gravity);
+    if (dist < hitR && std::fabs(dz) < zTol) {
         p.impactZ = p.posZ;
         impact(p, t, p.pos);
         if (p.expandTotal <= 0) p.dead = true;

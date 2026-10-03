@@ -379,6 +379,18 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
                 s.getNum("shielddeflectionmultiplier", 1));
             p.hullDamageMult = (float)s.getNum("hulldamagemultiplier", 1);
             p.armourIgnore = (float)s.getNum("armourignoreamount", 0);
+            // :48,224 -- the unguided ground bomb family (artillery, experimental tank, nukes).
+            p.targetGround = s.getBool("targetground", false);
+            p.targetGroundSpread = (float)s.getNum("targetgroundspread", 0);
+            // :115,118-119 -- the shot's own vertical speed and the two gravity flavours.
+            p.launchVelZ = (float)s.getNum("initialunguidedspeedheight", 0);
+            p.gravity = (float)s.getNum("gravity", 0);
+            p.trueGravity = (float)s.getNum("truegravity", 0);
+            // :141,190-191 -- the arc. -1 means the ini is silent, and the shot then keeps its own
+            // 40 / 60 px defaults (CustomUnit.java:1490-1495).
+            p.ballistic = s.getBool("ballistic", false);
+            p.ballisticDelayHeight = (float)s.getNum("ballistic_delaymove_height", -1);
+            p.ballisticHeight = (float)s.getNum("ballistic_height", -1);
             t.projectiles.push_back(p);
         }
         if (t.projectiles.empty()) {

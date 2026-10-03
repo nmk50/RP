@@ -95,6 +95,23 @@ struct ProjectileTpl {
     float shieldDamageMult = 1, shieldDeflectMult = 1, hullDamageMult = 1;
     float armourIgnore = 0;
     bool largeHit = false;
+    // targetGround (CustomProjectileTemplate.java:48): the shot is never guided onto the unit. The
+    // firing code freezes a lead-predicted ground point instead (CustomProjectileTemplate.a():377-405)
+    // and leaves Projectile.l null, so only the splash can hurt anything. targetGroundSpread (:224)
+    // scatters that point by up to this many px on each axis, which is why artillery misses.
+    bool targetGround = false;
+    float targetGroundSpread = 0;
+    // initialUnguidedSpeedHeight (:115) is a vertical speed in px/tick the shell keeps, while gravity
+    // (:118) takes a fixed height off it every tick above the ground and trueGravity (:119) decelerates
+    // the vertical speed itself. Projectile.update:844-856. Only gravity and the initial height are used
+    // by the shipped assets; trueGravity is what makes a shell arc back down on its own.
+    float launchVelZ = 0, gravity = 0, trueGravity = 0;
+    // ballistic (:141) throws the shell up to [ballistic_height] before it may close on its target, and
+    // the horizontal step is skipped until it is above [ballistic_delaymove_height] -- the round climbs
+    // straight out of the barrel, then arcs over (:857-888). Both default to -1 in the template, which
+    // means "leave the shot's own 40 / 60" (CustomUnit.java:1490-1495 with Projectile:204-205).
+    bool ballistic = false;
+    float ballisticDelayHeight = -1, ballisticHeight = -1;
 };
 
 struct BuildOption { std::string unitName; float pos = 1; };
