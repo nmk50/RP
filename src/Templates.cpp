@@ -114,6 +114,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.isBuilder = c->getBool("isbuilder", false);
         t.fogSight = (float)c->getNum("fogofwarsightrange", 0);
         t.energyUse = (float)c->getNum("energyusage", 0);
+        t.explodeOnDeath = c->getBool("explodeondeath", true);
+        t.hideScorchMark = c->getBool("hidescorchmark", false);
         auto fp = parseCSV(c->get("footprint", c->get("constructionfootprint", "0,0,0,0")));
         if (fp.size() >= 4) { t.footL = (int)fp[0]; t.footU = (int)fp[1]; t.footR = (int)fp[2]; t.footD = (int)fp[3]; }
         t.placeOnlyOnResPool = c->getBool("placeonlyonrespool", c->getBool("placeonlyonrespools", c->getBool("placeonlyonresource", false)));

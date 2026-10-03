@@ -77,6 +77,10 @@ struct UnitTemplate {
     int footL = 0, footU = 0, footR = 0, footD = 0; // footprint in tiles (relative to center tile)
     float fogSight = 0;
     float energyUse = 0;
+    // RWX [core] explodeOnDeath (default true) / hideScorchMark: an exploding unit leaves a
+    // permanent ground mark (ScorchMark.java) unless it is hidden or died over water.
+    bool explodeOnDeath = true;
+    bool hideScorchMark = false;
 
     float imageScale = 1, turretImageScale = 1;
     int totalFrames = 1;

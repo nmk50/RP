@@ -102,23 +102,6 @@ static void worldViewCull(const Camera2D& cam, float sw, float sh, float& x0, fl
     x0 = tl.x; y0 = tl.y; x1 = br.x; y1 = br.y;
 }
 
-void Renderer::drawMap(Game& g, const Camera2D& cam) {
-    float x0, y0, x1, y1; worldViewCull(cam, (float)GetScreenWidth(), (float)GetScreenHeight(), x0, y0, x1, y1);
-    int tx0 = std::max(0, (int)(x0 / TILE_SIZE) - 1), ty0 = std::max(0, (int)(y0 / TILE_SIZE) - 1);
-    int tx1 = std::min(g.map.w - 1, (int)(x1 / TILE_SIZE) + 1), ty1 = std::min(g.map.h - 1, (int)(y1 / TILE_SIZE) + 1);
-    for (int y = ty0; y <= ty1; ++y)
-        for (int x = tx0; x <= tx1; ++x) {
-            const MapTile& t = g.map.at(x, y);
-            Color c = terrainColor(t.color);
-            if (t.blocked) c = Color{ (uint8_t)(c.r * 0.6f), (uint8_t)(c.g * 0.6f), (uint8_t)(c.b * 0.6f), 255 };
-            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, c);
-            if (t.resource) DrawRectangle(x * TILE_SIZE + 4, y * TILE_SIZE + 4, TILE_SIZE - 8, TILE_SIZE - 8, Color{ 150, 220, 255, 120 });
-            if (t.tree) DrawCircle((x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE, 5, Color{ 30, 80, 30, 200 });
-        }
-    // world border
-    DrawRectangleLines(0, 0, g.map.worldW(), g.map.worldH(), BLACK);
-}
-
 // Draw one frame of a horizontal sprite-sheet (RWX total_frames) centered at pos, rotated rotDeg (clockwise).
 static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2 pos, float targetW, float rotDeg, Color col) {
     if (frames < 1) frames = 1;
@@ -133,6 +116,30 @@ static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2
 
 // RWX sprites face up (north); screen angle a (y-down) maps to raylib clockwise rotation a_deg + 90.
 static float spriteRot(float angleRad) { return angleRad * 180.0f / 3.14159265f + 90.0f; }
+
+void Renderer::drawMap(Game& g, const Camera2D& cam) {
+    float x0, y0, x1, y1; worldViewCull(cam, (float)GetScreenWidth(), (float)GetScreenHeight(), x0, y0, x1, y1);
+    int tx0 = std::max(0, (int)(x0 / TILE_SIZE) - 1), ty0 = std::max(0, (int)(y0 / TILE_SIZE) - 1);
+    int tx1 = std::min(g.map.w - 1, (int)(x1 / TILE_SIZE) + 1), ty1 = std::min(g.map.h - 1, (int)(y1 / TILE_SIZE) + 1);
+    for (int y = ty0; y <= ty1; ++y)
+        for (int x = tx0; x <= tx1; ++x) {
+            const MapTile& t = g.map.at(x, y);
+            Color c = terrainColor(t.color);
+            if (t.blocked) c = Color{ (uint8_t)(c.r * 0.6f), (uint8_t)(c.g * 0.6f), (uint8_t)(c.b * 0.6f), 255 };
+            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, c);
+            if (t.resource) DrawRectangle(x * TILE_SIZE + 4, y * TILE_SIZE + 4, TILE_SIZE - 8, TILE_SIZE - 8, Color{ 150, 220, 255, 120 });
+            if (t.tree) DrawCircle((x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE, 5, Color{ 30, 80, 30, 200 });
+        }
+    // RWX ScorchMark: permanent ground decals, drawn on the terrain layer below every unit
+    Texture2D sc;
+    if (!g.scorches.empty() && shared("blood_mark.png", sc)) {
+        int cells = std::max(1, sc.width / 50);
+        for (auto& s : g.scorches)
+            drawSpriteFrame(sc, cells, s.variant % cells, Vector2{ s.pos.x, s.pos.y }, 50.0f, 0, WHITE);
+    }
+    // world border
+    DrawRectangleLines(0, 0, g.map.worldW(), g.map.worldH(), BLACK);
+}
 
 static const TurretTpl kZeroTurret{};
 
@@ -251,6 +258,15 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     BeginMode2D(view.cam);
     drawMap(g, view.cam);
 
+    // RWX CustomUnit.java:946-951,2414-2424: a wreck is the whole image_wreak texture drawn at the
+    // unit's last rotation, with no turret, shadow layering or health bar.
+    for (auto& w : g.wrecks) {
+        if (!w.tpl) continue;
+        Texture2D wt;
+        if (!loaded(*w.tpl, 2, wt)) continue;
+        float wr = std::max(6.0f, w.tpl->displayRadius) * 2.0f * w.tpl->imageScale;
+        drawSpriteFrame(wt, 1, 0, Vector2{ w.pos.x, w.pos.y }, wr, spriteRot(w.facing), WHITE);
+    }
     // under-construction + normal units sorted so buildings draw first
     for (auto& u : g.units) drawUnitShadow(u);
     for (auto& u : g.units) if (u.tpl && u.tpl->isStatic()) drawUnit(g, u, view.cam);

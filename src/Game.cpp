@@ -24,6 +24,12 @@ static float angleDiff(float a, float b) {
 
 static Team* teamOf(Game& g, int id) { for (auto& t : g.teams) if (t.id == id) return &t; return nullptr; }
 
+// RWX OrderableUnit.isOverLiquid / ScorchMark skip: no ground decal over water.
+static bool overWater(const Game& g, Vec2 p) {
+    int x = (int)(p.x / TILE_SIZE), y = (int)(p.y / TILE_SIZE);
+    return g.map.inBounds(x, y) && g.map.at(x, y).water;
+}
+
 bool Game::init(const std::string& mapPath, std::string* err) {
     if (!map.loadTmx(mapPath, err)) return false;
 
@@ -683,12 +689,29 @@ void Game::explode(Vec2 at, bool big) {
     }
 }
 
+// RWX ScorchMark.b(): a new mark is dropped when one already sits within 5px of it, or when three
+// are within 25px. The variant picks one of the four 50x40 cells of blood_mark.png.
+void Game::addScorch(Vec2 at) {
+    int near25 = 0;
+    for (auto& s : scorches) {
+        if (std::abs(s.pos.x - at.x) >= 25.0f || std::abs(s.pos.y - at.y) >= 25.0f) continue;
+        if (std::abs(s.pos.x - at.x) < 5.0f && std::abs(s.pos.y - at.y) < 5.0f) return;
+        if (++near25 >= 3) return;
+    }
+    Scorch s; s.pos = at; s.variant = (int)g_rng.range(0.0f, 3.999f);
+    scorches.push_back(s);
+}
+
 void Game::killUnit(Unit& u) {
     if (u.dead) return;
     u.dead = true;
     if (u.tpl && u.tpl->isStatic()) markBuildingOcc(map, u, -1);
     bool big = u.tpl && u.tpl->radius > 20;
     explode(u.pos, big);
+    // RWX CustomUnit.java:891-893: an exploding unit leaves a permanent mark on the ground.
+    if (u.tpl && u.tpl->explodeOnDeath && !u.tpl->hideScorchMark && !overWater(*this, u.pos)) addScorch(u.pos);
+    // RWX CustomUnit.java:946: with image_wreak the corpse stays behind instead of vanishing.
+    if (u.tpl && !u.tpl->imageWreak.empty()) wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
     for (auto& o : units) { if (o.orderTargetId == u.id) o.orderTargetId = -1; if (o.constructingId == u.id) o.constructingId = -1; }
     for (auto& p : projectiles) if (p.targetId == u.id) p.targetId = -1;
 }

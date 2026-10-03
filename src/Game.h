@@ -102,6 +102,13 @@ struct Particle {
     bool dead = false;
 };
 
+// RWX ScorchMark: a permanent ground decal left by an exploding unit — blood_mark.png is a row of
+// four 50x40 cells and the mark picks one of them at random.
+struct Scorch { Vec2 pos; int variant = 0; };
+
+// RWX CustomUnit.java:946: a unit with image_wreak stays on the map as an inert wreck sprite.
+struct Wreck { Vec2 pos; float facing = 0; const UnitTemplate* tpl = nullptr; };
+
 struct Team {
     int id = 0;
     std::string name;
@@ -118,6 +125,8 @@ public:
     std::vector<Projectile> projectiles;
     std::vector<Effect> effects;
     std::vector<Particle> particles;
+    std::vector<Scorch> scorches;   // permanent ground decals, drawn with the map
+    std::vector<Wreck> wrecks;      // dead units that left an image_wreak behind
     std::vector<Team> teams;
     long tick = 0;
     bool gameOver = false;
@@ -163,6 +172,7 @@ private:
     void updateProjectile(Projectile& p);
     void killUnit(Unit& u);
     void explode(Vec2 at, bool big);
+    void addScorch(Vec2 at);
     void fire(Unit& u, Unit& target);
     void runAI();
     std::vector<Unit*> queryNearestEnemy(int team, Vec2 pos, float maxDist, const UnitTemplate* shooter);
