@@ -43,8 +43,9 @@ struct Unit {
     bool attackMove = false;
     int orderTargetId = -1;  // explicit attack target
     int moveGoalId = -1;     // chase a moving unit target
-    int constructingId = -1; // builder -> building it is constructing
-    int targetUnitId = -1;   // repair/reclaim/harvest target
+    int nanoTargetId = -1;   // builder -> its RWX UnitCommandType.repair target: resumes the site
+                             // while buildProgress<1 and heals hp afterwards
+                             // (OrderableUnit.updateRepairOrReclaimCommand:2301/2351)
     std::vector<std::string> prodQueue;
     float prodProgress = 0;
     bool underConstruction = false;
@@ -81,6 +82,11 @@ Vec2 turretPivot(const Unit& u, const TurretTpl& tur, float k);
 Vec2 turretPivot(const Unit& u, int i, float k);
 // barrel slide along its own aim, recoilOutTime/recoilReturnTime ticks after a shot
 float turretRecoil(const Unit& u, int i);
+
+// RWX CustomUnit.canRepairTarget:3648-3653 -> getTransportedUnitCount:3630-3644: a builder may fix a
+// friendly target that is not itself unrepairable, buildings needing canRepairBuildings and mobile
+// units needing canRepairUnits.
+bool canRepairTarget(const UnitTemplate& builder, const Unit& target);
 
 struct Projectile {
     Vec2 pos, vel;
@@ -186,7 +192,7 @@ public:
     void orderMove(std::vector<int> ids, Vec2 target);
     void orderAttackMove(std::vector<int> ids, Vec2 target);
     int  orderAttackTarget(std::vector<int> ids, int targetId); // returns #units assigned
-    bool orderConstruct(std::vector<int> builderIds, int buildingId);
+    bool orderRepair(std::vector<int> builderIds, int targetId);
     void orderStop(std::vector<int> ids);
     bool orderBuild(int builderId, const std::string& unitName, int tx, int ty);
     bool orderProduce(int factoryId, const std::string& unitName);
@@ -211,6 +217,7 @@ private:
     void updateUnit(Unit& u);
     void updateProjectile(Projectile& p);
     void killUnit(Unit& u);
+    void removeUnit(Unit& u);
     void explode(Vec2 at, bool big, float scale = 1.0f);
     void addScorch(Vec2 at);
     void updateTurrets(Unit& u, Unit* unitTarget);

@@ -273,7 +273,7 @@ void Game::orderMove(std::vector<int> ids, Vec2 target) {
     int k = 0;
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic()) continue;
-        u->orderTargetId = -1; u->attackMove = false; u->constructingId = -1; u->targetUnitId = -1;
+        u->orderTargetId = -1; u->attackMove = false; u->nanoTargetId = -1;
         Vec2 t = target;
         if (k > 0) { // RW formation scatter: golden-angle offsets around the click point
             float ang = (float)k * 2.39996f;
@@ -295,7 +295,7 @@ int Game::orderAttackTarget(std::vector<int> ids, int targetId) {
     int assigned = 0;
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic() || !u->tpl->canAttack) continue;
-        u->orderTargetId = targetId; u->attackMove = false; u->constructingId = -1;
+        u->orderTargetId = targetId; u->attackMove = false; u->nanoTargetId = -1;
         if (u->pos.dist(tgt->pos) > u->tpl->attackRange * 0.9f) {
             // RWX engagement: stop at range instead of walking into the target
             float stop = std::max(20.0f, u->tpl->attackRange * 0.8f - tgt->tpl->radius);
@@ -307,23 +307,37 @@ int Game::orderAttackTarget(std::vector<int> ids, int targetId) {
     return assigned;
 }
 
-// resume construction of a half-built friendly building (RWX repair branch on right-click)
-bool Game::orderConstruct(std::vector<int> ids, int buildingId) {
-    Unit* bs = get(buildingId);
-    if (!bs || bs->dead || !bs->tpl || !bs->tpl->isBuilding) return false;
-    if (!bs->underConstruction || bs->buildProgress >= 1.0f) return false;
+// RWX CustomUnit.getTransportedUnitCount:3630-3644 through canRepairTarget:3648-3653. The vanilla
+// builder class only ever fixes buildings (BuilderUnit.java:103-108), which RP's builder.ini says with
+// canRepairBuildings:true.
+bool canRepairTarget(const UnitTemplate& builder, const Unit& target) {
+    if (target.dead || !target.tpl || target.tpl->isUnrepairableUnit) return false;
+    return target.tpl->isBuilding ? builder.canRepairBuildings : builder.canRepairUnits;
+}
+
+// RWX has one command for both jobs: GameUI.java:2653 accepts a target that is damaged *or* unfinished
+// and requires every selected unit to pass canRepairTarget, then issues UnitCommandType.repair
+// (UnitCommand.java:236-240). OrderableUnit.java:2301 picks the branch each tick.
+bool Game::orderRepair(std::vector<int> ids, int targetId) {
+    Unit* t = get(targetId);
+    if (!t || !t->tpl || t->dead) return false;
+    if (t->operational() && t->hp >= t->maxHp) return false;
+    if (ids.empty()) return false;
     for (int id : ids) {
         Unit* u = get(id);
-        if (!u || !u->tpl || !u->tpl->isBuilder || u->team != bs->team) continue;
-        u->constructingId = buildingId; u->orderTargetId = -1; u->attackMove = false;
-        u->path.clear(); u->pathIdx = 0; u->hasGoal = false;
-        return true; // one builder per site, like RWX
+        if (!u || !u->tpl || !u->tpl->isBuilder || u->team != t->team) return false;
+        if (!canRepairTarget(*u->tpl, *t)) return false;
     }
-    return false;
+    for (int id : ids) {
+        Unit* u = get(id);
+        u->nanoTargetId = targetId; u->orderTargetId = -1; u->attackMove = false;
+        u->path.clear(); u->pathIdx = 0; u->hasGoal = false;
+    }
+    return true;
 }
 
 void Game::orderStop(std::vector<int> ids) {
-    for (int id : ids) { Unit* u = get(id); if (!u) continue; u->path.clear(); u->pathIdx = 0; u->orderTargetId = -1; u->attackMove = false; u->constructingId = -1; }
+    for (int id : ids) { Unit* u = get(id); if (!u) continue; u->path.clear(); u->pathIdx = 0; u->orderTargetId = -1; u->attackMove = false; u->nanoTargetId = -1; }
 }
 
 bool Game::buildingSpotFree(Vec2 center, const UnitTemplate& t) const {
@@ -353,7 +367,16 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     spend(b->team, tpl->price);
     int bid = spawnUnit(unitName, b->team, center, true);
     if (bid < 0) { reward(b->team, tpl->price); return false; }
-    b->constructingId = bid;
+    if (b->tpl->dieOnConstruct) {
+        // RWX CustomUnit.m():3668-3679: the builder is given to the foundation. It leaves play with no
+        // death effect and the new building takes over its selection.
+        bool wasSelected = b->selected;
+        if (wasSelected) b->selected = false;
+        removeUnit(*b);
+        if (wasSelected) { Unit* s = get(bid); if (s) s->selected = true; }
+    } else {
+        b->nanoTargetId = bid;
+    }
     return true;
 }
 
@@ -478,20 +501,37 @@ void Game::updateUnit(Unit& u) {
         }
     }
 
-    if (tpl.isBuilder && u.constructingId >= 0) {
-        Unit* bs = get(u.constructingId);
-        if (!bs || bs->dead) u.constructingId = -1;
-        else if (bs->operational()) u.constructingId = -1;
+    // [core] selfBuildRate: a foundation raises itself with no builder at all
+    // (CustomUnit.update:1774-1782)
+    if (u.underConstruction && tpl.selfBuildRate != 0.0f) {
+        u.buildProgress = std::min(1.0f, u.buildProgress + tpl.selfBuildRate);
+        if (u.buildProgress >= 1.0f) u.underConstruction = false;
+    }
+
+    if (tpl.isBuilder && u.nanoTargetId >= 0) {
+        Unit* bs = get(u.nanoTargetId);
+        if (!bs || bs->dead || !canRepairTarget(tpl, *bs)) u.nanoTargetId = -1;
+        else if (bs->operational() && bs->hp >= bs->maxHp) u.nanoTargetId = -1;
         else {
+            // [core] nanoRangeForRepair overrides the build range for repairs (:1760-1763)
+            float range = tpl.nanoRangeForRepair > 0 ? tpl.nanoRangeForRepair : tpl.nanoRange;
             float d = u.pos.dist(bs->pos);
-            if (d > tpl.nanoRange) computePath(*this, u, bs->pos + Vec2{ 0, -TILE_SIZE * 2 });
+            if (d > range)
+                computePath(*this, u, bs->pos + (bs->tpl->isBuilding ? Vec2{ 0, -TILE_SIZE * 2 } : Vec2{ 0, 0 }));
             else {
-                // RWX: nanoBuildSpeed multiplies with the target's buildSpeed (per-tick rate)
-                float target = bs->tpl->buildSpeed > 0 ? bs->tpl->buildSpeed : 0.001f;
-                float rate = (tpl.nanoBuildSpeed > 0 ? tpl.nanoBuildSpeed : 1.0f) * target;
-                bs->buildProgress = std::min(1.0f, bs->buildProgress + rate);
-                if (bs->buildProgress >= 1.0f) bs->underConstruction = false;
-                // nano particle: builder -> building, every 5 ticks (RW OrderableUnit nano effect)
+                if (bs->buildProgress < 1.0f) {
+                    // RWX: nanoBuildSpeed multiplies with the target's buildSpeed (per-tick rate)
+                    float target = bs->tpl->buildSpeed > 0 ? bs->tpl->buildSpeed : 0.001f;
+                    float rate = (tpl.nanoBuildSpeed > 0 ? tpl.nanoBuildSpeed : 1.0f) * target;
+                    bs->buildProgress = std::min(1.0f, bs->buildProgress + rate);
+                    if (bs->buildProgress >= 1.0f) bs->underConstruction = false;
+                } else {
+                    // OrderableUnit.java:2352 - a flat nanoRepairSpeed per tick, no buildSpeed factor,
+                    // and it writes currentHealth only: a drained shield bubble stays drained.
+                    bs->hp = std::min(bs->maxHp, bs->hp + tpl.nanoRepairSpeed);
+                }
+                // both branches emit the same nano stream: OrderableUnit.java:5164-5185 counts down 5
+                // ticks between particles
                 if (tick % 5 == 0 && particles.size() < 100) {
                     Vec2 tp = bs->pos + Vec2{ g_rng.range(-8, 8), g_rng.range(-8, 8) };
                     Vec2 dd = tp - u.pos;
@@ -507,15 +547,16 @@ void Game::updateUnit(Unit& u) {
     }
 
     // RWX: idle builders auto-acquire nearby unfinished friendly buildings
-    if (tpl.isBuilder && u.constructingId < 0 && u.path.empty() && !u.hasGoal && u.orderTargetId < 0 && tick % 20 == 0) {
+    if (tpl.isBuilder && u.nanoTargetId < 0 && u.path.empty() && !u.hasGoal && u.orderTargetId < 0 && tick % 20 == 0) {
         Unit* best = nullptr; float bd = 260.0f;
         for (auto& o : units) {
             if (o.team != u.team || o.dead || !o.tpl || !o.tpl->isBuilding) continue;
             if (!o.underConstruction || o.buildProgress >= 1.0f) continue;
+            if (!canRepairTarget(tpl, o)) continue;
             float d = u.pos.dist(o.pos);
             if (d < bd) { bd = d; best = &o; }
         }
-        if (best) u.constructingId = best->id;
+        if (best) u.nanoTargetId = best->id;
     }
 
     // self upgrade action progress (RWX [action_upgrade*]: converts the unit in place)
@@ -1064,18 +1105,25 @@ void Game::addScorch(Vec2 at) {
     scorches.push_back(s);
 }
 
-void Game::killUnit(Unit& u) {
+// RWX BaseUnit.removeFromGame: leave play and drop every order that pointed here. Used by death and by
+// [core] dieOnConstruct, whose builder vanishes without any death effect (CustomUnit.m():3668-3679).
+void Game::removeUnit(Unit& u) {
     if (u.dead) return;
     u.dead = true;
     if (u.tpl && u.tpl->isStatic()) markBuildingOcc(map, u, -1);
+    for (auto& o : units) { if (o.orderTargetId == u.id) o.orderTargetId = -1; if (o.nanoTargetId == u.id) o.nanoTargetId = -1; }
+    for (auto& p : projectiles) if (p.targetId == u.id) p.targetId = -1;
+}
+
+void Game::killUnit(Unit& u) {
+    if (u.dead) return;
     bool big = u.tpl && u.tpl->radius > 20;
+    removeUnit(u);
     explode(u.pos, big);
     // RWX CustomUnit.java:891-893: an exploding unit leaves a permanent mark on the ground.
     if (u.tpl && u.tpl->explodeOnDeath && !u.tpl->hideScorchMark && !overWater(*this, u.pos)) addScorch(u.pos);
     // RWX CustomUnit.java:946: with image_wreak the corpse stays behind instead of vanishing.
     if (u.tpl && !u.tpl->imageWreak.empty()) wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
-    for (auto& o : units) { if (o.orderTargetId == u.id) o.orderTargetId = -1; if (o.constructingId == u.id) o.constructingId = -1; }
-    for (auto& p : projectiles) if (p.targetId == u.id) p.targetId = -1;
 }
 
 void Game::runAI() {
@@ -1099,8 +1147,8 @@ void Game::runAI() {
         }
         if (tick % 300 == 0)
             for (auto& u : units) {
-                if (u.team != teamId || !u.tpl || !u.tpl->isBuilder || u.dead || u.constructingId >= 0) continue;
-                for (int y = 1; y < map.h - 1 && u.constructingId < 0; ++y)
+                if (u.team != teamId || !u.tpl || !u.tpl->isBuilder || u.dead || u.nanoTargetId >= 0) continue;
+                for (int y = 1; y < map.h - 1 && u.nanoTargetId < 0; ++y)
                     for (int x = 1; x < map.w - 1; ++x)
                         if (map.at(x, y).resource) {
                             Vec2 rp{ (x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE };

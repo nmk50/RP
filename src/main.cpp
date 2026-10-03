@@ -316,18 +316,19 @@ int main() {
                     // enemy at point? (RWX-style generous click radius)
                     Unit* enemy = nullptr; float bd = 1e9f;
                     for (auto& u : game.units) if (u.tpl && game.isEnemy(game.playerTeam(), u.team)) { float d = world.dist(u.pos); if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < bd) { bd = d; enemy = &u; } }
-                    // half-built friendly building with builders selected -> resume construction (RWX repair branch)
+                    // RWX GameUI.handleUnitTargetClick:2653 - a friendly target that is damaged or
+                    // unfinished takes the repair command instead of a move order. orderRepair only
+                    // accepts it when every selected unit is a builder able to fix that kind of target.
                     Unit* site = nullptr; float sd = 1e9f;
-                    bool anyBuilder = false;
-                    for (auto* s : sel) if (s->tpl && s->tpl->isBuilder) anyBuilder = true;
-                    if (anyBuilder)
-                        for (auto& u : game.units) if (u.tpl && u.team == game.playerTeam() && u.tpl->isBuilding && u.underConstruction) {
-                            float d = world.dist(u.pos);
-                            if (d < std::max(24.0f, u.tpl->radius) && d < sd) { sd = d; site = &u; }
-                        }
+                    for (auto& u : game.units) {
+                        if (!u.tpl || u.dead || u.team != game.playerTeam()) continue;
+                        if (u.operational() && u.hp >= u.maxHp) continue;
+                        float d = world.dist(u.pos);
+                        if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < sd) { sd = d; site = &u; }
+                    }
                     std::vector<int> ids; for (auto* s : sel) ids.push_back(s->id);
                     if (enemy && game.orderAttackTarget(ids, enemy->id) > 0) {} // attack order taken
-                    else if (site && game.orderConstruct(ids, site->id)) {}
+                    else if (site && game.orderRepair(ids, site->id)) {}
                     else if (IsKeyDown(KEY_LEFT_CONTROL)) game.orderAttackMove(ids, world);
                     else game.orderMove(ids, world);
                     ui.markerOn = true; ui.markerPos = worldV; ui.markerT = 0;

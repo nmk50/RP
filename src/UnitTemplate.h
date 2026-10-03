@@ -144,13 +144,25 @@ struct UnitTemplate {
     bool isFixedFiring = false;
     // [attack] turretRotateWithBody: the hull's turn is added to every barrel's aim (default true)
     bool turretRotateWithBody = true;
-    float attackRange = 0, shootDelay = 60, turretSize = 0, turretTurnSpeed = 3;
+    // RWX parser defaults: CustomUnitConfigParser.java:2042 (shootDelay 50 ticks), :2015
+    // (turretTurnSpeed 8 deg/tick), :1959-1961/:2008-2009 (every numeric [movement] key is 1.0f),
+    // :1774 (nanoRepairSpeed 0.2 hp/tick).
+    float attackRange = 0, shootDelay = 50, turretSize = 0, turretTurnSpeed = 8;
 
     MoveType moveType = MoveType::NONE;
-    float moveSpeed = 0, accel = 0.07f, decel = 0.17f, maxTurnSpeed = 4, turnAccel = 0.25f;
+    float moveSpeed = 1, accel = 1, decel = 1, maxTurnSpeed = 1, turnAccel = 1;
     float reverseSpeed = 0.6f; // RWX [movement] reverseSpeedPercentage: allows the flip-turn
 
-    float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0;
+    float nanoRange = 0, nanoBuildSpeed = 0, nanoRepairSpeed = 0.2f;
+    // RWX repair gates: CustomUnitConfigParser.java:1746-1747 (both default false) and :1732
+    // (isUnrepairableUnit), plus nanoRangeForRepair (:1760-1763, unset -1 means use nanoRange).
+    bool canRepairBuildings = false, canRepairUnits = false, isUnrepairableUnit = false;
+    float nanoRangeForRepair = 0;
+    // [core] selfBuildRate (:1781, getInvertedTime) raises a foundation without a builder
+    // (CustomUnit.update:1774-1782); [core] dieOnConstruct (:1782) gives the builder to the site it
+    // places (CustomUnit.m():3668-3679).
+    float selfBuildRate = 0;
+    bool dieOnConstruct = false;
 
     std::vector<TurretTpl> turrets;
     std::vector<ProjectileTpl> projectiles;

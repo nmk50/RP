@@ -105,6 +105,18 @@ static float timeTicks(const std::string& key, const IniSection& s, float def) {
     try { return std::stof(v) * mult; } catch (...) { return def; }
 }
 
+// RWX getInvertedTime (IniFile.java:756-778), used by buildSpeed and selfBuildRate: "60s" means the
+// whole job takes 60s, so the per-tick progress is 1/(60*60); a bare number is already per tick.
+static float perTickRate(const IniSection& s, const std::string& key, float def) {
+    std::string v = ToLower(Trim(s.get(key, "")));
+    if (v.empty()) return def;
+    if (v.back() == 's') {
+        float secs = (float)atof(v.substr(0, v.size() - 1).c_str());
+        return secs > 0 ? 1.0f / (secs * TICK_RATE) : def;
+    }
+    return (float)atof(v.c_str());
+}
+
 // RWX [section] @copyFromSection : A, B — fill a section from the named template sections, keys it
 // already has winning; each template is itself expanded, 10 levels at most
 // (CustomUnitConfigParser.readAllCustomUnitConfigs:379-404).
@@ -155,13 +167,7 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.armour = (float)c->getNum("armour", 0);
         t.armourMinKeep = (float)c->getNum("armourmindamagetokeep", 1);
         t.techLevel = (int)c->getNum("techlevel", 1);
-        double bs = c->getNum("buildspeed", 0.001);
-        // buildSpeed can be like "65.6s" (seconds) or per-tick float
-        std::string bsv = ToLower(c->get("buildspeed"));
-        if (EndsWith(bsv, "s")) { // convert seconds -> per-tick progress
-            float secs = (float)atof(bsv.c_str());
-            t.buildSpeed = secs > 0 ? 1.0f / (secs * TICK_RATE) : 0.001f;
-        } else t.buildSpeed = (float)bs;
+        t.buildSpeed = perTickRate(*c, "buildspeed", 0.001f);
         t.isBuilding = c->getBool("isbuilding", false);
         t.isBuilder = c->getBool("isbuilder", false);
         t.fogSight = (float)c->getNum("fogofwarsightrange", 0);
@@ -247,17 +253,21 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.isFixedFiring = a->getBool("isfixedfiring", false);
         t.turretRotateWithBody = a->getBool("turretrotatewithbody", true);
         t.attackRange = (float)a->getNum("maxattackrange", 0);
-        t.shootDelay = timeTicks("shootdelay", *a, 60);
+        // CustomUnitConfigParser.java:2042 getTime("attack","shootDelay", 50.0f)
+        t.shootDelay = timeTicks("shootdelay", *a, 50);
         t.turretSize = (float)a->getNum("turretsize", 0);
-        t.turretTurnSpeed = (float)a->getNum("turretturnspeed", 3);
+        // :2015 turretTurnSpeed default 8.0 deg/tick; per-turret turnSpeed overrides it
+        // (CustomUnit.java:2297-2303), which Templates.cpp does when the [turret] section has one.
+        t.turretTurnSpeed = (float)a->getNum("turretturnspeed", 8);
     }
     if (const IniSection* m = ini.find("movement")) {
         t.moveType = parseMoveType(m->get("movementtype", "NONE"));
-        t.moveSpeed = (float)m->getNum("movespeed", 0);
-        t.accel = (float)m->getNum("moveaccelerationspeed", 0.07);
-        t.decel = (float)m->getNum("movedecelerationspeed", 0.17);
-        t.maxTurnSpeed = (float)m->getNum("maxturnspeed", 4);
-        t.turnAccel = (float)m->getNum("turnacceleration", 0.25);
+        // :1959-1961, :2008-2009 every numeric [movement] default is 1.0f
+        t.moveSpeed = (float)m->getNum("movespeed", 1);
+        t.accel = (float)m->getNum("moveaccelerationspeed", 1);
+        t.decel = (float)m->getNum("movedecelerationspeed", 1);
+        t.maxTurnSpeed = (float)m->getNum("maxturnspeed", 1);
+        t.turnAccel = (float)m->getNum("turnacceleration", 1);
         t.reverseSpeed = (float)m->getNum("reversespeedpercentage", 0.6);
     }
     if (t.isBuilding) t.moveType = MoveType::NONE;
@@ -265,11 +275,23 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
     // nano (builder) params
     if (const IniSection* c = ini.find("core")) {
         t.nanoRange = (float)c->getNum("nanorange", 0);
-        t.nanoBuildSpeed = (float)c->getNum("nanobuildspeed", 0);
-        t.nanoRepairSpeed = (float)c->getNum("nanorepairspeed", 0);
-        if (t.isBuilder && t.nanoRange == 0) t.nanoRange = 90;
-        // RWX mods often omit isBuilder on nano units (e.g. megaBuilder)
-        if (!t.isBuilder && !t.isBuilding && (t.nanoRange > 0 || t.nanoBuildSpeed > 0)) t.isBuilder = true;
+        // :1778 nanoBuildSpeed defaults to 1.0
+        t.nanoBuildSpeed = (float)c->getNum("nanobuildspeed", 1);
+        // :1774 nanoRepairSpeed defaults to 0.2 hp/tick for every unit
+        t.nanoRepairSpeed = (float)c->getNum("nanorepairspeed", 0.2);
+        // unset nanoRange (-1 in RWX) falls through CustomUnit.y():1641-1646 to BaseUnit.y():1895
+        // which is 85
+        if (t.isBuilder && t.nanoRange == 0) t.nanoRange = 85;
+        t.canRepairBuildings = c->getBool("canrepairbuildings", false);
+        t.canRepairUnits = c->getBool("canrepairunits", false);
+        t.isUnrepairableUnit = c->getBool("isunrepairableunit", false);
+        // :1760-1763 nanoRangeForRepair; -1/unset means the repair reaches as far as nanoRange
+        t.nanoRangeForRepair = (float)c->getNum("nanorangeforrepair", 0);
+        t.selfBuildRate = perTickRate(*c, "selfbuildrate", 0);
+        t.dieOnConstruct = c->getBool("dieonconstruct", false);
+        // RWX mods often omit isBuilder on nano units (e.g. megaBuilder). nanoBuildSpeed now defaults
+        // to 1.0 like RWX (:1778), so only a declared key counts as evidence here.
+        if (!t.isBuilder && !t.isBuilding && (t.nanoRange > 0 || c->has("nanobuildspeed"))) t.isBuilder = true;
     }
 
     // [projectile_<name>] is keyed by whatever follows the underscore, case-insensitively, and the
