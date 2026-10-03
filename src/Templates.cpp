@@ -289,6 +289,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.nanoRangeForRepair = (float)c->getNum("nanorangeforrepair", 0);
         t.selfBuildRate = perTickRate(*c, "selfbuildrate", 0);
         t.dieOnConstruct = c->getBool("dieonconstruct", false);
+        // :1780 selfRegenRate is a plain getFloat, not an inverted time: the value is HP per tick
+        t.selfRegenRate = (float)c->getNum("selfregenrate", 0);
         // RWX mods often omit isBuilder on nano units (e.g. megaBuilder). nanoBuildSpeed now defaults
         // to 1.0 like RWX (:1778), so only a declared key counts as evidence here.
         if (!t.isBuilder && !t.isBuilding && (t.nanoRange > 0 || c->has("nanobuildspeed"))) t.isBuilder = true;

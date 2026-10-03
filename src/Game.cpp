@@ -508,6 +508,15 @@ void Game::updateUnit(Unit& u) {
         if (u.buildProgress >= 1.0f) u.underConstruction = false;
     }
 
+    // [core] selfRegenRate: RWX runs this for every unit that has passed the isDead early return and
+    // isAlive() check, so a foundation heals too, and a negative rate is kept even at full health so
+    // it can burn the unit down (CustomUnit.update:1821-1826). The bubble is untouched — that is
+    // shieldRegen's job, not this one.
+    if (tpl.selfRegenRate != 0.0f && (u.hp < u.maxHp || tpl.selfRegenRate < 0.0f)) {
+        u.hp += tpl.selfRegenRate;
+        if (u.hp > u.maxHp) u.hp = u.maxHp;
+    }
+
     if (tpl.isBuilder && u.nanoTargetId >= 0) {
         Unit* bs = get(u.nanoTargetId);
         if (!bs || bs->dead || !canRepairTarget(tpl, *bs)) u.nanoTargetId = -1;

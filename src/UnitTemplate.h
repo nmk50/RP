@@ -167,6 +167,9 @@ struct UnitTemplate {
     // places (CustomUnit.m():3668-3679).
     float selfBuildRate = 0;
     bool dieOnConstruct = false;
+    // [core] selfRegenRate (:1780, plain getFloat) is HP per tick recovered with no builder and no
+    // shield involved; it runs for every live unit, foundation included (CustomUnit.update:1821-1826).
+    float selfRegenRate = 0;
 
     std::vector<TurretTpl> turrets;
     std::vector<ProjectileTpl> projectiles;
