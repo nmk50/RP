@@ -126,6 +126,11 @@ struct UnitTemplate {
 
     float price = 100, maxHp = 100, mass = 1000;
     float radius = 12, displayRadius = 12;
+    // [core] softCollisionOnAll (CustomUnitConfigParser.java:1721) divides the overlap a unit corrects
+    // per tick: at 12 a hull sinks out of an intersection a twelfth of the way each frame instead of
+    // being shoved clear at once, which is what makes the big experimental units feel heavy. The
+    // resolve takes the larger of the pair's two values (OrderableUnit.java:1112-1121).
+    int softCollisionOnAll = 0;
     // RWX [core] shields (BaseUnit.shield / unitEnergyMax): maxShield is the pool size, shieldRegen
     // refills it every tick - default 0.25, i.e. 15 per second - and startShieldAtZero leaves a fresh
     // unit's bubble empty. shieldRenderRadius (default radius) is how big the bubble is drawn, and

@@ -156,6 +156,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.mass = (float)c->getNum("mass", 1000);
         t.radius = (float)c->getNum("radius", 12);
         t.displayRadius = (float)c->getNum("displayradius", t.radius);
+        // [core] softCollisionOnAll, :1721 -- a plain int that is only ever used as a divisor.
+        t.softCollisionOnAll = (int)c->getNum("softcollisiononall", 0);
         // CustomUnitConfigParser.java:1682-1688 - maxShield is read as an int with no scaling and
         // shieldRegen defaults to 0.25 per tick even for units that never get a bubble.
         t.maxShield = (int)c->getNum("maxshield", 0);

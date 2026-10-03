@@ -452,15 +452,7 @@ void Game::update() {
     ++tick;
     for (size_t i = 0; i < units.size(); ++i) updateUnit(units[i]);
     for (auto& p : projectiles) updateProjectile(p);
-    for (auto& a : units) {
-        if (!a.tpl || a.isStatic() || a.dead) continue;
-        for (auto& b : units) {
-            if (&a == &b || b.dead || !b.tpl || b.isStatic()) continue;
-            float rr = (a.tpl->radius + b.tpl->radius) * 0.9f;
-            Vec2 d = a.pos - b.pos; float dist = d.len();
-            if (dist < rr && dist > 0.0001f) a.pos = a.pos + d.norm() * (rr - dist) * 0.5f;
-        }
-    }
+    resolveSoftCollisions();
     // A trail puff sinks 0.1 px/tick (Effect.java:364-366 applying the Q set at Projectile:934).
     for (auto& e : effects) { e.t += 1; if (e.trail) e.pos.y += 0.1f; if (e.t - e.delay >= e.life) e.dead = true; }
     for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
@@ -472,9 +464,118 @@ void Game::update() {
     checkWinLoss();
 }
 
+// OrderableUnit.resolveSoftCollisionWithUnit:1106-1184 for one ordered pair, `a` being the mover that
+// gathered `b` as a neighbour. The correction lands in both units' push buffers, weighted by
+// [core] mass.
+static void softPushPair(Unit& a, Unit& b) {
+    float dx = b.pos.x - a.pos.x, dy = b.pos.y - a.pos.y;
+    float d2 = dx * dx + dy * dy;
+    float rr = a.tpl->radius + b.tpl->radius;
+    if (d2 >= rr * rr) return;
+    float dist = std::sqrt(d2);
+    float overlap = (rr - dist) + 0.001f;
+    int divisor = std::max(a.tpl->softCollisionOnAll, b.tpl->softCollisionOnAll);
+    // :1115-1121, with f == 1 tick. A high softCollisionOnAll makes a huge hull ease out of an
+    // intersection instead of popping out of it.
+    if (divisor != 0) overlap = std::min(overlap / divisor, overlap);
+    // :1122-1134 -- 5% off the top, then 30% off everything past 1 px, 3 px, 6 px and 10 px in turn,
+    // so units buried deep in a crowd separate slowly rather than exploding apart.
+    float t = overlap * 0.95f;
+    if (t > 1.0f) t *= 0.7f;
+    if (t > 3.0f) t = 3.0f + (t - 3.0f) * 0.7f;
+    if (t > 6.0f) t = 6.0f + (t - 6.0f) * 0.7f;
+    if (t > 10.0f) t = 10.0f + (t - 10.0f) * 0.7f;
+    // :1175-1176, the direction from the mover toward the neighbour. Two units on the exact same pixel
+    // push along +X, which is what fastCos(atan2(0, 0)) gives RWX.
+    Vec2 dir{ 1.0f, 0.0f };
+    if (dist > 1e-4f) dir = Vec2{ dx / dist, dy / dist };
+    float mA = a.tpl->mass, mB = b.tpl->mass;
+    // :1142-1170, friendly pairs only: whoever is parked counts as 1.7x heavier, so a moving hull
+    // gives way around a standing one rather than ploughing through it -- 5x once either has been
+    // retrying its path for 200 ticks, which is how RWX unjams a blocked column. RWX weights a unit
+    // riding inside its transport the same way, which RP has no equivalent for yet.
+    if (a.team == b.team) {
+        float k = (a.stuckTimer > 200 || b.stuckTimer > 200) ? 5.0f : 1.7f;
+        if (a.throttle == 0.0f && b.throttle != 0.0f) mA *= k;
+        else if (b.throttle == 0.0f && a.throttle != 0.0f) mB *= k;
+    }
+    // :1171-1184 -- b's slice, by mass. A building takes its share into a buffer it then throws away,
+    // because CustomUnit.I():598-603 stops a building applying any position change at all.
+    float share = mA / (mA + mB);
+    b.push = b.push + dir * (t * share);
+    a.push = a.push - dir * (t * (1.0f - share));
+}
+
+// RWX OrderableUnit.updateAllUnitCollisions:451-509 with resolveSoftCollisionWithUnit:1043-1204, the
+// rule that separates overlapping hulls. It replaces a symmetric half-overlap nudge, which ignored
+// mass, terrain group and buildings alike, so a scout could bulldoze a tank across a factory floor.
+void Game::resolveSoftCollisions() {
+    // BaseUnit.bR():944-958 numbers the groups: 3 airborne, 2 submerged, 1 everything else, and -1 for
+    // a unit out of the collision world. RWX reads 3 and 2 off posZ (CustomUnit.java:636-643), which RP
+    // has no model for, so the movement type stands in -- and like RWX that leaves hover units in the
+    // ground group, because only movementType AIR can be airborne.
+    for (auto& u : units) {
+        int group = 1;
+        if (!u.tpl || u.dead) group = -1;
+        else if (u.tpl->moveType == MoveType::AIR) group = 3;
+        else if (u.tpl->moveType == MoveType::WATER) group = 2;
+        u.collisionGroup = group;
+    }
+    // Last tick's buffered push is folded in here, before the new overlaps are measured, clamped to
+    // +-9 px per axis (OrderableUnit.java:922-928, where clampTo255 is despite its name a plain clamp)
+    // and put through the same passability test as a step -- a unit crushed by a whole crowd simply
+    // loses the rest of that tick's correction.
+    for (auto& u : units) {
+        Vec2 d{ std::min(9.0f, std::max(-9.0f, u.push.x)), std::min(9.0f, std::max(-9.0f, u.push.y)) };
+        u.push = Vec2{};
+        if (d.len() < 1e-6f || u.collisionGroup < 0 || u.isStatic()) continue;
+        Vec2 np = u.pos + d;
+        if (passableAt(*this, np, u.tpl->moveType)) u.pos = np;
+        else {
+            Vec2 nx{ np.x, u.pos.y }, ny{ u.pos.x, np.y };
+            if (passableAt(*this, nx, u.tpl->moveType)) u.pos = nx;
+            else if (passableAt(*this, ny, u.tpl->moveType)) u.pos = ny;
+        }
+        u.moved = true;   // :929 -- being pushed counts as moving
+    }
+    // Gather, then resolve (the two loops at :463-494 and :497-508), so every pair in a tick is
+    // measured against the positions at the start of it. A mover keeps its ten nearest neighbours
+    // within its own radius plus 7 px (:470, list capped at :1089-1103); RWX stretches each unit's
+    // query over 50-250 ms as a pure optimisation, which RP at this scale does not need.
+    struct Near { Unit* other; float rank; };
+    std::vector<std::vector<Near>> near(units.size());
+    for (size_t i = 0; i < units.size(); i++) {
+        Unit& a = units[i];
+        if (!a.moved || a.collisionGroup < 0 || a.isStatic()) continue;
+        float reach = a.tpl->radius + 7.0f, reachSq = reach * reach;
+        for (size_t j = 0; j < units.size(); j++) {
+            if (j == i) continue;
+            Unit& b = units[j];
+            // :1047 -- a unit only pushes its own group, and never the unit it is shooting at, so a
+            // tank can sit against its target instead of being shoved out of range.
+            if (b.collisionGroup != a.collisionGroup || a.targetId == b.id || b.targetId == a.id) continue;
+            float dx = b.pos.x - a.pos.x, dy = b.pos.y - a.pos.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 > reachSq) continue;
+            float rr = a.tpl->radius + b.tpl->radius;
+            float rank = d2 < rr * rr ? 0.0f : d2;   // :1057-1060, overlapping units sort first
+            auto& lst = near[i];
+            int at = (int)lst.size();
+            for (int k = 0; k < (int)lst.size(); k++) if (rank < lst[k].rank) { at = k; break; }
+            if (at >= (int)lst.size() && lst.size() >= 10) continue;
+            if ((int)lst.size() < 10) lst.push_back({ nullptr, 0 });
+            for (int k = (int)lst.size() - 1; k > at; k--) lst[k] = lst[k - 1];
+            lst[at] = { &b, rank };
+        }
+    }
+    for (size_t i = 0; i < units.size(); i++)
+        for (auto& n : near[i]) softPushPair(units[i], *n.other);
+}
+
 void Game::updateUnit(Unit& u) {
     if (u.dead || !u.tpl) return;
     const UnitTemplate& tpl = *u.tpl;
+    u.moved = false;
     if (u.underConstruction && u.buildProgress >= 1.0f) u.underConstruction = false;
     if (tpl.creditIncomeRate > 0 && u.operational() && tick % 10 == 0)
         reward(u.team, tpl.creditIncomeRate * (10.0f / 40.0f));
@@ -496,9 +597,17 @@ void Game::updateUnit(Unit& u) {
         u.prodProgress += item ? item->buildSpeed : tpl.buildSpeed;
         if (u.prodProgress >= 1.0f) {
             u.prodProgress = 0; std::string name = u.prodQueue.front(); u.prodQueue.erase(u.prodQueue.begin());
-            Vec2 sp = u.hasRally ? u.rallyPoint : u.pos + Vec2{ 0, (tpl.footprintTilesH() / 2 + 1.5f) * TILE_SIZE };
-            if (item && item->isWaterUnit()) sp = findWaterSpawn(*this, sp, tpl.radius + TILE_SIZE * 2.0f);
-            spawnUnit(name, u.team, sp);
+            // FactoryWithQueue.a:72-86 with FactoryQueueManager:99-144: a finished unit is born at the
+            // factory's own exit and *ordered* out of there -- to the rally point when one is set,
+            // otherwise three factory radii straight down the exit line. Appearing parked on the spot
+            // it was wanted is what stacked RP's whole production queue on one pixel, since the
+            // collision pass only ever spreads units that are moving.
+            Vec2 exitAt{ u.pos.x, u.pos.y + tpl.radius * 2.0f };
+            Vec2 sp = exitAt;
+            if (item && item->isWaterUnit()) sp = findWaterSpawn(*this, exitAt, tpl.radius + TILE_SIZE * 2.0f);
+            int newId = spawnUnit(name, u.team, sp);
+            Vec2 goal = u.hasRally ? u.rallyPoint : u.pos + Vec2{ 0, tpl.radius * 3.0f };
+            if (newId >= 0 && goal.dist(sp) > 4.0f) orderMove({ newId }, goal);
         }
     }
 
@@ -615,6 +724,7 @@ void Game::updateUnit(Unit& u) {
         }
     }
     Unit* tgt = combatTarget >= 0 ? get(combatTarget) : nullptr;
+    u.targetId = combatTarget;
 
     if (!u.isStatic()) {
         if (u.repathTimer > 0) u.repathTimer--;
@@ -734,6 +844,9 @@ void Game::updateUnit(Unit& u) {
         } else if (std::fabs(u.throttle) > 1e-4f) {
             stepTo(Vec2{ std::cos(a), std::sin(a) } * (tpl.moveSpeed * u.throttle));
         }
+        // OrderableUnit.java:873, 920 -- a unit only takes part in the collision pass when it had
+        // throttle or carried velocity; whether the step above actually moved it is not asked.
+        u.moved = u.throttle != 0.0f || u.vel.len() > 1e-6f;
         if (pathing) {
             float arrive = lastNode ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7
             if (dist <= std::max(arrive, tpl.moveSpeed)) {

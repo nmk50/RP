@@ -1,5 +1,6 @@
 // Core simulation: teams, units, projectiles, orders, economy, combat.
 #pragma once
+#include <deque>
 #include <string>
 #include <vector>
 #include "Common.h"
@@ -42,6 +43,9 @@ struct Unit {
     int pathIdx = 0;
     bool attackMove = false;
     int orderTargetId = -1;  // explicit attack target
+    // RWX BaseUnit.targetUnit as resolved for this tick, explicit or auto-acquired. Soft collisions
+    // skip a unit's own target (OrderableUnit.java:1047) so a tank can sit against what it shoots.
+    int targetId = -1;
     int moveGoalId = -1;     // chase a moving unit target
     int nanoTargetId = -1;   // builder -> its RWX UnitCommandType.repair target: resumes the site
                              // while buildProgress<1 and heals hp afterwards
@@ -75,6 +79,16 @@ struct Unit {
     // RWX BaseUnit.velocityX/velocityY. Only [movement] moveSlidingMode integrates it into the
     // position (OrderableUnit.java:893-918); a normal hull steps straight off its throttle.
     Vec2 vel;
+    // RWX BaseUnit.worldX/worldY (:135) and .collisionGroup (BaseUnit.bR():944-958). A soft-collision
+    // push is buffered in `push` and folded into `pos` at the start of the next tick's collision pass,
+    // clamped to +-9 px per axis (OrderableUnit.java:922-930). collisionGroup is 3 airborne, 2 water,
+    // 1 land, -1 for a unit that is dead or riding in a transport, and only units sharing a group push
+    // each other (:1047).
+    Vec2 push;
+    int collisionGroup = 1;
+    // OrderableUnit.java:873, 920 -- set when the unit had throttle, velocity or a buffered push this
+    // tick. A unit that never moves is not asked to resolve collisions at all.
+    bool moved = false;
     bool isStatic() const { return tpl && tpl->moveType == MoveType::NONE; }
     bool operational() const { return !underConstruction || buildProgress >= 1.0f; }
 };
@@ -184,7 +198,10 @@ struct Team {
 class Game {
 public:
     TileMap map;
-    std::vector<Unit> units;
+    // A deque, not a vector: updateUnit() spawns units (factory output, builders, death spawns) while it
+    // still holds a reference to the unit being updated and pointers to its neighbours, and only a deque
+    // keeps those valid when the container grows.
+    std::deque<Unit> units;
     std::vector<Projectile> projectiles;
     std::vector<Effect> effects;
     std::vector<Particle> particles;
@@ -233,6 +250,9 @@ public:
 
 private:
     void updateUnit(Unit& u);
+    // RWX OrderableUnit.updateAllUnitCollisions:451-509 -- the per-tick soft-collision pass that keeps
+    // overlapping hulls apart, replacing a symmetric push.
+    void resolveSoftCollisions();
     void updateProjectile(Projectile& p);
     void killUnit(Unit& u);
     void removeUnit(Unit& u);
