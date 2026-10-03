@@ -295,8 +295,15 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.lightColor = (lc.empty() || lc == "-1") ? 0u : parseRgba(lc);
             p.lightSize = (float)s.getNum("lightsize", 0.5);
             p.largeHit = s.getBool("largehiteffect", false);
-            std::string exp = ToLower(s.get("explodeeffect", ""));
-            p.explodeOnHit = p.areaDamage > 0 || p.areaRadius > 0;
+            p.turnSpeed = (float)s.getNum("turnspeed", -1);
+            p.targetSpeed = (float)s.getNum("targetspeed", -1);
+            p.targetSpeedAccel = (float)s.getNum("targetspeedacceleration", 0.1);
+            p.speedSpread = (float)s.getNum("speedspread", 0);
+            p.instant = s.getBool("instant", false);
+            p.wobbleAmp = (float)s.getNum("wobbleamplitude", 0);
+            p.wobbleFreq = (float)s.getNum("wobblefrequency", 5);
+            p.areaExpandTime = (float)s.getNum("areaexpaintime", p.areaExpandTime);
+            p.buildingDamageMult = (float)s.getNum("buildingdamagemultiplier", 1);
             if (s.has("copyfrom")) {
                 int from = (int)s.getNum("copyfrom", 0);
                 if (from >= 0 && from <= maxIdx && present[from]) { ProjectileTpl b = arr[from]; p.directDamage = s.has("directdamage") ? p.directDamage : b.directDamage; arr[idx] = p; present[idx] = true; continue; }

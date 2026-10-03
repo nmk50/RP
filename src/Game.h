@@ -77,9 +77,24 @@ struct Projectile {
     uint32_t color = 0xFFFFFFFF;   // 0xRRGGBBAA sprite tint
     uint32_t lightColor = 0;       // 0xRRGGBBAA additive glow, 0 = none
     float lightSize = 0.5f;
-    bool explodeOnHit = false;
     bool largeHit = false;
     bool dead = false;
+    // RWX Projectile flight state (Projectile.update): the shot owns a heading that either re-aims
+    // at the target every tick (turnSpeed < 0) or turns toward it by turnSpeed deg/tick, and a
+    // speed that ramps toward targetSpeed. az / O / r / s.
+    float heading = 0, turnSpeed = -1;
+    float speedTarget = -1, speedAccel = 0.1f;
+    // wobble: a sine drift sideways to the heading, phase I is random per shot (update:905)
+    float wobbleAmp = 0, wobbleFreq = 5, wobblePhase = 0;
+    int ticks = 0;
+    float buildingMult = 1;                  // ai: buildingDamageMultiplier
+    // Once the shot lands (bn) the splash ring grows over areaExpandTime ticks (ao/W) centred on
+    // the impact point; the projectile itself is no longer drawn (update:1038 sets shouldDraw=false).
+    bool hit = false;
+    Vec2 impactPos;
+    float expandT = 0, expandTotal = 0;
+    bool airBurst = false;                   // RWX impact height: splash stays in that domain
+    std::vector<int> splashHits;             // ap: units already caught by the growing ring
 };
 
 // RWX EffectManager.createSmallExplosion: explode_big.png strip, frames 0..12 at 0.5/tick,
@@ -164,14 +179,15 @@ public:
     int playerTeam() const { return 0; }
 
     void damage(Unit& target, float dmg);
-    void impact(Projectile& p, Vec2 point);
+    void impact(Projectile& p, Unit* direct, Vec2 at);
+    void splash(Projectile& p, float frac);
     void checkWinLoss();
 
 private:
     void updateUnit(Unit& u);
     void updateProjectile(Projectile& p);
     void killUnit(Unit& u);
-    void explode(Vec2 at, bool big);
+    void explode(Vec2 at, bool big, float scale = 1.0f);
     void addScorch(Vec2 at);
     void fire(Unit& u, Unit& target);
     void runAI();

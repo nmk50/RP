@@ -1,5 +1,6 @@
 #include "Game.h"
 #include "Pathfinding.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -28,6 +29,17 @@ static Team* teamOf(Game& g, int id) { for (auto& t : g.teams) if (t.id == id) r
 static bool overWater(const Game& g, Vec2 p) {
     int x = (int)(p.x / TILE_SIZE), y = (int)(p.y / TILE_SIZE);
     return g.map.inBounds(x, y) && g.map.at(x, y).water;
+}
+
+// RWX Utility.distanceSq(current, target, maxDelta): ramp a scalar toward a target by at most a step.
+static float moveTowards(float v, float to, float step) {
+    float d = to - v;
+    return std::fabs(d) <= step ? to : v + (d > 0 ? step : -step);
+}
+
+// RWX Projectile.a:228 - [projectile_N] buildingDamageMultiplier only scales damage dealt to buildings.
+static float damageScale(const Projectile& p, const Unit& u) {
+    return (p.buildingMult != 1.0f && u.tpl && u.tpl->isBuilding) ? p.buildingMult : 1.0f;
 }
 
 bool Game::init(const std::string& mapPath, std::string* err) {
@@ -634,9 +646,18 @@ void Game::fire(Unit& u, Unit& target) {
     p.frame = pt.frame; p.drawType = pt.drawType; p.shadowFrame = pt.shadowFrame;
     p.drawSize = pt.drawSize; p.color = pt.color;
     p.lightColor = pt.lightColor; p.lightSize = pt.lightSize;
-    p.explodeOnHit = pt.explodeOnHit || pt.areaDamage > 0; p.largeHit = pt.largeHit;
-    p.vel = (target.pos - p.pos).norm() * p.speed;
-    projectiles.push_back(p);
+    p.largeHit = pt.largeHit;
+    // RWX Projectile.az is set from the turret's aim line, not from the target's position
+    // (CustomUnit.java:1371), and the shot then flies along that heading.
+    p.heading = u.turretRot;
+    p.turnSpeed = pt.turnSpeed;
+    p.speedTarget = pt.targetSpeed; p.speedAccel = pt.targetSpeedAccel;
+    if (pt.speedSpread > 0) p.speed += g_rng.range(-pt.speedSpread, pt.speedSpread);
+    p.wobbleAmp = pt.wobbleAmp; p.wobbleFreq = pt.wobbleFreq;
+    p.wobblePhase = g_rng.range(0.0f, 1.0f);   // RWX Projectile.I
+    p.buildingMult = pt.buildingDamageMult;
+    p.expandTotal = pt.areaExpandTime > 0 ? pt.areaExpandTime : 0.0f;
+    p.vel = Vec2{ std::cos(p.heading), std::sin(p.heading) } * p.speed;
     if (tur.shootFlame) {
         // RWX EffectManager.createFlameEffect(2): small plays frames 0..3 at 0.5/tick (8 ticks),
         // large/medium frames 1..4 at 0.4/tick (10 ticks); the flame is attached to the shooter.
@@ -645,27 +666,97 @@ void Game::fire(Unit& u, Unit& target) {
         u.muzzleAng = u.turretRot;
         u.muzzleOff = p.pos - u.pos;
     }
+    if (pt.instant) {
+        // RWX update:841,979: an instant shot never moves, it lands on the firing tick.
+        impact(p, &target, target.pos);
+        if (p.expandTotal <= 0) return;   // nothing is left to animate, so no projectile is spawned
+    }
+    projectiles.push_back(p);
 }
 
+// RWX Projectile.update: the shot owns a heading and moves along it, so a shot with turnSpeed >= 0
+// only curves at that rate and can miss; turnSpeed < 0 (the default) re-aims every tick. The step is
+// clamped to the target distance, which also zeroes the gap so the following hit test lands it
+// (update:857-866,975).
 void Game::updateProjectile(Projectile& p) {
     if (p.dead) return;
+    if (p.hit) {
+        // The shot has landed: only the blast ring keeps growing, and it is no longer drawn.
+        p.expandT -= 1.0f;
+        splash(p, 1.0f - p.expandT / p.expandTotal);
+        if (p.expandT <= 0) p.dead = true;
+        return;
+    }
     Unit* t = p.targetId >= 0 ? get(p.targetId) : nullptr;
-    Vec2 aim = (t && !t->dead) ? t->pos : p.dest;
-    Vec2 d = aim - p.pos; float dist = d.len();
-    if (dist < p.speed + 2.0f) { impact(p, aim); p.dead = true; return; }
-    p.vel = d.norm() * p.speed;
-    p.pos = p.pos + p.vel;
-    if (--p.life <= 0) { if (p.explodeOnHit) impact(p, p.pos); p.dead = true; }
+    if (t && t->dead) t = nullptr;
+    // RWX keeps chasing the corpse, so a shot whose target dies mid-flight still lands where it died.
+    if (t) p.dest = t->pos;
+    Vec2 aim = t ? t->pos : p.dest;
+    float dist = p.pos.dist(aim);
+    float want = std::atan2(aim.y - p.pos.y, aim.x - p.pos.x);
+    p.heading = p.turnSpeed >= 0 ? lerpAngle(p.heading, want, p.turnSpeed * 0.0174533f) : want;
+    if (p.speedTarget > 0) p.speed = moveTowards(p.speed, p.speedTarget, p.speedAccel);
+    float step = p.speed;
+    if (dist < step) { step = dist; dist = 0; }
+    Vec2 dir{ std::cos(p.heading), std::sin(p.heading) };
+    p.pos = p.pos + dir * step;
+    if (p.wobbleAmp != 0) {
+        float off = std::sin((p.ticks * 360.0f / p.wobbleFreq + p.wobblePhase * 360.0f) * 0.0174533f) * p.wobbleAmp;
+        p.pos = p.pos + Vec2{ -dir.y, dir.x } * off;
+    }
+    p.vel = dir * p.speed;
+    p.ticks++;
+    // RWX lands within a flat 6px of a unit, or within 0.8 of a building's radius (update:961-967)
+    float hitR = (t && t->tpl && t->tpl->isBuilding) ? std::max(6.0f, t->tpl->radius * 0.8f) : 6.0f;
+    if (dist < hitR) {
+        impact(p, t, p.pos);
+        if (p.expandTotal <= 0) p.dead = true;
+        return;
+    }
+    // RWX update:1411: a shot that runs out of life just vanishes; only explodeOnEndOfLife makes it
+    // detonate there, which no shipped weapon sets.
+    if (--p.life <= 0) p.dead = true;
 }
 
-void Game::impact(Projectile& p, Vec2 point) {
-    explode(point, p.largeHit || p.areaRadius > 0);
-    if (p.damage > 0) { Unit* t = p.targetId >= 0 ? get(p.targetId) : nullptr; if (t && !t->dead) damage(*t, p.damage); }
-    if (p.areaDamage > 0)
-        for (auto& u : units) {
-            if (!u.tpl || u.dead || !isEnemy(p.team, u.team)) continue;
-            if (u.pos.dist(point) <= p.areaRadius) damage(u, p.areaDamage);
+// RWX update:1021-1140: the blast is centred on the impact point, the direct damage goes to the
+// chased unit, and the splash either fills its radius at once or grows over areaExpandTime.
+void Game::impact(Projectile& p, Unit* direct, Vec2 at) {
+    p.hit = true;
+    p.impactPos = at;
+    p.airBurst = direct && direct->tpl && direct->tpl->moveType == MoveType::AIR;
+    // largeHitEffect reads backwards but is literal in RWX: it means "this weapon brings its own
+    // hit flash", which swaps the generic seven-flame blast for a small one, plus one flame scaled
+    // by the blast radius when that radius exceeds 10px (update:1168-1185).
+    if (p.largeHit) {
+        if (p.areaRadius > 10) explode(at, false, p.areaRadius / 25.0f);
+        explode(at, false);
+    } else {
+        explode(at, true);
+    }
+    if (direct && p.damage > 0) damage(*direct, p.damage * damageScale(p, *direct));
+    if (p.expandTotal > 0) p.expandT = p.expandTotal;
+    else splash(p, 1.0f);
+}
+
+// RWX Projectile.b(f2):1443-1526: units inside the ring take areaDamage * (1 - dist/areaRadius + 0.1)
+// capped at 1; the burst stays in the domain it detonated in, so a ground burst does not splash
+// aircraft, and a growing ring catches each unit only once.
+void Game::splash(Projectile& p, float frac) {
+    if (p.areaDamage <= 0 || p.areaRadius <= 0) return;
+    float ring = p.areaRadius * std::min(1.0f, frac);
+    for (auto& u : units) {
+        if (!u.tpl || u.dead || !isEnemy(p.team, u.team)) continue;
+        if ((u.tpl->moveType == MoveType::AIR) != p.airBurst) continue;
+        float d = u.pos.dist(p.impactPos);
+        if (d > ring) continue;
+        if (p.expandTotal > 0) {
+            bool seen = false;
+            for (int id : p.splashHits) if (id == u.id) { seen = true; break; }
+            if (seen) continue;
+            p.splashHits.push_back(u.id);
         }
+        damage(u, p.areaDamage * std::min(1.0f, 1.0f - d / p.areaRadius + 0.1f) * damageScale(p, u));
+    }
 }
 
 void Game::damage(Unit& target, float dmg) {
@@ -676,13 +767,13 @@ void Game::damage(Unit& target, float dmg) {
 
 // RWX EffectManager.createExplosionWithVelocity: a big explosion is 7 flames jittered +-20 px,
 // each starting 0..20 ticks later and running at 0.3..0.6 frames/tick.
-void Game::explode(Vec2 at, bool big) {
+void Game::explode(Vec2 at, bool big, float scale) {
     for (int i = 0, n = big ? 7 : 1; i < n; ++i) {
         Effect e;
         if (big) e.pos = at + Vec2{ g_rng.range(-20.0f, 20.0f), g_rng.range(-20.0f, 20.0f) };
         else e.pos = at;
         e.rot = g_rng.range(-3.14159265f, 3.14159265f);
-        e.scale = g_rng.range(0.8f, 1.0f);
+        e.scale = g_rng.range(0.8f, 1.0f) * scale;
         e.frameSpeed = big ? g_rng.range(0.3f, 0.6f) : 0.5f;
         e.delay = big ? g_rng.range(0.0f, 20.0f) : 0.0f;
         effects.push_back(e);

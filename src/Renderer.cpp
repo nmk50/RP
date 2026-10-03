@@ -277,6 +277,7 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     // travel angle + 90 and scaled to cell*drawSize (Projectile.java:1688-1711 + GameViewUtils.java:100).
     // frame : -1 keeps the plain tinted dot instead.
     for (auto& p : g.projectiles) {
+        if (p.hit) continue;   // RWX clears shouldDraw once the shot lands; only its ring keeps growing
         Color tint{ (uint8_t)(p.color >> 24), (uint8_t)((p.color >> 16) & 0xFF),
                     (uint8_t)((p.color >> 8) & 0xFF), (uint8_t)p.color };
         // RWX [projectile_N] lightColor: EffectManager.createLightEffect attaches an additive

@@ -43,9 +43,21 @@ struct ProjectileTpl {
     // (EffectManager.createLightEffect: alpha 0.3, size = texture * lightSize, default 0.5). 0 = off.
     uint32_t lightColor = 0;
     float lightSize = 0.5f;
+    // RWX [projectile_N] flight model (Projectile.update). turnSpeed (template.O, default -1) is
+    // degrees per tick the heading may rotate toward the target; -1 re-aims every tick, 0 flies dead
+    // straight. speed ramps toward targetSpeed by targetSpeedAcceleration per tick.
+    float turnSpeed = -1;
+    float targetSpeed = -1, targetSpeedAccel = 0.1f, speedSpread = 0;
+    // instant: the shot never moves and lands on the firing tick (Projectile.update:841,979)
+    bool instant = false;
+    // wobbleAmplitude (px per tick sideways) / wobbleFrequency (ticks per full sine)
+    float wobbleAmp = 0, wobbleFreq = 5;
+    // areaExpandTime: the splash ring grows from nothing to areaRadius over these ticks and each
+    // unit is caught once (Projectile.b(f2):1443 with the Projectile.ap list)
+    float areaExpandTime = -1;
+    // buildingDamageMultiplier: only scales damage dealt to buildings (Projectile.a:228)
+    float buildingDamageMult = 1;
     bool largeHit = false;
-    bool explodeOnHit = false;
-    bool pushForce = false;
 };
 
 struct BuildOption { std::string unitName; float pos = 1; };
