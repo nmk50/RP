@@ -241,6 +241,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.showShieldBar = g->getBool("showshieldbar", true);
         t.shadowOffX = (float)g->getNum("shadowoffsetx", 0);
         t.shadowOffY = (float)g->getNum("shadowoffsety", 0);
+        // :1583-1584, and the shadow key's default is the body key's value. These two really are
+        // spelled with underscores in the mod ini's, unlike most [graphics] keys.
+        t.lockBodyRot = g->getBool("lock_body_rotation_with_main_turret", false);
+        t.lockShadowRot = g->getBool("lock_shadow_rotation_with_main_turret", t.lockBodyRot);
         t.totalFrames = (int)g->getNum("total_frames", 1);
         if (t.totalFrames < 1) t.totalFrames = 1;
         t.drawLayer = g->get("drawlayer");

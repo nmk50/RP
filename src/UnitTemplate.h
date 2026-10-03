@@ -116,6 +116,12 @@ struct UnitTemplate {
     // RWX [graphics] image_shadow: "AUTO" = the body silhouette in black, offset by shadowOffsetX/Y world px
     std::string imageShadow;
     float shadowOffX = 0, shadowOffY = 0;
+    // [graphics] lock_body_rotation_with_main_turret (:1583) draws the body sprite along the main
+    // turret's aim instead of the heading the unit travels on (CustomUnit.getRenderRotation:2345-2347),
+    // so a bug or mech keeps facing its prey while strafing past it. Only the sprite turns -- the hull's
+    // game rotation still drives movement and turret pivots. lock_shadow_rotation_with_main_turret
+    // (:1584) does the same for the shadow and takes the body's value as its default.
+    bool lockBodyRot = false, lockShadowRot = false;
     std::string sourceDir;   // directory of the ini, for image resolution
 
     float price = 100, maxHp = 100, mass = 1000;

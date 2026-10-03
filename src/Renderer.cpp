@@ -134,6 +134,17 @@ static void drawSpriteFrame(const Texture2D& tex, int frames, int frame, Vector2
 // RWX sprites face up (north); screen angle a (y-down) maps to raylib clockwise rotation a_deg + 90.
 static float spriteRot(float angleRad) { return angleRad * 180.0f / 3.14159265f + 90.0f; }
 
+// RWX CustomUnit.getRenderRotation:2338-2349 takes the turret's rendered angle (movementLevels[main
+// TurretIndex].targetX) in place of the hull's rotation for every unit that sets
+// lock_body_rotation_with_main_turret, and getRenderRotation(true) does the same for the shadow when
+// lock_shadow_rotation_with_main_turret is on. No RP asset uses [attack] setMainTurretAs, so turret 0
+// is the main turret the parser would pick (CustomUnitConfigParser.java:2201-2206).
+static float unitRenderAngle(const Unit& u, bool shadow) {
+    const UnitTemplate& t = *u.tpl;
+    if ((shadow ? t.lockShadowRot : t.lockBodyRot) && !u.tur.empty()) return u.tur[0].angle;
+    return u.facing;
+}
+
 void Renderer::drawMap(Game& g, const Camera2D& cam) {
     float x0, y0, x1, y1; worldViewCull(cam, (float)GetScreenWidth(), (float)GetScreenHeight(), x0, y0, x1, y1);
     int tx0 = std::max(0, (int)(x0 / TILE_SIZE) - 1), ty0 = std::max(0, (int)(y0 / TILE_SIZE) - 1);
@@ -169,7 +180,7 @@ void Renderer::drawUnitShadow(const Unit& u) {
     int frames = std::max(1, t.totalFrames);
     int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
     int anim = ef > 1 ? (int)(GetTime() * 5.0f) % ef : 0;
-    float rot = t.isStatic() ? 0 : spriteRot(u.facing);
+    float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, true));
     drawSpriteFrame(tex, ef, anim, Vector2{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY },
         std::max(6.0f, t.displayRadius) * 2.0f * t.imageScale, rot, Color{ 0, 0, 0, 128 });
 }
@@ -195,7 +206,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
         baseFrameW = tex.width / (float)ef;
         t.texFrameWpx = (int)baseFrameW;
-        float rot = t.isStatic() ? 0 : spriteRot(u.facing);
+        float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, false));
         drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale, rot, col);
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
