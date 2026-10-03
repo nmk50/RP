@@ -263,6 +263,20 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     for (auto& p : g.projectiles) {
         Color tint{ (uint8_t)(p.color >> 24), (uint8_t)((p.color >> 16) & 0xFF),
                     (uint8_t)((p.color >> 8) & 0xFF), (uint8_t)p.color };
+        // RWX [projectile_N] lightColor: EffectManager.createLightEffect attaches an additive
+        // light_50.png glow (alpha 0.3, size = texture * lightSize) that follows the projectile.
+        if (p.lightColor) {
+            Texture2D glow;
+            if (shared("light_50.png", glow)) {
+                float gs = glow.width * p.lightSize;
+                Color gc{ (uint8_t)(p.lightColor >> 24), (uint8_t)((p.lightColor >> 16) & 0xFF),
+                          (uint8_t)((p.lightColor >> 8) & 0xFF), (uint8_t)(0.3f * (p.lightColor & 0xFF)) };
+                BeginBlendMode(BLEND_ADDITIVE);
+                DrawTexturePro(glow, Rectangle{ 0, 0, (float)glow.width, (float)glow.height },
+                               Rectangle{ p.pos.x, p.pos.y, gs, gs }, Vector2{ gs * 0.5f, gs * 0.5f }, 0, gc);
+                EndBlendMode();
+            }
+        }
         const char* sheet = p.drawType == 1 ? "projectiles_large.png"
                           : (p.drawType == 2 ? "projectiles2.png" : "projectiles.png");
         Texture2D tex;

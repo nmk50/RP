@@ -75,6 +75,8 @@ struct Projectile {
     int shadowFrame = -1;
     float drawSize = 1;
     uint32_t color = 0xFFFFFFFF;   // 0xRRGGBBAA sprite tint
+    uint32_t lightColor = 0;       // 0xRRGGBBAA additive glow, 0 = none
+    float lightSize = 0.5f;
     bool explodeOnHit = false;
     bool largeHit = false;
     bool dead = false;

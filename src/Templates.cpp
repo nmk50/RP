@@ -289,6 +289,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.shadowFrame = (int)s.getNum("shadowframe", -1);
             p.drawSize = (float)s.getNum("drawsize", 1);
             p.color = parseRgba(s.get("color", "#FFFFFF"));
+            std::string lc = Trim(s.get("lightcolor", ""));
+            p.lightColor = (lc.empty() || lc == "-1") ? 0u : parseRgba(lc);
+            p.lightSize = (float)s.getNum("lightsize", 0.5);
             p.largeHit = s.getBool("largehiteffect", false);
             std::string exp = ToLower(s.get("explodeeffect", ""));
             p.explodeOnHit = p.areaDamage > 0 || p.areaRadius > 0;

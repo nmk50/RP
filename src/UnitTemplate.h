@@ -39,6 +39,10 @@ struct ProjectileTpl {
     int shadowFrame = -1;
     float drawSize = 1;
     uint32_t color = 0xFFFFFFFF;
+    // RWX [projectile_N] lightColor/lightSize: an additive light_50.png glow follows the projectile
+    // (EffectManager.createLightEffect: alpha 0.3, size = texture * lightSize, default 0.5). 0 = off.
+    uint32_t lightColor = 0;
+    float lightSize = 0.5f;
     bool largeHit = false;
     bool explodeOnHit = false;
     bool pushForce = false;

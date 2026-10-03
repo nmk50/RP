@@ -627,6 +627,7 @@ void Game::fire(Unit& u, Unit& target) {
     p.speed = pt.speed; p.life = pt.life;
     p.frame = pt.frame; p.drawType = pt.drawType; p.shadowFrame = pt.shadowFrame;
     p.drawSize = pt.drawSize; p.color = pt.color;
+    p.lightColor = pt.lightColor; p.lightSize = pt.lightSize;
     p.explodeOnHit = pt.explodeOnHit || pt.areaDamage > 0; p.largeHit = pt.largeHit;
     p.vel = (target.pos - p.pos).norm() * p.speed;
     projectiles.push_back(p);
