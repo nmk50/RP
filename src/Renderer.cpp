@@ -179,10 +179,10 @@ void Renderer::drawUnitShadow(const Unit& u) {
     if (!loaded(t, 0, tex)) return;
     int frames = std::max(1, t.totalFrames);
     int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
-    int anim = ef > 1 ? (int)(GetTime() * 5.0f) % ef : 0;
+    int anim = ef > 1 ? u.animFrame % ef : 0;
     float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, true));
     drawSpriteFrame(tex, ef, anim, Vector2{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY },
-        std::max(6.0f, t.displayRadius) * 2.0f * t.imageScale, rot, Color{ 0, 0, 0, 128 });
+        std::max(6.0f, t.displayRadius) * 2.0f * t.imageScale * u.animScale, rot, Color{ 0, 0, 0, 128 });
 }
 
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
@@ -196,8 +196,11 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         col = Color{ 140, 255, 140, (uint8_t)(40 + 200 * std::max(0.0f, std::min(1.0f, u.buildProgress))) };
     if (t.isStatic()) col = Fade(col, 1.0f);
 
+    // The hull pose the animation controller wrote this tick (CustomUnit.animationFrameIndex /
+    // .currentFrameTime, CustomUnitAnimationController.b():276-279). With no animation running these are
+    // back at [graphics] default_frame and scale 1.
     int frames = std::max(1, t.totalFrames);
-    int anim = frames > 1 ? (int)(GetTime() * 5.0f) % frames : 0;
+    int anim = std::max(0, u.animFrame);
 
     Texture2D tex;
     // RWX draws the hull at posY - posZ (CustomUnit.java:2416), while its shadow stays flat on the
@@ -218,7 +221,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         baseFrameW = tex.width / (float)ef;
         t.texFrameWpx = (int)baseFrameW;
         float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, false));
-        drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale, rot, col);
+        drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale * u.animScale, rot, col);
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
     }

@@ -217,6 +217,7 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.shieldMax = (float)tpl->maxShield;
     u.shield = tpl->startShieldAtZero ? 0.0f : u.shieldMax;
     u.footprint[0] = tpl->footL; u.footprint[1] = tpl->footU; u.footprint[2] = tpl->footR; u.footprint[3] = tpl->footD;
+    u.animFrame = tpl->defaultFrame;      // CustomUnit.setUnitType:1060
     // RWX BaseBuilding.java:108: a building's body angle is -90 deg, so its turret idles along the
     // unrotated sprite (north) plus [turret] idleDir.
     if (tpl->isStatic()) u.facing = -1.5708f;
@@ -343,7 +344,14 @@ bool Game::orderRepair(std::vector<int> ids, int targetId) {
 }
 
 void Game::orderStop(std::vector<int> ids) {
-    for (int id : ids) { Unit* u = get(id); if (!u) continue; u->path.clear(); u->pathIdx = 0; u->orderTargetId = -1; u->attackMove = false; u->nanoTargetId = -1; }
+    // OrderableUnit.clearAllWaypoints:3790-3800 drops the waypoints and calls clearPathData, which
+    // zeroes activePathCount and pathRetryTimer -- RWX keeps no remembered goal to walk back to, so a
+    // stopped hull must not re-path once its blockage timer runs out.
+    for (int id : ids) {
+        Unit* u = get(id); if (!u) continue;
+        u->path.clear(); u->pathIdx = 0; u->hasGoal = false; u->repathTimer = 0;
+        u->orderTargetId = -1; u->attackMove = false; u->nanoTargetId = -1;
+    }
 }
 
 bool Game::buildingSpotFree(Vec2 center, const UnitTemplate& t) const {
@@ -599,6 +607,67 @@ static void updateHeight(Unit& u, const UnitTemplate& tpl) {
     u.posZ = moveTowards(u.posZ, want, std::min(raw, limit));
 }
 
+// CustomUnitAnimationController.a(config, priority, loop):61-99. Every tick the unit asks for moving at
+// priority 3 or idle at 2 (CustomUnit.update:1893-1897) and a barrel that fires asks for the recoil at
+// 11 with loop set (:1335), so a higher slot takes the clock from a lower one, and a looping animation
+// keeps running on its own instead of being dropped the tick it stops being re-requested.
+static void requestAnimation(Unit& u, const BodyAnim* cfg, int prio, bool loop) {
+    if (!cfg || !cfg->valid()) return;                      // :62 an AnimationConfig with no keys is inert
+    if ((u.animRequested || (u.animLoop && u.animPlaying)) && prio <= u.animPrio &&
+        (!loop || cfg != u.animCur)) return;                // :65-67
+    u.animRequested = true;                                 // :70, cleared again by the clock step
+    if (cfg != u.animCur || loop) {                         // :72 only a real change restarts it
+        u.animCur = cfg;
+        u.animPrio = prio;
+        u.animLoop = loop;                                  // :81 forceLoop
+        u.animTime = -1.0f;                                 // :88 the first step pulls it back to 0
+        u.animSpeed = 1.0f;                                 // :90
+    }
+    u.animPlaying = true;
+}
+
+// :106-126 b() -- the animation ended, so the hull takes back the pose it had before it started
+// (:255-263 uses default_frame and scale 1 as the base values). RWX would first fade out of the old
+// pose over blendIn/blendOut (fadeMultiplier, :160-165); no shipped asset puts either on a body
+// animation, so the swap here is immediate.
+static void stopAnimation(Unit& u) {
+    u.animPlaying = false;
+    u.animCur = nullptr;
+    u.animPrio = -1;
+    u.animLoop = false;
+    u.animScale = 1.0f;
+    u.animFrame = u.tpl ? u.tpl->defaultFrame : 0;
+}
+
+// CustomUnitAnimationController.a(f):132-195. RWX steps it once per logic tick with f = 1 (the same
+// delta the whole game update runs on, GameLogic.java:1495-1523), from the tail of the unit update
+// (CustomUnit.java:2207).
+static void stepAnimation(Unit& u, float f) {
+    if (!u.animPlaying) return;
+    if (u.animTime < 0.0f) u.animTime = 0.0f;
+    u.animTime += u.animSpeed * f;                          // :137-143
+    // :145-148 a strip animation the unit did not ask for again this tick is over
+    if (!u.animLoop && !u.animRequested) { stopAnimation(u); return; }
+    u.animRequested = false;
+    const BodyAnim* cfg = u.animCur;
+    if (!cfg) return;
+    if (!cfg->pingPong) {                                   // :169-184
+        if (u.animTime > cfg->maxTime) {
+            if (u.animLoop) { stopAnimation(u); return; }    // :173-176, the recoil plays out and stops
+            u.animTime = 0.0f; u.animSpeed = 1.0f;           // :179-180, loop the strip
+        }
+    } else {                                                // :185-193
+        if (u.animTime > cfg->maxTime) { u.animTime = cfg->maxTime; u.animSpeed = -1.0f; }
+        else if (u.animTime < 0.0f) {
+            u.animTime = 0.0f; u.animSpeed = 1.0f;
+            if (u.animLoop) { stopAnimation(u); return; }
+        }
+    }
+    // :241-279, only the key lists the animation actually has write into the unit
+    if (!cfg->frame.empty()) u.animFrame = (int)cfg->frameAt(u.animTime);
+    if (!cfg->scale.empty()) u.animScale = cfg->scaleAt(u.animTime);
+}
+
 void Game::updateUnit(Unit& u) {
     if (!u.tpl) return;
     // A corpse that died above the ground does not update as a unit any more -- no height, no shield, no
@@ -607,6 +676,7 @@ void Game::updateUnit(Unit& u) {
     if (u.dead) { if (u.deathFalling) updateDeathFall(u); return; }
     const UnitTemplate& tpl = *u.tpl;
     u.moved = false;
+    u.driven = false;
     updateHeight(u, tpl);
     if (u.underConstruction && u.buildProgress >= 1.0f) u.underConstruction = false;
     if (tpl.creditIncomeRate > 0 && u.operational() && tick % 10 == 0)
@@ -724,6 +794,9 @@ void Game::updateUnit(Unit& u) {
                     if (wasStatic) markBuildingOcc(map, u, -1);
                     u.tpl = nt;
                     u.tplKey = ToLower(nt->name);
+                    // CustomUnit.setUnitType:1057-1061 re-applies the config's default frame when the hull
+                    // changes template, so an upgrade drops the animation it was mid-way through.
+                    stopAnimation(u);
                     u.maxHp = nt->maxHp;
                     u.hp = nt->maxHp * frac;
                     // the same proportionality RWX updateStats uses for the bubble (:1079-1083): a unit
@@ -879,6 +952,9 @@ void Game::updateUnit(Unit& u) {
         // OrderableUnit.java:873, 920 -- a unit only takes part in the collision pass when it had
         // throttle or carried velocity; whether the step above actually moved it is not asked.
         u.moved = u.throttle != 0.0f || u.vel.len() > 1e-6f;
+        // :2841-2850 stateFlag2 is raised by the order, not by the momentum: a path node still to be
+        // reached, or else a live attack target this unit is holding position against.
+        u.driven = pathing || (u.orderTargetId >= 0 && tgt && !tgt->dead);
         if (pathing) {
             float arrive = lastNode ? 6.0f : 16.0f; // RW: distSq<256 mid, <16 final, cmd radius 7
             if (dist <= std::max(arrive, tpl.moveSpeed)) {
@@ -910,6 +986,14 @@ void Game::updateUnit(Unit& u) {
         Vec2 away = (u.pos - tgt->pos).norm();
         computePath(*this, u, tgt->pos + away * stop);
     }
+
+    // CustomUnit.update:1893-1897 chooses the hull animation from isMoving, and :2207 then steps its
+    // clock. An idle request is only made when nothing is playing or the idle strip itself is, so the
+    // attack recoil the turret pass asked for gets to finish.
+    if (u.driven) requestAnimation(u, tpl.animMoving.valid() ? &tpl.animMoving : nullptr, 3, false);
+    else if (!u.animPlaying || u.animCur == &tpl.animIdle)
+        requestAnimation(u, tpl.animIdle.valid() ? &tpl.animIdle : nullptr, 2, false);
+    stepAnimation(u, 1.0f);
 }
 
 // RWX turret pivot: [turret_N] x/y are sprite-space offsets (sprite faces up, y down);
@@ -1114,6 +1198,9 @@ void Game::fire(Unit& u, Unit& target, int ti) {
     if (ti < 0 || ti >= (int)tpl.turrets.size()) return;
     const TurretTpl& tur = tpl.turrets[ti];
     TurretState& s = u.tur[ti];
+    // CustomUnit.a(TurretConfig):1335 asks for the attack animation with loop=true at priority 11, so a
+    // firing unit shows the recoil strip instead of its moving cycle, and the shot restarts it.
+    requestAnimation(u, tpl.animAttack.valid() ? &tpl.animAttack : nullptr, 11, true);
     int pi = (tur.projectile >= 0 && tur.projectile < (int)tpl.projectiles.size()) ? tur.projectile : -1;
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
     if (pi < 0) pt.directDamage = 10;   // RWX's stand-in [projectile_1] for a unit with none at all

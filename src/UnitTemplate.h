@@ -116,6 +116,40 @@ struct ProjectileTpl {
 
 struct BuildOption { std::string unitName; float pos = 1; };
 
+// One keyframe of a body animation. `t` is in ticks: a key written "0.8s" is 48 (the trailing 's' is
+// worth 60, IniFile.parseUnitValue:761-783), and the animation clock steps by 1 per logic tick because
+// GameLogic.update passes f = deltaSpeed * speedMultiplier, i.e. one tick at normal speed
+// (GameLogic.java:1495-1523, where gameTimeMillis grows by f * 16.666666).
+struct AnimKey { float t = 0, v = 0; };
+
+// RWX AnimationConfig (units/custom/AnimationConfig.java) cut down to the two key lists that move the
+// hull sprite: the frame index (CustomUnit.animationFrameIndex) and a scale that multiplies
+// [graphics] imageScale (CustomUnit.getDrawScale:2328 `imageScale * currentFrameTime`). Both ini forms
+// compile to this: the old-style [graphics] animation_moving_* keys build the lists straight from
+// start/end/speed/scale_start/scale_end (AnimationConfig.java:103-146) and a [animation_*] section
+// spells them out as body_0.8s : {frame:3} keyframes instead (AnimationConfig.a():211-248).
+struct BodyAnim {
+    std::vector<AnimKey> frame, scale;   // CustomUnitAnimationSet.e, sorted by time
+    float maxTime = 0;                   // AnimationConfig.n, the loop length in ticks
+    bool pingPong = false;               // AnimationConfig.g
+
+    bool valid() const { return !frame.empty() || !scale.empty(); }
+    // CustomUnitAnimationSet.b(time):116-135 -- hold the first and last key, linear in between
+    static float valueAt(const std::vector<AnimKey>& k, float t) {
+        if (k.empty()) return 0.0f;
+        if (t <= k.front().t) return k.front().v;
+        if (t >= k.back().t) return k.back().v;
+        for (size_t i = 1; i < k.size(); ++i) {
+            if (t > k[i].t) continue;
+            const AnimKey& a = k[i - 1]; const AnimKey& b = k[i];
+            return a.v + (b.v - a.v) * (t - a.t) / (b.t - a.t);
+        }
+        return k.back().v;
+    }
+    float frameAt(float t) const { return valueAt(frame, t); }
+    float scaleAt(float t) const { return scale.empty() ? 1.0f : valueAt(scale, t); }
+};
+
 // [action_upgradeT2] / action_N_* self-actions, e.g. unit upgrades (RWX displayType:upgrade)
 struct UnitAction {
     std::string convertTo;
@@ -176,6 +210,13 @@ struct UnitTemplate {
 
     float imageScale = 1, turretImageScale = 1;
     int totalFrames = 1;
+    // [graphics] default_frame (CustomUnitConfigParser.java:1311) is the frame the hull reverts to
+    // whenever no frame animation is playing -- CustomUnitAnimationController.b(true):262 uses it as the
+    // reset value, so a tank that stops dead does not freeze on whatever tread frame it last showed.
+    int defaultFrame = 0;
+    // The three animations the update loop picks between (CustomUnit.java:1893-1897 for moving/idle,
+    // :1335 for the shot recoil), plus any [animation_*] section whose onActions names the same slot.
+    BodyAnim animMoving, animIdle, animAttack;
     std::string drawLayer;
 
     bool canAttack = false;

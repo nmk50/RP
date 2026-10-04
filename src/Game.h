@@ -57,7 +57,15 @@ struct Unit {
     Vec2 rallyPoint; bool hasRally = false;
     bool selected = false;
     bool dead = false;
-    float animFrame = 0;
+    // RWX CustomUnitAnimationController state for the hull sprite. `animCur` is currentAnimation,
+    // animPrio its animationId and animLoop forceLoop; animTime is currentTime, which starts at -1 and
+    // is stepped by animSpeed * ticks (:132-146). animFrame / animScale are the two values the key
+    // lists write back into the unit -- animationFrameIndex and currentFrameTime (:276-279).
+    const BodyAnim* animCur = nullptr;
+    float animTime = 0, animSpeed = 1, animScale = 1;
+    int animFrame = 0;
+    int animPrio = -1;
+    bool animPlaying = false, animLoop = false, animRequested = false;
     int footprint[4] = { 0,0,0,0 };
     // self upgrade action (RWX [action_upgrade*])
     int upgradeIdx = -1;
@@ -89,6 +97,11 @@ struct Unit {
     // OrderableUnit.java:873, 920 -- set when the unit had throttle, velocity or a buffered push this
     // tick. A unit that never moves is not asked to resolve collisions at all.
     bool moved = false;
+    // OrderableUnit.java:3019 -- isMoving is unitStateTracker.stateFlag2, which the movement update
+    // raises only while a waypoint/path node is being followed, or a live attack target is being
+    // walked to (:2841-2850). It is order state, not momentum: a hull still coasting on its sliding
+    // velocity is already idle. CustomUnit.I():598-602 keeps buildings out of it altogether.
+    bool driven = false;
     // RWX GameObject.posZ (:43, :89) -- height above the ground in px, and the phase of the AIR sine
     // bob, which RWX keeps in frameAnimationTimer (:1996-2000, +2 deg per tick, wrapping at 360).
     // Everything below 4 px still counts as ground for collisions, targeting and splashes

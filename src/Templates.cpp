@@ -117,6 +117,72 @@ static float perTickRate(const IniSection& s, const std::string& key, float def)
     return (float)atof(v.c_str());
 }
 
+// A keyframe time written into the key itself, as the new-style animation sections do
+// (`body_0.8s : {frame:3}`). IniFile.parseUnitValue:761-783 charges a trailing 's' 60 ticks and has no
+// other unit -- "ms" fails to parse there, so it fails here too. -1 marks a key that is not a time.
+static float keyTicks(const std::string& raw) {
+    std::string v = ToLower(Trim(raw));
+    float mult = 1.0f;
+    if (!v.empty() && v.back() == 's') { v.pop_back(); mult = TICK_RATE; }
+    try { return std::stof(v) * mult; } catch (...) { return -1.0f; }
+}
+
+// AnimationConfig.a(config, iniFile, section, prefix):103-146 plus its keyframe branch :211-248,
+// compiled for the hull only. The [graphics] form passes prefix "animation_moving_" and drives
+// everything off start/end/speed/scale_start/scale_end; a [animation_*] section passes an empty prefix
+// and lists `body_<time> : {frame:n}` keyframes instead. `speed` is ticks *per frame*, which is why its
+// default is 40 (two thirds of a second) -- tank.ini and the bug mods name it explicitly.
+static void parseBodyAnim(const IniSection& s, const std::string& prefix, BodyAnim& out) {
+    out = BodyAnim{};
+    int start = (int)s.getNum(prefix + "start", 0);            // :104, default frame 0
+    int end = (int)s.getNum(prefix + "end", -1);               // :105, -1 = no frame strip
+    float speed = (float)s.getNum(prefix + "speed", 40);       // :117, 40 ticks per frame
+    float kts = (float)s.getNum(prefix + "keyframetimescale", 1);   // :134
+    out.pingPong = s.getBool(prefix + "pingpong", false);      // :125
+    float span = speed;                                        // :132 f2
+    if (end != -1 && end >= start) {
+        span = speed * (float)(end - start + 1);               // :139 the strip's whole length
+        out.frame.push_back({ 0, (float)start });              // :140
+        out.frame.push_back({ span * kts, (float)end + 0.99f });  // :141, +0.99 so the last frame shows
+    }
+    float ds = (float)s.getNum(prefix + "scale_start", 1);     // :118
+    float de = (float)s.getNum(prefix + "scale_end", 1);       // :119
+    if (ds != 1.0f || de != 1.0f) {
+        out.scale.push_back({ 0, ds });                        // :144
+        out.scale.push_back({ span * kts, de });               // :145
+    }
+    // New-style keyframe keys. RWX also reads leg*/arm*/turret*/effect* here; those drive a limb rig
+    // and spawn events, neither of which RP has, so only body_* is taken.
+    const std::string bodyKey = prefix + "body_";
+    for (auto& kv : s.kv) {
+        std::string k = ToLower(kv.first);
+        if (k.rfind(bodyKey, 0) != 0) continue;
+        float t = keyTicks(k.substr(bodyKey.size()));
+        if (t < 0.0f) continue;
+        std::string val = Trim(kv.second);
+        if (val.size() < 2 || val.front() != '{' || val.back() != '}') continue;   // :228 wants {a:b,..}
+        for (auto& part : splitNames(val.substr(1, val.size() - 2))) {
+            size_t c = part.find(':');
+            if (c == std::string::npos) continue;
+            std::string what = ToLower(Trim(part.substr(0, c)));
+            float v = (float)std::atof(Trim(part.substr(c + 1)).c_str());
+            if (what == "frame") out.frame.push_back({ t, v });
+            else if (what == "scale") out.scale.push_back({ t, v });
+        }
+    }
+    if (out.frame.empty() && out.scale.empty()) return;
+    auto sortKeys = [](std::vector<AnimKey>& v) {
+        std::sort(v.begin(), v.end(), [](const AnimKey& a, const AnimKey& b) { return a.t < b.t; });
+    };
+    sortKeys(out.frame); sortKeys(out.scale);
+    // AnimationConfig.n (:146 then the maxTime bump at :158) ends up as the last keyframe time either
+    // list holds, which for the old-style form is exactly the span.
+    float n = 0;
+    if (!out.frame.empty()) n = std::max(n, out.frame.back().t);
+    if (!out.scale.empty()) n = std::max(n, out.scale.back().t);
+    out.maxTime = n;
+}
+
 // RWX [section] @copyFromSection : A, B — fill a section from the named template sections, keys it
 // already has winning; each template is itself expanded, 10 levels at most
 // (CustomUnitConfigParser.readAllCustomUnitConfigs:379-404).
@@ -252,7 +318,27 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.lockShadowRot = g->getBool("lock_shadow_rotation_with_main_turret", t.lockBodyRot);
         t.totalFrames = (int)g->getNum("total_frames", 1);
         if (t.totalFrames < 1) t.totalFrames = 1;
+        t.defaultFrame = (int)g->getNum("default_frame", 0);
+        // CustomUnitConfigParser.java:1658-1660 hands each of the three slots its own key prefix.
+        parseBodyAnim(*g, "animation_moving_", t.animMoving);
+        parseBodyAnim(*g, "animation_idle_", t.animIdle);
+        parseBodyAnim(*g, "animation_attack_", t.animAttack);
         t.drawLayer = g->get("drawlayer");
+    }
+    // :1661-1668 a [animation_*] section is a standalone AnimationConfig, and the one whose onActions
+    // names move/idle/attack *replaces* the [graphics] form for that slot (resolveAnimationForAction,
+    // CustomUnitConfig.java:1032-1041 -- defining both is a config error, so taking the section here is
+    // all RWX allows). Sections with any other onActions (dive, build, dance, fireNuke) are only reached
+    // by trigger actions, which RP does not run.
+    for (IniSection* s : ini.startingWith("animation_")) {
+        BodyAnim b;
+        parseBodyAnim(*s, "", b);
+        if (!b.valid()) continue;
+        std::string acts;
+        for (auto& n : splitNames(ToLower(s->get("onactions", "")))) acts += n + ",";
+        if (acts.find("idle,") != std::string::npos) t.animIdle = b;
+        else if (acts.find("move,") != std::string::npos) t.animMoving = b;
+        else if (acts.find("attack,") != std::string::npos) t.animAttack = b;
     }
     if (const IniSection* a = ini.find("attack")) {
         t.canAttack = a->getBool("canattack", false);
