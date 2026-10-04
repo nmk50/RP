@@ -217,6 +217,10 @@ struct UnitTemplate {
     // The three animations the update loop picks between (CustomUnit.java:1893-1897 for moving/idle,
     // :1335 for the shot recoil), plus any [animation_*] section whose onActions names the same slot.
     BodyAnim animMoving, animIdle, animAttack;
+    // [animation_build] onActions: underConstructionWithLinkedBuiltTime -- CustomUnit.java:1791-1795
+    // pins the clock to buildProgress instead of ticks, so a foundation pops from scale 0 to 1.2 as it
+    // is paid for. `animUnderConstruction` is the :1788-1790 variant, driven by ticks at priority 8.
+    BodyAnim animBuild, animUnderConstruction;
     std::string drawLayer;
 
     bool canAttack = false;

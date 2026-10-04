@@ -325,11 +325,12 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         parseBodyAnim(*g, "animation_attack_", t.animAttack);
         t.drawLayer = g->get("drawlayer");
     }
-    // :1661-1668 a [animation_*] section is a standalone AnimationConfig, and the one whose onActions
+    // :1661-1672 a [animation_*] section is a standalone AnimationConfig, and the one whose onActions
     // names move/idle/attack *replaces* the [graphics] form for that slot (resolveAnimationForAction,
     // CustomUnitConfig.java:1032-1041 -- defining both is a config error, so taking the section here is
-    // all RWX allows). Sections with any other onActions (dive, build, dance, fireNuke) are only reached
-    // by trigger actions, which RP does not run.
+    // all RWX allows). The two construction actions are the only other ones the engine itself raises
+    // (CustomUnit.java:1788-1795); sections named for anything else (dive, dance, fireNuke) are only
+    // reached by trigger actions, which RP does not run.
     for (IniSection* s : ini.startingWith("animation_")) {
         BodyAnim b;
         parseBodyAnim(*s, "", b);
@@ -339,6 +340,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         if (acts.find("idle,") != std::string::npos) t.animIdle = b;
         else if (acts.find("move,") != std::string::npos) t.animMoving = b;
         else if (acts.find("attack,") != std::string::npos) t.animAttack = b;
+        else if (acts.find("underconstructionwithlinkedbuilttime,") != std::string::npos) t.animBuild = b;
+        else if (acts.find("underconstruction,") != std::string::npos) t.animUnderConstruction = b;
     }
     if (const IniSection* a = ini.find("attack")) {
         t.canAttack = a->getBool("canattack", false);

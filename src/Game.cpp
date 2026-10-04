@@ -987,12 +987,25 @@ void Game::updateUnit(Unit& u) {
         computePath(*this, u, tgt->pos + away * stop);
     }
 
-    // CustomUnit.update:1893-1897 chooses the hull animation from isMoving, and :2207 then steps its
-    // clock. An idle request is only made when nothing is playing or the idle strip itself is, so the
-    // attack recoil the turret pass asked for gets to finish.
-    if (u.driven) requestAnimation(u, tpl.animMoving.valid() ? &tpl.animMoving : nullptr, 3, false);
-    else if (!u.animPlaying || u.animCur == &tpl.animIdle)
+    // CustomUnit.update:1788-1795 runs the construction animation instead of the normal pick, and the
+    // linked variant is not clocked by ticks at all: currentTime is pinned to buildProgress with
+    // speedMultiplier 0, so [animation_build]'s body_0 {scale:0} .. body_1 {scale:1.2} is one long
+    // frame the foundation grows through as it is paid for. With neither section the update requests
+    // nothing at all, and an unfinished building holds its default frame. Otherwise :1893-1897 lets
+    // isMoving pick the tread strip, and the idle strip is only requested when nothing else owns the
+    // clock, so the priority-11 shot recoil of :1335 gets to finish.
+    if (u.underConstruction && u.buildProgress < 1.0f) {
+        if (tpl.animBuild.valid()) {
+            requestAnimation(u, &tpl.animBuild, 99, false);
+            u.animTime = u.buildProgress;
+            u.animSpeed = 0.0f;
+        } else if (tpl.animUnderConstruction.valid())
+            requestAnimation(u, &tpl.animUnderConstruction, 8, false);
+    } else if (u.driven) {
+        requestAnimation(u, tpl.animMoving.valid() ? &tpl.animMoving : nullptr, 3, false);
+    } else if (!u.animPlaying || u.animCur == &tpl.animIdle) {
         requestAnimation(u, tpl.animIdle.valid() ? &tpl.animIdle : nullptr, 2, false);
+    }
     stepAnimation(u, 1.0f);
 }
 
