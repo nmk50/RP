@@ -1,5 +1,6 @@
 #include "Renderer.h"
 #include "TileMap.h"
+#include "Debug.h"
 #include <raylib.h>
 #include <cmath>
 
@@ -20,37 +21,57 @@ static Color terrainColor(int c) {
     }
 }
 
-static Color teamPal[8] = {
-    { 90, 140, 240, 255 },   // blue (player)
-    { 220, 70, 70, 255 },    // red
-    { 80, 190, 90, 255 },    // green
-    { 230, 200, 70, 255 },   // yellow
-    { 200, 100, 220, 255 },  // purple
-    { 240, 150, 60, 255 },   // orange
-    { 70, 200, 210, 255 },   // cyan
-    { 220, 120, 130, 255 },  // pink
-};
-Color Renderer::teamColor(int t) { return teamPal[((t % 8) + 8) % 8]; }
+// RWX PlayerTeam.i(int):1383-1391 hands out the ten colours of TeamColoring.h, addressed by the team's
+// colour index -- which is why the green team is the one that sees the art exactly as drawn.
+Color Renderer::teamColor(int t) {
+    uint32_t a = kTeamColors[teamColorIndex(t)];
+    return Color{ (uint8_t)((a >> 16) & 0xFF), (uint8_t)((a >> 8) & 0xFF), (uint8_t)(a & 0xFF),
+                  (uint8_t)((a >> 24) & 0xFF) };
+}
 
-static std::string resolveImage(const UnitTemplate& t) {
+static std::string resolveImage(const UnitTemplate& t, bool& shadow) {
+    shadow = false;
     if (t.image.empty() || t.image == "NONE" || t.image == "AUTO") return "";
     std::string nm = t.image;
-    auto strip = [&](const std::string& pfx) -> std::string {
-        if (nm.rfind(pfx, 0) == 0) return nm.substr(pfx.size()); return nm;
+    auto strip = [&](const std::string& pfx) {
+        if (nm.rfind(pfx, 0) != 0) return false;
+        nm = nm.substr(pfx.size());
+        return true;
     };
-    std::vector<std::string> cands = {
-        strip("SHARED:"),
-    };
-    std::string sh = strip("SHARED:");
+    shadow = strip("SHADOW:");
+    bool shared = strip("SHARED:");
+    bool core = strip("CORE:");
+    shadow = strip("SHADOW:") || shadow;
+    if (core) {
+        std::string path = g_assetsRoot + "/units/" + nm;
+        return FileExists(path.c_str()) ? path : "";
+    }
+    std::string raw = shared ? "SHARED:" + nm : nm;
     std::string paths[] = {
-        t.sourceDir + "/" + nm,
-        g_assetsRoot + "/drawable/" + sh,
+        t.sourceDir + "/" + raw,
         g_assetsRoot + "/drawable/" + nm,
-        g_assetsRoot + "/units/shared/" + sh,
-        t.sourceDir + "/" + sh,
+        g_assetsRoot + "/drawable/" + raw,
+        g_assetsRoot + "/units/shared/" + nm,
+        t.sourceDir + "/" + nm,
     };
     for (auto& p : paths) if (FileExists(p.c_str())) return p;
     return "";
+}
+
+static void blackenImage(Image& im) {
+    ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    Color* px = (Color*)im.data;
+    for (int i = 0; i < im.width * im.height; ++i) px[i].r = px[i].g = px[i].b = 0;
+}
+
+static Texture2D loadResolvedTexture(const std::string& path, bool shadow) {
+    if (!shadow) return LoadTexture(path.c_str());
+    Image im = LoadImage(path.c_str());
+    if (!im.data || im.width <= 0 || im.height <= 0) { UnloadImage(im); return {}; }
+    blackenImage(im);
+    Texture2D tex = LoadTextureFromImage(im);
+    UnloadImage(im);
+    return tex;
 }
 
 void Renderer::init() {
@@ -59,8 +80,10 @@ void Renderer::init() {
     UnloadImage(im);
 }
 void Renderer::close() {
-    for (auto& kv : cache_) UnloadTexture(kv.second);
+    for (auto& kv : cache_) if (kv.second.id != missing_.id) UnloadTexture(kv.second);
     cache_.clear();
+    for (auto& kv : teamCache_) if (kv.second.id != missing_.id) UnloadTexture(kv.second);
+    teamCache_.clear();
     UnloadTexture(missing_);
 }
 
@@ -76,9 +99,10 @@ bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     // resolve
     UnitTemplate tmp = t;
     if (which == 2) { tmp.image = t.imageWreak; }
-    std::string path = resolveImage(tmp);
-    Texture2D tex = missing_;
-    if (!path.empty()) { tex = LoadTexture(path.c_str()); }
+    bool shadow;
+    std::string path = resolveImage(tmp, shadow);
+    Texture2D tex = path.empty() ? missing_ : loadResolvedTexture(path, shadow);
+    if (tex.id == 0) tex = missing_;
     cache_[key] = tex;
     out = tex;
     return tex.id != missing_.id;
@@ -93,12 +117,49 @@ bool Renderer::byName(const UnitTemplate& t, const std::string& nm, Texture2D& o
     if (it != cache_.end()) { out = it->second; return it->second.id != missing_.id; }
     UnitTemplate tmp = t;
     tmp.image = nm;
-    std::string path = resolveImage(tmp);
-    Texture2D tex = missing_;
-    if (!path.empty()) { tex = LoadTexture(path.c_str()); }
+    bool shadow;
+    std::string path = resolveImage(tmp, shadow);
+    Texture2D tex = path.empty() ? missing_ : loadResolvedTexture(path, shadow);
+    if (tex.id == 0) tex = missing_;
     cache_[key] = tex;
     out = tex;
     return tex.id != missing_.id;
+}
+
+// RWX PlayerTeam.getTeamColorTextures(texture, mode, lazy):1414-1419 -> b():1445-1507: ten variants of one
+// image, dyed per pixel by TeamColoring, with slot 0 left as the source texture itself (:1503) and a
+// disabled mode giving ten raw copies (:1447). RP bakes the same pixels on demand.
+bool Renderer::teamed(const UnitTemplate& t, const std::string& nm, int which, int colorIdx, Texture2D& out) {
+    if (nm.empty() || nm == "NONE" || nm == "AUTO") return false;
+    if (colorIdx <= 0 || colorIdx >= 10 || t.teamColoringMode == kTCModeDisabled)
+        return which == 0 ? loaded(t, 0, out) : byName(t, nm, out);
+    std::string key = nm + "|" + t.sourceDir + "|" + std::to_string(which)
+                    + "|c" + std::to_string(colorIdx) + "|m" + std::to_string(t.teamColoringMode);
+    auto it = teamCache_.find(key);
+    if (it != teamCache_.end()) { out = it->second; return true; }
+    UnitTemplate tmp = t;
+    tmp.image = nm;
+    bool shadow;
+    std::string path = resolveImage(tmp, shadow);
+    if (path.empty()) return false;
+    Image im = LoadImage(path.c_str());
+    if (!im.data || im.width <= 0 || im.height <= 0) { UnloadImage(im); return false; }
+    if (shadow) blackenImage(im);
+    else ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    Color* px = (Color*)im.data;
+    uint32_t dye = kTeamColors[colorIdx];
+    for (int i = 0; i < im.width * im.height; ++i) {
+        uint32_t argb = (uint32_t(px[i].a) << 24) | (uint32_t(px[i].r) << 16)
+                      | (uint32_t(px[i].g) << 8) | uint32_t(px[i].b);
+        argb = teamColourArgb(argb, t.teamColoringMode, dye);
+        px[i].a = (uint8_t)((argb >> 24) & 0xFF); px[i].r = (uint8_t)((argb >> 16) & 0xFF);
+        px[i].g = (uint8_t)((argb >> 8) & 0xFF);  px[i].b = (uint8_t)(argb & 0xFF);
+    }
+    Texture2D tex = LoadTextureFromImage(im);
+    UnloadImage(im);
+    teamCache_[key] = tex;
+    out = tex;
+    return true;
 }
 
 bool Renderer::shared(const std::string& file, Texture2D& out) {
@@ -145,6 +206,18 @@ static float unitRenderAngle(const Unit& u, bool shadow) {
     return u.facing;
 }
 
+static int submergedRenderAlpha(float z) {
+    if (z < -0.3f) return std::max(45, (int)(((1.0f - ((-z) / 10.0f)) * 130.0f) + 45.0f));
+    return 255;
+}
+
+static Color unitRenderPaint(const Unit& u) {
+    Color col{ 255, 255, 255, (uint8_t)submergedRenderAlpha(u.posZ) };
+    if (u.underConstruction && u.buildProgress < 1.0f)
+        col = Color{ 140, 255, 140, (uint8_t)(20.0f + 220.0f * std::max(0.0f, u.buildProgress)) };
+    return col;
+}
+
 void Renderer::drawMap(Game& g, const Camera2D& cam) {
     float x0, y0, x1, y1; worldViewCull(cam, (float)GetScreenWidth(), (float)GetScreenHeight(), x0, y0, x1, y1);
     int tx0 = std::max(0, (int)(x0 / TILE_SIZE) - 1), ty0 = std::max(0, (int)(y0 / TILE_SIZE) - 1);
@@ -181,20 +254,19 @@ void Renderer::drawUnitShadow(const Unit& u) {
     int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
     int anim = ef > 1 ? u.animFrame % ef : 0;
     float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, true));
+    // RWX OrderableUnit.drawShadow:4425-4438 builds the same es/et frame rect the hull uses and scales
+    // it by getRenderScale(), so the shadow is the body frame at its native pixel size.
     drawSpriteFrame(tex, ef, anim, Vector2{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY },
-        std::max(6.0f, t.displayRadius) * 2.0f * t.imageScale * u.animScale, rot, Color{ 0, 0, 0, 128 });
+        (tex.width / (float)ef) * t.imageScale * u.animScale, rot, Color{ 0, 0, 0, 128 });
 }
 
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
     float r = std::max(6.0f, t.displayRadius);
-    float scale = (r * 2.0f);
     Color col = WHITE;
-    // RW BaseBuilding.java:301 unfinished buildings tint green with alpha ramp 40->240
     if (u.underConstruction && u.tpl->isBuilding)
         col = Color{ 140, 255, 140, (uint8_t)(40 + 200 * std::max(0.0f, std::min(1.0f, u.buildProgress))) };
-    if (t.isStatic()) col = Fade(col, 1.0f);
 
     // The hull pose the animation controller wrote this tick (CustomUnit.animationFrameIndex /
     // .currentFrameTime, CustomUnitAnimationController.b():276-279). With no animation running these are
@@ -211,17 +283,25 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // and health bar all gone from the frame it died (:2414-2424 draws a wreck as the bare texture).
     Texture2D wt;
     if (u.dead && u.corpseWreck && loaded(t, 2, wt)) {
-        drawSpriteFrame(wt, 1, 0, pv, scale * t.imageScale,
+        drawSpriteFrame(wt, 1, 0, pv, wt.width * t.imageScale,
                         t.isStatic() ? 0 : spriteRot(u.facing), WHITE);
         return;
     }
-    float baseFrameW = 0;
-    if (loaded(t, 0, tex)) {
+    // CustomUnit.d():671-677 -- a dead hull draws the raw wreck, a living one the baked variant of its own
+    // team colour slot. The shadow (k():680) never joins in and stays raw.
+    drawLegs(g, u, 0, cam);
+    int colorIdx = teamColorIndex(u.team);
+    // Only the living hull sprite rides the getUnitBounds() translate (:2834-2840 -> the rect c():2426 draws
+    // into). The wreck above and the shadow, shield and turrets below all stay on the plain hull position.
+    Vector2 bv{ pv.x + t.bodyOffsetDrawX(), pv.y + t.bodyOffsetDrawY() };
+    if (teamed(t, t.image, 0, colorIdx, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
-        baseFrameW = tex.width / (float)ef;
-        t.texFrameWpx = (int)baseFrameW;
         float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, false));
-        drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, pv, scale * t.imageScale * u.animScale, rot, col);
+        // RWX sizes the hull from es/et, which CustomUnit:1046-1052 sets to the config's frameWidth x
+        // frameHeight -- the sprite's own pixels -- and then scales that rect by getRenderScale():2327 =
+        // imageScale * currentFrameTime. displayRadius is a HUD/collision radius, never a sprite size.
+        drawSpriteFrame(tex, ef, ef > 1 ? anim % ef : 0, bv,
+                        (tex.width / (float)ef) * t.imageScale * u.animScale, rot, col);
     } else {
         DrawCircleV(pv, r, Fade(teamColor(u.team), 0.8f));
     }
@@ -229,41 +309,56 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // rotated by its own aim, with its own sprite and recoil; a barrel with no image of its own
     // falls back to [graphics] image_turret.
     if (!t.turrets.empty()) {
-        float k = baseFrameW > 0 ? (scale * t.imageScale) / baseFrameW : 1.0f;
         for (size_t i = 0; i < t.turrets.size(); ++i) {
             const TurretTpl& tt = t.turrets[i];
             if (tt.invisible) continue;
             const TurretState* s = (i < u.tur.size()) ? &u.tur[i] : nullptr;
             float a = s ? s->angle : u.facing;
             Vec2 aim{ std::cos(a), std::sin(a) }, right{ -aim.y, aim.x };
-            Vec2 tp = turretPivot(u, (int)i, k);
-            float rc = turretRecoil(u, (int)i);
-            if (rc != 0.0f) tp = tp + aim * rc;                       // recoilOffset along the aim
+            Vec2 tp = turretPivot(u, (int)i);   // recoilOffset is already inside it, as in RWX's F(i)
+            // GameViewUtils:192 draws the sprite's centre at pivot - (h(i), i(i)) and only then rotates
+            // and scales about the pivot, so image_drawOffsetX/Y ride the aim and turretImageScale.
             if (tt.drawOffsetX != 0 || tt.drawOffsetY != 0)
-                tp = tp + (aim * tt.drawOffsetY - right * tt.drawOffsetX) * k;
+                tp = tp + (aim * tt.drawOffsetY - right * tt.drawOffsetX) * t.turretImageScale;
             Texture2D tur;
-            if (!byName(t, tt.image.empty() ? t.imageTurret : tt.image, tur)) continue;
-            int ef = (frames > 1 && tur.width % frames == 0) ? frames : 1;
-            // RWX GameViewUtils: turret keeps its own native aspect vs the body (turretImageScale, not body scale)
-            float turW = baseFrameW > 0
-                ? (tur.width / (float)ef) * t.turretImageScale * (scale / baseFrameW)
-                : scale * 0.7f * t.turretImageScale;
-            drawSpriteFrame(tur, ef, ef > 1 ? anim % ef : 0, Vector2{ tp.x, tp.y - u.posZ }, turW, spriteRot(a), col);
-            // RWX shoot_flame: effectTemplates[3] = drawable/flame.png, 20x25 frames, attached to the barrel
-            if (s && s->flameType > 0 && s->flameT > 0) {
-                Texture2D fl;
-                if (shared("flame.png", fl)) {
-                    int total = s->flameType == 1 ? 8 : 10;
-                    float elapsed = (float)total - s->flameT;
-                    int frame = s->flameType == 1 ? (int)(elapsed * 0.5f) : 1 + (int)(elapsed * 0.4f);
-                    int ff = std::max(1, fl.width / 20);
-                    drawSpriteFrame(fl, ff, std::min(ff - 1, frame),
-                        Vector2{ pv.x + s->flameOff.x, pv.y + s->flameOff.y },
-                        20.0f * (s->flameType == 2 ? 0.75f : 1.0f), spriteRot(s->flameAng), col);
-                }
+            // RWX CustomUnit.d(i):691-706 walks four slots: the barrel's own baked array, its raw image, the
+            // [graphics] image_turret array -- only baked when teamColorsOnTurret is on (:1407) -- then the
+            // raw image_turret. So a barrel that names its own sprite ignores the hull-wide flag only if
+            // image_applyTeamColors says so (TurretConfig.java:551-554).
+            bool ownImage = !tt.image.empty();
+            std::string turName = ownImage ? tt.image : t.imageTurret;
+            bool dyeTurret = (ownImage && tt.applyTeamColors >= 0)
+                ? tt.applyTeamColors == 1 : t.teamColorsOnTurret;
+            if (!(dyeTurret ? teamed(t, turName, 1, colorIdx, tur) : byName(t, turName, tur))) continue;
+            // GameViewUtils:192 hands the whole texture to GraphicsEngine.b(texture,x,y,paint), which
+            // KoolGraphicsEngine:441-449 draws over fullSourceRect() -- a turret has no frame strip of its
+            // own (TurretConfig carries no total_frames), and p(i):2332 is the only scale it gets.
+            drawSpriteFrame(tur, 1, 0, Vector2{ tp.x, tp.y - u.posZ },
+                            tur.width * t.turretImageScale, spriteRot(a), col);
+        }
+        // RWX shoot_flame is not part of the barrel's drawing at all: CustomUnit.java:1593-1595 hands the
+        // muzzle point of D(i) to EffectTemplate.a(), which spawns an Effect the effect layer draws later,
+        // so an invisible barrel (turret_antiair_t3's missile pods) or one with no sprite still flashes.
+        // effectTemplates[3] = drawable/flame.png, 20x25 frames, centred on that point (EffectManager:603
+        // leaves an=true), and its own paint: the built-in flame carries color=-1, never the hull's team or
+        // under-construction tint. small plays frames 0..3 at 0.5/frame (8 ticks), large/medium 1..4 at
+        // 0.4 (10 ticks), and medium is the only one scaled, to 0.75 (EffectTemplate.java:107-111).
+        Texture2D fl;
+        if (shared("flame.png", fl)) {
+            int ff = std::max(1, fl.width / 20);
+            for (size_t i = 0; i < t.turrets.size() && i < u.tur.size(); ++i) {
+                const TurretState& s = u.tur[i];
+                if (s.flameType <= 0 || s.flameT <= 0) continue;
+                int total = s.flameType == 1 ? 8 : 10;
+                float elapsed = (float)total - s.flameT;
+                int frame = s.flameType == 1 ? (int)(elapsed * 0.5f) : 1 + (int)(elapsed * 0.4f);
+                drawSpriteFrame(fl, ff, std::min(ff - 1, frame),
+                    Vector2{ pv.x + s.flameOff.x, pv.y + s.flameOff.y },
+                    20.0f * (s.flameType == 2 ? 0.75f : 1.0f), spriteRot(s.flameAng), WHITE);
             }
         }
     }
+    drawLegs(g, u, 1, cam);
     // RWX CustomUnit.c():2491-2521 - the bubble is [graphics] image_shield, or the shared
     // drawable/shield_mid.png, drawn 1.25x over shieldRenderRadius on top of the whole unit. Its
     // alpha is how full the pool is plus how recently it soaked a hit, so a shielded unit glows
@@ -289,7 +384,8 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         DrawCircleLines((int)pv.x, (int)pv.y, r + 3, Color{ 60, 220, 90, 255 });
     }
     // hp bar
-    if (u.hp < u.maxHp || u.selected || t.isBuilding ||
+    bool energyBar = t.maxEnergy > 0 && t.showEnergyBar && u.energy < t.maxEnergy;
+    if (u.hp < u.maxHp || u.selected || t.isBuilding || energyBar ||
         (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
         float bw = r * 2.0f, bh = 4;
         float frac = std::max(0.0f, u.hp / u.maxHp);
@@ -301,13 +397,35 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             float bp = std::min(1.0f, u.buildProgress);
             DrawRectangle((int)p.x, (int)p.y + 5, (int)(bw * bp), 3, Color{ 240, 220, 90, 255 });
         }
-        // RWX BaseUnit.java:1166-1183: the secondary bar is the bubble's own fill, cyan, stacked just
-        // under the health bar (it is only there while the shield is not full).
-        if (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax) {
-            float by = p.y + 5 + (u.underConstruction ? 5 : 0);
-            float sf = std::max(0.0f, u.shield / u.shieldMax);
+        // RWX BaseUnit.java:1146-1163 -- a row of slot cells under the health bar, only for a selected
+        // carrier (the same `isSelected || settingsEngine.showHp` gate the health bar uses) and only while
+        // [graphics] showTransportBar (CustomUnit.java:532/541 returns -1 to hide it). The weight drawn is
+        // dI(), i.e. the *slots* taken, so a nine-slot dropship shows a single heavy hull as five cells.
+        bool transportBar = u.selected && t.canTransportUnits() && t.showTransportBar;
+        int slotsUsed = transportBar ? g.transportSlotsUsed(u) : 0;
+        if (transportBar) {
+            float tw = r * 2.0f + (t.maxTransportingUnits > 10 ? 20.0f : 0.0f);
+            float cell = (float)(int)(tw / t.maxTransportingUnits + 0.5f);
+            float x0 = pv.x - tw / 2.0f;
+            for (int i = 1; i <= t.maxTransportingUnits; ++i) {
+                float cx = x0 + (i - 1) * cell;
+                Rectangle box{ cx, p.y + 3, std::max(1.0f, cell - 2.0f), 3.0f };
+                if (slotsUsed >= i) DrawRectangleRec(box, Color{ 0, 0, 255, 255 });
+                DrawRectangleLinesEx(box, 1.0f, Color{ 0, 0, 210, 110 });
+            }
+        }
+        // RWX BaseUnit.java:1166-1183: one secondary bar sits under the health bar, and
+        // getSecondaryBarProgress (CustomUnit.java:3479-3495) fills that slot with the energy pool
+        // *before* the bubble -- a unit with both only ever shows its charge. While the
+        // recharge-to-full latch holds the barrels the bar is drawn in the dim grey of :1170-1174.
+        if (energyBar || (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
+            // :1163 -- f8 becomes 3+5 once the cells are drawn, so the secondary bar drops 5 px for them
+            float by = p.y + 5 + (u.underConstruction ? 5 : 0) + (transportBar ? 5 : 0);
+            float sf = energyBar ? std::max(0.0f, u.energy / t.maxEnergy)
+                                 : std::max(0.0f, u.shield / u.shieldMax);
+            Color fill = u.energyRecharging ? Color{ 103, 117, 119, 118 } : Color{ 23, 179, 207, 200 };
             DrawRectangle((int)p.x, (int)by, (int)bw, 2, Color{ 20, 20, 20, 160 });
-            DrawRectangle((int)p.x, (int)by, (int)(bw * sf), 2, Color{ 23, 179, 207, 200 });
+            DrawRectangle((int)p.x, (int)by, (int)(bw * sf), 2, fill);
         }
         // RWX production bar: yellow progress + queue count while a factory is building a unit
         if (t.isFactory && u.operational() && !u.prodQueue.empty()) {
@@ -327,9 +445,156 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     }
 }
 
+void Renderer::drawLegs(Game& g, const Unit& u, int pass, const Camera2D& cam) {
+    if (!u.tpl || u.legs.empty() || u.dead) return;
+    const UnitTemplate& t = *u.tpl;
+    bool details = cam.zoom >= 0.45f;
+    bool underAll = pass == 2, overBody = pass == 1;
+    float scale = t.imageScale * u.animScale;
+    int colorIdx = teamColorIndex(u.team);
+    Color basePaint = unitRenderPaint(u);
+    float dir = (t.lockLegRot && !u.tur.empty()) ? u.tur[0].angle : u.facing;
+    Vec2 aim{ std::cos(dir), std::sin(dir) }, right{ -aim.y, aim.x };
+    for (size_t i = 0; i < u.legs.size() && i < t.legs.size(); ++i) {
+        const LegTpl& C = t.legs[i];
+        const LegState& S = u.legs[i];
+        if (C.hidden || C.drawUnderAllUnits != underAll || S.alpha <= 0.0f) continue;
+        bool drawLimb = C.drawOverBody == overBody;
+        float height = S.z + u.posZ;
+        bool drawShadow = !overBody && cam.zoom >= 0.3f && height > 0.0f && !C.imageShadow.empty();
+        if (!drawLimb && !drawShadow) continue;
+        Vec2 fw = u.pos + S.foot;
+        Vector2 fp{ fw.x, fw.y - S.z - u.posZ };
+        float rot = spriteRot(S.angle) + S.spin + C.drawDirOffset;
+        Texture2D ft, lt, sh;
+        if (drawShadow && byName(t, C.imageShadow, sh))
+            drawSpriteFrame(sh, 1, 0, Vector2{ fp.x, fp.y + height * scale }, sh.width * scale,
+                            rot, Color{ 255, 255, 255, 128 });
+        if (!drawLimb) continue;
+        float alpha = height < -0.3f ? submergedRenderAlpha(height) * 0.003921569f : 1.0f;
+        if (S.alpha < 1.0f) alpha *= S.alpha;
+        Color col = basePaint;
+        // Limb fading caps the base paint alpha, preserving construction opacity.
+        if (alpha < 1.0f) col.a = (uint8_t)std::min((int)col.a, (int)(255.0f * alpha));
+        bool hasFoot = (details || C.drawFootZoomedOut) && (C.footTeamColors
+            ? teamed(t, C.imageFoot, 1, colorIdx, ft) : byName(t, C.imageFoot, ft));
+        bool hasLeg = (details || C.drawLegZoomedOut) && (C.legTeamColors
+            ? teamed(t, C.imageLeg, 1, colorIdx, lt) : byName(t, C.imageLeg, lt));
+        if (hasFoot && !C.drawFootOnTop)
+            drawSpriteFrame(ft, 1, 0, fp, ft.width * scale, rot, col);
+        if (hasLeg) {
+            Vec2 d = aim * C.attachY + right * C.attachX - S.foot;
+            float half = lt.height * 0.5f;
+            float len = half;
+            float d2 = d.x * d.x + d.y * d.y;
+            if (d2 < (half - 2.0f) * (half - 2.0f))
+                len = std::round(std::sqrt((float)(int)d2));
+            if (len > 0.0f) {
+                float ang = std::atan2(d.y, d.x) * 180.0f / 3.14159265f + 90.0f;
+                int top = (int)(half - len), bottom = (int)(half + len);
+                float halfWidth = (float)(lt.width / 2) * scale;
+                Rectangle src{ 0, (float)top, (float)lt.width, (float)(bottom - top) };
+                Rectangle dst{ fp.x, fp.y, 2.0f * halfWidth, 2.0f * len * scale };
+                DrawTexturePro(lt, src, dst, Vector2{ halfWidth, len * scale }, ang, col);
+            }
+        }
+        if (hasFoot && C.drawFootOnTop)
+            drawSpriteFrame(ft, 1, 0, fp, ft.width * scale, rot, col);
+    }
+}
+
+// Effect.update(GameEngine,false):403-637, the draw half of one [effect_*] instance. Everything RWX keeps in
+// Effect is already stepped by Game::updateFx; what is left is the sheet cell, the anchor, the scale/alpha
+// curves and the rotation.
+void Renderer::drawFx(Game& g, bool under) {
+    const int want = under ? 1 : 2;
+    for (const Fx& f : g.fx) {
+        if (f.dead || f.delay > 0.0f || f.spec.layer != want) continue;   // :410-412
+        const EffectTpl& s = f.spec;
+        Texture2D tex;
+        Rectangle src;
+        if (!s.image.empty()) {
+            // :419-423 -- a custom image replaces the built-in strip entirely, and its SpriteSheet was built
+            // by EffectTemplate.a(config,ini,section):487-505 off the texture's own size.
+            if (!f.src || !byName(*f.src, s.image, tex)) continue;
+            int tw = tex.width, th = tex.height;
+            int cw = s.frameW > 0 ? s.frameW : tw / std::max(1, s.totalFrames);
+            int ch = s.frameH > 0 ? s.frameH : th;
+            if (cw <= 0 || ch <= 0 || tw <= 0 || th <= 0) continue;
+            if (s.totalFrames == 1 && cw >= tw) {
+                src = Rectangle{ 0, 0, (float)tw, (float)th };            // SpriteSheet.k
+            } else {
+                // :494-501 -- h (columns) only leaves Integer.MAX_VALUE when the cell is shorter than the
+                // texture, which is what makes a sheet wrap onto a second row.
+                int cols = ch < th ? std::max(1, tw / cw) : 0;
+                int row = cols > 0 ? f.frame / cols : 0;
+                int col = cols > 0 ? f.frame % cols : f.frame;
+                src = Rectangle{ (float)(col * cw), (float)(row * ch), (float)cw, (float)ch };
+            }
+        } else {
+            if (s.strip < 0 || s.strip >= 20) continue;
+            const FxSheetSpec& sh = kFxSheets[s.strip];
+            if (!shared(sh.file, tex)) continue;
+            // Effect.getEffectSprite:388-401 -- origin + frame * step, single row for all twenty sheets.
+            src = sh.whole ? Rectangle{ 0, 0, (float)tex.width, (float)tex.height }
+                           : Rectangle{ (float)(sh.ox + f.frame * sh.sx), (float)sh.oy,
+                                        (float)sh.cw, (float)sh.ch };
+        }
+        // RWX hands the backend a rect that may run off the sheet (animateFrameEnd == total_frames lets ap
+        // reach one past the last cell); raylib would sample wrapped pixels, so the rect is clipped instead.
+        if (src.x >= tex.width || src.y >= tex.height) continue;
+        if (src.x + src.width > tex.width) src.width = tex.width - src.x;
+        if (src.y + src.height > tex.height) src.height = tex.height - src.y;
+        if (src.width <= 0 || src.height <= 0) continue;
+
+        // :430-433 createPointWithOffset(I,J,K) = (I, J-K), then :460-466 adds the attached GameObject's live
+        // position back -- a hull, or the round an effectOnCreate entry is riding. One that is already gone
+        // keeps the last snapshot updateFx took.
+        Vec2 pt{ f.ij.x, f.ij.y - f.k };
+        if (f.unitId >= 0 || f.projId >= 0) { pt.x += f.hull.x; pt.y += f.hull.y - f.hullZ; }
+        // :436-442 -- the lerp only runs when the template asked for a size change at all, and its progress
+        // is 1 - V/W, not 1 - V/Vmax: the hit flashes carry W=25 under V=35.
+        float sc = 1.0f;
+        if (s.scaleFrom != 1.0f || s.scaleTo != 1.0f) {
+            float prog = f.w > 0.0f ? 1.0f - f.life / f.w : 1.0f;
+            sc = s.scaleFrom + (s.scaleTo - s.scaleFrom) * prog;
+        }
+        float w = src.width * sc, h = src.height * sc;
+        // :451-459 -- an=true is set by every creator, so the cell is always centred; imageAnchorY then
+        // slides it along its own height. That shift also moves the rotation pivot (:541).
+        float anchor = s.imageAnchorY != 0.5f ? h * (0.5f - s.imageAnchorY) : 0.0f;
+        // :482-533 -- f = W - V is the age, and the two fades share the one boundary t. With W under V the
+        // age starts negative, which holds the alpha at E until V drops below W (the hit-flash look).
+        float age = f.w - f.life;
+        float ta = 1.0f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
+        if (s.color != 0) {                       // x == -1 in RWX, which RP writes as 0
+            // parseRgba packs RRGGBBAA, the same layout the projectile tint at :571 reads back out.
+            tr = ((s.color >> 24) & 0xFF) / 255.0f;
+            tg = ((s.color >> 16) & 0xFF) / 255.0f;
+            tb = ((s.color >> 8) & 0xFF) / 255.0f;
+            ta = (s.color & 0xFF) / 255.0f;
+        }
+        float a;
+        if (s.fadeOut && age >= s.fadeIn)
+            a = ta * (f.life / std::max(0.001f, f.w - s.fadeIn)) * s.alpha;
+        else if (s.fadeIn > 0.0f && age < s.fadeIn)
+            a = ta * (age / s.fadeIn) * s.alpha;
+        else a = ta * s.alpha;
+        if (a > 1.0f) a = 1.0f;
+        if (a <= 0.0f) continue;
+        // :536-542 -- rotation is applied ONLY when Y is non-zero, and then at Y + 90. An effect pinned at
+        // zero (the shockwave, the light) is drawn in the sheet's own orientation, not turned a quarter.
+        float rot = f.dir != 0.0f ? f.dir + 90.0f : 0.0f;
+        DrawTexturePro(tex, src, Rectangle{ pt.x, pt.y + anchor, w, h }, Vector2{ w * 0.5f, h * 0.5f }, rot,
+                       Color{ (uint8_t)(tr * 255.0f), (uint8_t)(tg * 255.0f), (uint8_t)(tb * 255.0f),
+                              (uint8_t)(a * 255.0f) });
+    }
+}
+
 void Renderer::drawWorld(Game& g, const ViewState& view) {
     BeginMode2D(view.cam);
     drawMap(g, view.cam);
+    debugDrawGrid(g, view.cam);
 
     // RWX CustomUnit.java:946-951,2414-2424: a wreck is the whole image_wreak texture drawn at the
     // unit's last rotation, with no turret, shadow layering or health bar.
@@ -337,13 +602,18 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         if (!w.tpl) continue;
         Texture2D wt;
         if (!loaded(*w.tpl, 2, wt)) continue;
-        float wr = std::max(6.0f, w.tpl->displayRadius) * 2.0f * w.tpl->imageScale;
+        float wr = wt.width * w.tpl->imageScale;
         drawSpriteFrame(wt, 1, 0, Vector2{ w.pos.x, w.pos.y }, wr, spriteRot(w.facing), WHITE);
     }
-    // under-construction + normal units sorted so buildings draw first
-    for (auto& u : g.units) drawUnitShadow(u);
-    for (auto& u : g.units) if (u.tpl && u.tpl->isStatic()) drawUnit(g, u, view.cam);
-    for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic()) drawUnit(g, u, view.cam);
+    // RWX GameLogic.java:1915 -- EffectManager.drawEffect(f, 1) is the ground pass, ahead of every game
+    // object, so a drawUnderUnits effect ends up beneath the hulls and their shadows.
+    drawFx(g, true);
+    // under-construction + normal units sorted so buildings draw first. A hull in someone's hold is not
+    // drawn at all (CustomUnit.a(GameEngine):4656) -- it reappears where b():718-809 puts it.
+    for (auto& u : g.units) if (!u.riding()) drawUnitShadow(u);
+    for (auto& u : g.units) if (!u.riding()) drawLegs(g, u, 2, view.cam);
+    for (auto& u : g.units) if (u.tpl && u.tpl->isStatic() && !u.riding()) drawUnit(g, u, view.cam);
+    for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic() && !u.riding()) drawUnit(g, u, view.cam);
 
     // RWX projectile trail (Projectile.update:921-939): effects.png cell 0 is a 25x25 grey puff taken
     // from the sheet at x=1+26*cell, y=1 (EffectManager.java:665-678). It fades in over 5 ticks to
@@ -458,6 +728,9 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
                 Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
         }
     }
+    // RWX GameLogic.java:1984 -- drawEffect(f, 2) is the air pass, after the units and the shots. The muzzle
+    // list lands here, which is what puts a shockwave or a spark cloud over the barrel that made it.
+    drawFx(g, false);
     // nano build particles (green flecks flying builder -> building, RW effects.png frame 6)
     for (auto& p : g.particles) {
         float prog = p.dur > 0 ? std::min(1.0f, p.t / p.dur) : 1.0f;
@@ -483,6 +756,7 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
                 DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, gc);
         }
     }
+    debugDrawWorld(g, view.cam);
     EndMode2D();
 
     // selection drag box (screen space)

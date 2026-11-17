@@ -2,6 +2,7 @@
 #include <raylib.h>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 #include "Common.h"
@@ -9,6 +10,7 @@
 #include "TileMap.h"
 #include "Game.h"
 #include "Renderer.h"
+#include "Debug.h"
 
 static const char* MAP_PATH_DEFAULT = "../assets/maps/l030;[demo]mission_3__-__Crossfire.tmx";
 
@@ -33,15 +35,20 @@ struct UI {
     // selection drag
     bool dragging = false;
     Vector2 dragA, dragB;
+    // RWX ActionType.reclaimTarget pick mode (GameUI:1934-1955): the builder action bar arms it and the next
+    // map click issues the command.
+    bool reclaimPick = false;
     // command marker anim
     bool markerOn = false; Vector2 markerPos; float markerT = 0;
 };
 static UI ui;
 
+// RWX draws the zoomed-out hull as teamColoredIconTextures[team.getTeamColorIndex()] (CustomUnit.v():664-668),
+// so the dot here takes the same slot of the same ten-colour table the sprites are dyed with.
 static Color TC(int t) {
-    static Color pal[8] = { {90,140,240,255},{220,70,70,255},{80,190,90,255},{230,200,70,255},
-        {200,100,220,255},{240,150,60,255},{70,200,210,255},{220,120,130,255} };
-    return pal[((t % 8) + 8) % 8];
+    uint32_t a = kTeamColors[teamColorIndex(t)];
+    return Color{ (uint8_t)((a >> 16) & 0xFF), (uint8_t)((a >> 8) & 0xFF), (uint8_t)(a & 0xFF),
+                  (uint8_t)((a >> 24) & 0xFF) };
 }
 
 static std::vector<const UnitTemplate*> buildableOptions(Game& g) {
@@ -70,7 +77,7 @@ static void selectBox(Game& g, Vector2 a, Vector2 b) {
     int player = g.playerTeam();
     Unit* firstMatch = nullptr;
     for (auto& u : g.units) {
-        if (u.team != player || !u.tpl) continue;
+        if (u.team != player || !u.tpl || u.riding()) continue;
         if (u.tpl->isStatic() && (hi.x - lo.x) < 4 && (hi.y - lo.y) < 4) {} // allow buildings single select
         if (u.pos.x >= lo.x && u.pos.x <= hi.x && u.pos.y >= lo.y && u.pos.y <= hi.y) { u.selected = true; if (!firstMatch) firstMatch = &u; }
     }
@@ -89,6 +96,15 @@ static void renderHUD(Game& g, Camera2D& cam) {
     DrawText(credits.c_str(), 14, 12, 20, Color{ 240, 220, 90, 255 });
     char buf[64]; snprintf(buf, 64, "Units: %zu  FPS: %d", g.units.size(), (int)GetFPS());
     DrawText(buf, 14, 40, 14, LIGHTGRAY);
+    // RP has no command bar for the unload order, so the hold reads out here instead
+    for (auto* u : g.selectedUnits()) {
+        if (!u->tpl || !u->tpl->canTransportUnits()) continue;
+        std::string s = "Transport " + std::to_string(g.transportSlotsUsed(*u)) + "/" +
+            std::to_string(u->tpl->maxTransportingUnits) + (u->unloading ? "  unloading" : "") +
+            "   [U]unload  [I]load up";
+        DrawText(s.c_str(), 14, 60, 14, Color{ 150, 200, 255, 255 });
+        break;
+    }
     if (g.gameOver) DrawText(("*** " + g.gameOverText + " ***  (R to restart)").c_str(), 220, 10, 26, g.gameOverText == "VICTORY" ? GREEN : RED);
 
     // ---- minimap (top-right) ----
@@ -105,7 +121,7 @@ static void renderHUD(Game& g, Camera2D& cam) {
         Color c = t.water ? Color{ 40, 96, 160, 255 } : (t.blocked ? Color{ 80, 80, 80, 255 } : Color{ 110, 120, 80, 255 });
         DrawRectangle(mm.x + x * sx, mm.y + y * sy, 2 * sx, 2 * sy, c);
     }
-    for (auto& u : g.units) if (u.tpl) DrawRectangle(mm.x + u.pos.x * sx - 1, mm.y + u.pos.y * sy - 1, 3, 3, TC(u.team));
+    for (auto& u : g.units) if (u.tpl && !u.riding()) DrawRectangle(mm.x + u.pos.x * sx - 1, mm.y + u.pos.y * sy - 1, 3, 3, TC(u.team));
     // view rect
     Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam), br = GetScreenToWorld2D({ (float)SW, (float)SH }, cam);
     DrawRectangleLines(mm.x + tl.x * sx, mm.y + tl.y * sy, (br.x - tl.x) * sx, (br.y - tl.y) * sy, WHITE);
@@ -115,17 +131,22 @@ static void renderHUD(Game& g, Camera2D& cam) {
     }
 
     // ---- build / produce / upgrade panel (bottom) ----
-    struct PBtn { bool upgrade; std::string label; float price; std::string key; };
+    struct PBtn { bool upgrade; bool reclaim = false; std::string label; float price; std::string key; };
     std::vector<PBtn> btns;
-    for (auto* it : buildableOptions(g)) btns.push_back({ false, it->displayText, it->price, it->name });
+    for (auto* it : buildableOptions(g)) btns.push_back({ false, false, it->displayText, it->price, it->name });
+    bool anyReclaimer = false;
     for (auto* u : g.selectedUnits()) {
         if (u->team != g.playerTeam() || !u->tpl) continue;
+        if (u->tpl->canReclaimResources) anyReclaimer = true;
         for (auto& a : u->tpl->actions) {
             bool dup = false;
             for (auto& o : btns) if (o.upgrade && o.key == a.convertTo) dup = true;
-            if (!dup) btns.push_back({ true, a.text, a.price, a.convertTo });
+            if (!dup) btns.push_back({ true, false, a.text, a.price, a.convertTo });
         }
     }
+    // BuilderUnit.java:62 bolts ReclaimTargetAction onto every builder's action list; the shipped ini never
+    // writes customActions, so the vanilla engineers always show it.
+    if (anyReclaimer) btns.push_back({ false, true, "Reclaim", 0, "" });
     if (!btns.empty()) {
         Rectangle panel{ 8, SH - ui.panelH - 8, SW - 16 - mmW, ui.panelH };
         DrawRectangleRec(panel, Color{ 12, 16, 20, 210 });
@@ -145,9 +166,12 @@ static void renderHUD(Game& g, Camera2D& cam) {
             DrawRectangleLinesEx(btn, 1, afford ? LIGHTGRAY : DARKGRAY);
             std::string label = b.label.size() > 12 ? b.label.substr(0, 11) + "." : b.label;
             DrawText(label.c_str(), btn.x + 4, btn.y + 3, 14, afford ? WHITE : GRAY);
-            DrawText((std::to_string((int)b.price) + "$").c_str(), btn.x + 4, btn.y + 24, 14, afford ? Color{ 240, 220, 90, 255 } : GRAY);
+            // ReclaimTargetAction.getCostAmount():38-40 -- the action is free, so it shows no price.
+            if (!b.reclaim)
+                DrawText((std::to_string((int)b.price) + "$").c_str(), btn.x + 4, btn.y + 24, 14, afford ? Color{ 240, 220, 90, 255 } : GRAY);
             if (hover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && afford) {
-                if (b.upgrade) {
+                if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; }
+                else if (b.upgrade) {
                     for (auto* u : g.selectedUnits()) {
                         if (!u->tpl) continue;
                         for (size_t k = 0; k < u->tpl->actions.size(); ++k)
@@ -192,7 +216,7 @@ static void handlePlacement(Game& g, Vec2 world) {
         bool ok = true;
         for (int y = miny; y < miny + fh && ok; ++y) for (int x = minx; x < minx + fw && ok; ++x)
             if (!g.map.inBounds(x, y) || !(t->placeOnlyOnWater ? g.map.canPlaceWaterBuilding(x, y) : g.map.canPlaceBuilding(x, y))) ok = false;
-        if (ok && !g.buildingSpotFree(Vec2{ (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE }, *t)) ok = false;
+        if (ok && !g.buildingSpotFree(t->footprintPos(tx, ty), *t)) ok = false;
         // RWX: ghost turns red off the resource pool (center-tile rule, same as orderBuild)
         if (ok && t->placeOnlyOnResPool && !(g.map.inBounds(tx, ty) && g.map.at(tx, ty).resource)) ok = false;
         ui.placingValid = ok;
@@ -263,15 +287,23 @@ int main() {
 
     while (!WindowShouldClose()) {
         double now = GetTime();
-        acc += now - last; last = now;
+        acc += (now - last) * (g_debug.paused ? 0.0 : g_debug.speed); last = now;
+        if (g_debug.step) { acc += 1.0 / TICK_RATE; g_debug.step = false; }
         while (acc >= 1.0 / TICK_RATE) { if (!game.gameOver) game.update(); acc -= 1.0 / TICK_RATE; }
 
-        // camera pan
+        // camera pan (WASD doubles as the spawn picker's text input, so it yields while typing)
         float pan = 600.0f / cam.zoom * GetFrameTime();
-        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) cam.target.y -= pan;
-        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) cam.target.y += pan;
-        if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) cam.target.x -= pan;
-        if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) cam.target.x += pan;
+        if (!g_debug.spawnOpen) {
+            if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) cam.target.y -= pan;
+            if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) cam.target.y += pan;
+            if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) cam.target.x -= pan;
+            if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) cam.target.x += pan;
+        } else {
+            if (IsKeyDown(KEY_UP)) cam.target.y -= pan;
+            if (IsKeyDown(KEY_DOWN)) cam.target.y += pan;
+            if (IsKeyDown(KEY_LEFT)) cam.target.x -= pan;
+            if (IsKeyDown(KEY_RIGHT)) cam.target.x += pan;
+        }
         if (IsKeyDown(KEY_MINUS) || GetMouseWheelMove() < 0) cam.zoom = std::max(0.3f, cam.zoom - 0.1f);
         if (IsKeyDown(KEY_EQUAL) || GetMouseWheelMove() > 0) cam.zoom = std::min(3.0f, cam.zoom + 0.1f);
         // clamp target to world
@@ -283,11 +315,15 @@ int main() {
         Vec2 world{ worldV.x, worldV.y };
         bool overUI = ui.overPanel || ui.overMinimap;
 
+        debugHandleKeys(game);
+        if (g_debug.spawnOpen || g_debug.spawnArmed) { ui.placing = false; ui.reclaimPick = false; }
+
         if (ui.markerOn) { ui.markerT += (float)GetFrameTime(); if (ui.markerT > 0.6f) ui.markerOn = false; }
         handlePlacement(game, world);
 
         // ---- selection drag (left mouse) ----
-        if (!overUI && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        bool dbgClick = debugMouseLeft(game, mouse, world, overUI);
+        if (!dbgClick && !overUI && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             if (ui.placing) tryPlace(game);
             else { ui.dragging = true; ui.dragA = mouse; ui.dragB = mouse; }
         }
@@ -297,19 +333,30 @@ int main() {
                 Vector2 a = GetScreenToWorld2D(ui.dragA, cam), b = GetScreenToWorld2D(ui.dragB, cam);
                 float w = std::abs(b.x - a.x), h = std::abs(b.y - a.y);
                 if (w * cam.zoom < 6 && h * cam.zoom < 6) {
-                    // single click select
-                    clearSelection(game);
+                    // single click
                     Unit* best = nullptr; float bd = 1e9f;
-                    for (auto& u : game.units) if (u.tpl) { float d = Vec2{ a.x, a.y }.dist(u.pos); if (d < std::max(12.0f, u.tpl->radius) && d < bd) { bd = d; best = &u; } }
-                    if (best && best->team == game.playerTeam()) best->selected = true;
+                    for (auto& u : game.units) if (u.tpl && !u.riding()) { float d = Vec2{ a.x, a.y }.dist(u.pos); if (d < std::max(12.0f, u.tpl->radius) && d < bd) { bd = d; best = &u; } }
+                    // GameUI:1934-1955: with the reclaim action armed the same click issues the command
+                    // instead of selecting -- any unit under the cursor, whatever its team, since the general
+                    // ReclaimTargetAction(true) isAvailableAndVisible():79-84 answers true for all of them.
+                    // orderReclaim then drops the hulls RWX's canReclaimTarget:2179 would drop.
+                    // Shift leaves the action armed for another target, as clearCurrentAction() is skipped.
+                    if (ui.reclaimPick && best) {
+                        for (auto* s : game.selectedUnits()) if (s->tpl && s->tpl->canReclaimResources) game.orderReclaim(s->id, best->id);
+                        if (!IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_RIGHT_SHIFT)) ui.reclaimPick = false;
+                    } else if (!ui.reclaimPick) {
+                        clearSelection(game);
+                        if (best && best->team == game.playerTeam()) best->selected = true;
+                    }
                 } else selectBox(game, a, b);
                 ui.dragging = false;
             }
         }
 
         // ---- right click orders ----
-        if (!overUI && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            if (ui.placing) { ui.placing = false; }
+        if (debugMouseRight()) {}
+        else if (!overUI && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            if (ui.placing || ui.reclaimPick) { ui.placing = false; ui.reclaimPick = false; }
             else {
                 auto sel = game.selectedUnits();
                 if (!sel.empty()) {
@@ -327,22 +374,73 @@ int main() {
                         if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < sd) { sd = d; site = &u; }
                     }
                     std::vector<int> ids; for (auto* s : sel) ids.push_back(s->id);
+                    // RWX GameUI.handleUnitTargetClick puts the transport branches after repair and before
+                    // the plain move: :2728-2731 a friendly carrier any selected hull can board takes the
+                    // loadInto order, and :2732-2735 (PC) a friendly hull a selected carrier can take aboard
+                    // takes loadUp instead. canSelectedUnitsLoadInto:3856-3869 asks for *any* one of the
+                    // selected units to qualify, then issueLoadIntoCommand gives it to all that do.
+                    auto atPoint = [&](std::function<bool(const Unit& u)> ok) {
+                        Unit* best = nullptr; float bd = 1e9f;
+                        for (auto& u : game.units) {
+                            if (!u.tpl || u.dead || u.team != game.playerTeam() || !ok(u)) continue;
+                            float d = world.dist(u.pos);
+                            if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < bd) { bd = d; best = &u; }
+                        }
+                        return best;
+                    };
+                    Unit* carrier = atPoint([&](const Unit& tr) {
+                        if (!tr.tpl->canTransportUnits()) return false;
+                        for (auto* s : sel) if (game.canLoadInto(tr, *s)) return true;
+                        return false;
+                    });
+                    Unit* rideable = atPoint([&](const Unit& c) {
+                        if (c.tpl->isStatic() || c.tpl->canTransportUnits()) return false;
+                        for (auto* s : sel) if (game.canLoadInto(*s, c)) return true;
+                        return false;
+                    });
+                    // GameUI.handleUnitTargetClick:2699-2726: right-clicking a [core] resourceRate target that
+                    // *every* selected hull may reclaim issues the reclaim order instead of a move -- and the
+                    // target needs no team check here, since OrderableUnit:2202 only refuses a cross-team one
+                    // whose resourceRate is 0. RP keeps RWX's "all or nothing": one hull without
+                    // [core] canReclaimResources and the whole click falls through to move.
+                    Unit* harvest = nullptr; float hd = 1e9f;
+                    for (auto& u : game.units) {
+                        if (!u.tpl || u.dead || u.riding() || !(u.tpl->resourceRate > 0)) continue;
+                        float d = world.dist(u.pos);
+                        if (d < std::max(26.0f, u.tpl->radius + 10.0f) && d < hd) { hd = d; harvest = &u; }
+                    }
+                    bool allReclaim = !sel.empty();
+                    for (auto* s : sel) if (!s->tpl || !s->tpl->canReclaimResources) allReclaim = false;
                     if (enemy && game.orderAttackTarget(ids, enemy->id) > 0) {} // attack order taken
                     else if (site && game.orderRepair(ids, site->id)) {}
+                    else if (harvest && allReclaim) { for (int id : ids) game.orderReclaim(id, harvest->id); }
+                    else if (carrier && game.orderLoadInto(ids, carrier->id) > 0) {}
+                    else if (rideable && game.orderLoadUp(ids, rideable->id) > 0) {}
                     else if (IsKeyDown(KEY_LEFT_CONTROL)) game.orderAttackMove(ids, world);
                     else game.orderMove(ids, world);
                     ui.markerOn = true; ui.markerPos = worldV; ui.markerT = 0;
                 }
             }
         }
-        if (IsKeyPressed(KEY_ESCAPE)) { ui.placing = false; clearSelection(game); }
+        if (IsKeyPressed(KEY_ESCAPE)) { ui.placing = false; ui.reclaimPick = false; clearSelection(game); }
+        if (!g_debug.spawnOpen) {
         if (IsKeyPressed(KEY_X)) { std::vector<int> ids; for (auto* s : game.selectedUnits()) ids.push_back(s->id); game.orderStop(ids); }
+        // RWX puts unload / load-up in the command bar for every carrier with
+        // transportUnitsAddUnloadOption (CustomUnitConfigParser.java:1844); RP triggers them from keys.
+        if (IsKeyPressed(KEY_U) || IsKeyPressed(KEY_I)) {
+            bool unload = IsKeyPressed(KEY_U);
+            for (auto* s : game.selectedUnits()) {
+                if (!s->tpl || !s->tpl->canTransportUnits()) continue;
+                if (unload) game.orderUnload(s->id); else game.orderLoadUpAgain(s->id);
+            }
+        }
         if (IsKeyPressed(KEY_R) && game.gameOver) {
             Game fresh; std::string e2;
             if (fresh.init(MAP_PATH_DEFAULT, &e2)) { game = std::move(fresh); }
             for (auto& u : game.units) u.selected = false;
             game.gameOver = false;
         }
+        } // !spawnOpen: game hotkeys yield to the picker's text input
 
         // ---- render ----
         ViewState view;
@@ -355,6 +453,13 @@ int main() {
         ClearBackground(Color{ 24, 28, 32, 255 });
         g_render.drawWorld(game, view);
         renderHUD(game, cam);
+        debugDrawHUD(game, cam);
+        // RWX keeps the armed action visible by drawing its tooltip on the cursor (drawActionTooltip,
+        // GameUI:1935); RP has no tooltip art, so it prints the prompt instead.
+        if (ui.reclaimPick) {
+            Vector2 m2 = GetMousePosition();
+            DrawText("Reclaim: click a target", m2.x + 14, m2.y + 16, 16, Color{ 255, 200, 90, 255 });
+        }
         EndDrawing();
     }
 

@@ -3,9 +3,115 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include "Common.h"
+#include "TeamColoring.h"
 
 enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF };
+
+// [core] transportUnitsCanUnloadUnits is a LogicBoolean (CustomUnitConfigParser.java:1837-1842), and the
+// shipped ini files only ever spell out a handful of forms of it: the bare `false` (nautilus, whose cargo
+// is meant to stay aboard for good), `if self.isOverLiquid()` / `if not self.isOverLiquid()` (the nautilus
+// surface variant and the gunship) and, when the key is absent, the built-in
+// `if not self.isOverLiquid() and not self.isMoving()` (logic_notOverLiquidAndNotMoving,
+// CustomUnitConfig.java:754). RP reads those atoms into a test list instead of carrying a logic-boolean
+// VM; a predicate it does not know is kept as always-true, since RWX would have rejected the ini outright.
+enum class CondPred { overLiquid, moving };
+struct UnloadCond {
+    bool never = false;
+    std::vector<std::pair<CondPred, bool>> tests;   // predicate, negated -- all of them must hold
+};
+
+// A [effect_NAME] section: RWX EffectTemplate (game/units/custom/EffectTemplate.java). Every member
+// starts at RWX's own constructor default (:105-143) so an ini that says nothing still behaves like
+// RWX. The *Random members are the +-spread RWX draws with randomFloatInRange(-v, v) when v != 0
+// (a(float):357-362), which is why an absent key costs nothing.
+struct EffectTpl {
+    std::string name;
+    // image : SHARED:spark.png wins over stripIndex; stripIndex is resolved by name or number against
+    // RWX's 20 built-in sheets (EffectManager.loadContent:667-868) and is what a custom image replaces.
+    std::string image;
+    int strip = 0;
+    int totalFrames = 1, frameW = 0, frameH = 0;   // 0 = take the cell size off the texture
+    float life = 200, lifeRandom = 0;             // V, in ticks
+    // W, the denominator of the age/scale/fade curves (Effect.draw:437,482,521). The built-in hit flashes
+    // count V=35 down against W=25, so the fade only starts once V drops below W; 0 keeps W = V, which is
+    // what every parsed [effect_*] and most creators use.
+    float fadeDenom = 0;
+    float scaleFrom = 1, scaleTo = 1;             // G -> F over the life
+    float alpha = 1;                              // E
+    uint32_t color = 0;                           // 0xRRGGBBAA, 0 = uncoloured (RWX's -1 sentinel)
+    bool fadeOut = true;                          // r
+    float fadeIn = 0;                             // s / t
+    bool attached = true;                         // attachedToUnit
+    bool liveAfterAttachedDies = true;
+    bool atmospheric = false, physics = false;
+    float physicsGravity = 1;                     // w
+    // EffectManager draws an effect in one of its own passes; EffectTemplate.a():446-457 turns the two keys
+    // into ar = 1 for drawUnderUnits, 3 for drawType: displacement and 2 for everything else. RP has no
+    // displacement buffer, so a layer-3 effect is parsed and then left undrawn.
+    int layer = 2;
+    float spawnChance = 1;
+    float delay = 0, delayRandom = 0;             // U, delayedStartTimer
+    float pivotOffset = 0, pivotOffsetRandom = 0;   // degrees, added to the muzzle angle to get the effect's own
+    float dirOffset = 0, dirOffsetRandom = 0;       // angle Y (also degrees), which dirSpeed Z turns per tick
+    int frame = 0, frameRandom = 0;               // ap out of the sheet
+    int animStart = 0, animEnd = 0;               // ae is raised only when these differ
+    int animStartRandom = 0;                      // animateFrameStartRandomAdd, which moves af but not ak
+    float animSpeed = 0.5f, animSpeedRandom = 0;  // frames per tick
+    bool animLooping = false, animPingPong = false;
+    // The four speeds, split the way RWX splits them: the absolute pair lands on P/Q as written and the
+    // relative pair is turned by the effect's angle first (:320-329).
+    float xAbs = 0, yAbs = 0, xAbsRnd = 0, yAbsRnd = 0;
+    float xRel = 0, yRel = 0, xRelRnd = 0, yRelRnd = 0;
+    float hSpeed = 0, hSpeedRandom = 0;           // R, px per tick of height
+    float dirSpeed = 0, dirSpeedRandom = 0;       // Z, degrees per tick
+    // The two offset pairs work the same way (:258-271), plus a height offset.
+    float oxAbs = 0, oyAbs = 0, oxAbsRnd = 0, oyAbsRnd = 0;
+    float oxRel = 0, oyRel = 0, oxRelRnd = 0, oyRelRnd = 0;
+    float hOffset = 0, hOffsetRandom = 0;
+    float imageAnchorY = 0.5f;                    // 0 top / 0.5 center / 1 bottom
+    float teamColorRatio = 0;
+    // alwayStartDirAtZero (and RWX's typo alias) pins the effect's angle at 0 instead of taking the muzzle
+    // direction -- which is exactly how the built-in shockwave comes out of EffectManager: its creator never
+    // touches Effect.Y, and free() leaves it at 0.
+    bool startDirAtZero = false;
+};
+
+// One entry of the [turret_N] shoot_flame spawn list. CustomUnitSpawnList.c():46-58 splits the string on
+// commas, peels a "*N" repeat off each item and resolves the rest through resolveEffect(:1175-1239), so a
+// list is that template repeated N times. builtIn is 1..3 for the flame sizes TurretState already plays,
+// 4 smoke / 5 shockwave for the two flavours RWX builds itself, and 0 for a parsed [effect_*] section, which
+// tpl then indexes UnitTemplate::effects. A list only ever keeps one flame size in TurretState (see
+// parseFlameList), so everything the flame slot cannot show lands in the turret's flames vector.
+struct FlameSpec {
+    int builtIn = 0;   // 4 smoke, 5 shockwave; 0 = use tpl
+    int tpl = -1;
+};
+
+// EffectManager.effectTemplates[] (loadContent:667-868), the twenty sheets a stripIndex selects. `whole` is
+// SpriteSheet.k, which hands the draw the entire texture instead of a cell; the six geometry members are the
+// sheet's b/c/d/e/f/g, i.e. cell, origin and step in texture pixels, and SpriteSheet.h stays at
+// Integer.MAX_VALUE for every one of them, so a built-in strip is always a single row.
+struct FxSheetSpec {
+    const char* name;
+    const char* file;
+    int cw, ch, ox, oy, sx, sy;
+    bool whole;
+};
+extern const FxSheetSpec kFxSheets[20];
+
+// stripIndex: found by sheet name (case-insensitive) or by the plain number "0".."19", and "" is the number
+// 0 because RWX reads a missing key as the empty string (findEffectTemplateIndex:889-901). -1 = no such sheet.
+int fxStripIndex(const std::string& key);
+
+// EffectManager's three flavours a shoot_flame list can ask for by name, expressed as the same EffectTpl the
+// ini sections fill in so one spawn path drives both: 4 smoke (createMuzzleFlash:291-312), 5 shockwave
+// (createSmallExplosionInternal:447-463) and 6 the muzzle light (createLightEffectInternal:356-374).
+// EffectTemplate.a():202 then overrules the two creators' own ar=1 with 2 and attaches both to the shooter,
+// and because the built-in effects keep EffectTemplate.defaultEffectTemplate as their template, whose
+// liveAfterAttachedDies is never assigned, they die with the hull.
+EffectTpl muzzleEffect(int kind);
 
 struct TurretTpl {
     float x = 0, y = 0;
@@ -19,6 +125,10 @@ struct TurretTpl {
     int projectile = 0;
     // [turret_N] image, empty = the unit's [graphics] image_turret (CustomUnit.d(i):691)
     std::string image;
+    std::string shootAnimation;
+    // [turret_N] image_applyTeamColors (TurretConfig.java:551-554) -- a tri-state, since RWX reads the key as
+    // a nullable Boolean and only falls back to [graphics] teamColorsOnTurret when it is absent.
+    int applyTeamColors = -1;
     bool invisible = false;
     bool canShoot = true;
     float turnSpeed = 4.0f;
@@ -29,6 +139,9 @@ struct TurretTpl {
     // linkDelayWithTurret sets 9000 so the parent's barrage is what restarts this barrel's timer.
     float shootDelay = -1;
     float warmup = 0;
+    // [turret_N] energyUsage (TurretConfig.java:372-375, TurretConfig.u): what one shot takes off the
+    // unit's energy pool. A barrel with a cost bigger than the pool left cannot fire at all.
+    float energyUsage = 0;
     float warmCallDown = 4;   // warmupCallDownRate: how fast an interrupted charge bleeds off
     bool warmNoReset = false; // warmupNoReset: the charge survives between barrages
     // limitingRange / limitingMinRange / canAttackMaxAngle: what this barrel may hit and how well it
@@ -41,9 +154,72 @@ struct TurretTpl {
     // RWX [turret_N]: idle rest angle relative to the hull, and whether the turret returns to it
     float idleDir = 0;
     bool shouldResetTurret = true;
+    // [turret_N] idleSweepAngle (TurretConfig.java:220-222,518-536) -- with no target the barrel rocks
+    // about its rest angle instead of holding it: CustomUnit.b(i,f):3996-4029 walks it out to +angle,
+    // parks, then after idleSweepDelay(+random) ticks flips to -angle and back. idleSweepSpeed is not a
+    // deg/tick of its own -- it is handed to the rotate helper as the tick scale (:4011-4013), so the
+    // whole turnSpeed/acceleration dynamics run that fraction as fast. addRandomDelay defaults to -1 and
+    // is resolved at parse time to 1 / 5 / 20 by the size of the delay (:524-532).
+    float idleSweepAngle = 0;
+    float idleSweepDelay = 10;
+    float idleSweepSpeed = 0;
+    float idleSweepAddRandomDelay = -1;
+    float idleSweepAddRandomAngle = 0;
+    // idleSweepCondition is a LogicBoolean; the only shipped shape is `if not self.isMoving()`
+    // (mech_gun, mech_bunker), read into the same atom list the unload condition uses. Empty = always.
+    UnloadCond idleSweepCond;
+    // [turret_N] aimOffsetSpread, inherited from [attack] when the barrel is not a copyFrom
+    // (TurretConfig.java:331, per-turret override at :487). OrderableUnit.M(i):4812-4827 turns this into
+    // the barrel's aim jitter after every shot: the barrel stops pointing at the hull centre and instead
+    // aims at a whole pixel offset by up to target.radius * spread, which is what spreads a barrage over
+    // the target instead of stacking every round on the same dot. 0.6 by default, so a shell lands
+    // anywhere within 60% of the target's radius; only aaBeamGunship and turret_t2_flame set 0.
+    float aimOffsetSpread = 0.6f;
     // RWX shoot_flame built-in effects: 0 none, 1 small, 2 medium, 3 large (flame.png frames)
     int shootFlame = 0;
+    // ... and the rest of the same spawn list, which is where smoke, shockwave and every CUSTOM:name entry
+    // lands, along with a second flame size should an ini ever ask for one.
+    std::vector<FlameSpec> flames;
+    // [turret_N] shoot_light (TurretConfig.java:424) is a colour, not a spawn list: CustomUnit:1590-1591
+    // answers it with createLightEffect on the muzzle point, which runs before the shoot_flame list.
+    uint32_t shootLight = 0;
     bool canAttackFlying = true, canAttackLand = true, canAttackUnderwater = false;
+    // [turret_N] canAttackNotTouchingWaterUnits (TurretConfig:437, always-true folded back to null at :577)
+    // is the fourth domain test and it is measured on the target's *height over a water tile*, not on its
+    // movement type: CustomUnit:1308 rejects a land-domain target unless isTouchingWater (BaseUnit:2082,
+    // water tile and posZ<=2). Written false by the subs' barrels, so a submarine can chew a surface ship
+    // but cannot touch a tank standing on the shore -- while flying and submerged targets still pass, since
+    // those two domains return before this test is ever reached (:1296-1305).
+    bool canAttackNotTouchingWater = true;
+    // [turret_N] laserDefenceEnergyUse (TurretConfig.java:503-507) bolts a point-defence beam on the barrel:
+    // every tick it may shoot one incoming round down and pays this much off the unit's energy pool for it.
+    // The key is `null` when absent -- it is a Float, not a float -- and setting it registers the very same
+    // ProjectileInterceptorHook that carries the tag hunt below, which is why both passes share a loop here
+    // (:22-35 for the beam, :36-38 for the hunt). Five shipped designs use it, all of them on an invisible
+    // `canShoot : false` barrel, so the beam is not a weapon: no cooldown, no warmup and no attack target.
+    // The beam reaches [turret] limitingRange when the barrel names one -- every shipped barrel does, at 160
+    // for the spider module, carrier and experimental spider, 140 for the landed gunship and 80 for the heavy
+    // artillery -- and the hull's [attack] maxAttackRange otherwise (OrderableUnit.m():1636-1638). Of the five
+    // only four can actually shoot: the landed gunship writes no [core] energyMax, and the gate is a pool above
+    // zero (ProjectileInterceptorHook.b():22).
+    bool laserDefence = false;
+    float laserDefenceEnergyUse = 0;
+    // [turret_N] interceptProjectiles_withTags (TurretConfig.java:508-514) turns the barrel into a
+    // projectile hunt: the tag list is the switch, and the three geometry keys below are only read inside
+    // that branch, so an ini that names tags still gets RWX's own defaults for the distances. Five shipped
+    // designs use it -- the antiNukeLauncherC silo at 1000/2200/50, the modular spider's anti-nuke module at
+    // 1000/1500/50, and the experimental carrier, gunship and nautilus at 500/1600 or 1100/50 -- eight store
+    // entries, because the gunship's landed variant and the nautilus's land and surface variants each
+    // re-declare the same [turret_antiNuke]. All of them hunt `nuke` tagged shots and three sit on
+    // canShoot:false barrels, which is why the runtime hunt ignores that key. Runtime is
+    // ProjectileInterceptorHook.a():41-66; see Game::updateInterceptors.
+    std::vector<std::string> interceptTags;
+    // ..._andTargetingGroundUnderDistance: the quarry's own ground aim point has to lie this close to the
+    // barrel, which is what makes an anti-nuke defend its neighbourhood instead of meeting a rocket
+    // anywhere on the map. A negative value means the test is not run at all.
+    float interceptGroundUnder = -1;
+    float interceptUnder = 2000;        // ..._andUnderDistance: how close the quarry itself must be
+    float interceptOverHeight = -999;   // ..._andOverHeight: how high it must already have climbed
 };
 
 struct ProjectileTpl {
@@ -77,6 +253,16 @@ struct ProjectileTpl {
     float targetSpeed = -1, targetSpeedAccel = 0.1f, speedSpread = 0;
     // instant: the shot never moves and lands on the firing tick (Projectile.update:841,979)
     bool instant = false;
+    // [projectile_N] deflectionPower (CustomProjectileTemplate.java:71 into ProjectileTemplate.java:77, whose
+    // default is 1.0) is how many times a laser defence beam has to hit this round before it goes down:
+    // CustomUnit.java:1401-1404 reads it one way only -- below 0.5 the round is immune outright, otherwise the
+    // value is the round's deflection health, which LaserDefense.attackTarget:298-300 cuts by 1.01 per beam
+    // hit. So the default of 1.0 means an ordinary round dies to the first hit, and the 19 `deflectionPower :
+    // -1` lines among the 22 the shipped data writes (31 store entries once copyFrom hands them to the
+    // nautilus, gunship and spider variants -- the nuke, both anti-nuke missiles, the fabricator shells, the
+    // flame gel and the torpedoes) mean the beam cannot touch it at all. The bomber's two guns at 3 and the
+    // carrier's one round at 2 shrug off that many hits.
+    float deflectionPower = 1.0f;
     // wobbleAmplitude (px per tick sideways) / wobbleFrequency (ticks per full sine)
     float wobbleAmp = 0, wobbleFreq = 5;
     // autoTargetingOnDeadTarget: once the chased unit is gone the shot looks for a new enemy around
@@ -86,6 +272,31 @@ struct ProjectileTpl {
     // areaExpandTime: the splash ring grows from nothing to areaRadius over these ticks and each
     // unit is caught once (Projectile.b(f2):1443 with the Projectile.ap list)
     float areaExpandTime = -1;
+    // [projectile_N] friendlyFire (:60-68) is one key with two shapes: the string "only-ignoreEnemy"
+    // sets l, and anything else that parses as a boolean sets k and clears l. CustomUnit.java:
+    // 1387-1392 turns them into the shot's aa/ab -- l means "allies only", otherwise aa = !k, i.e. a
+    // weapon that ignores nobody's team colours needs k set. Projectile.b(:1469-1481) is the reader:
+    // a same-colour hull survives unless aa is clear, a different-colour one unless ab is.
+    // fabricatorT1.ini:106 and nuke_launcher.ini:208 are the only shipped users, both `true`.
+    bool friendlyFire = false;              // k
+    bool friendlyFireIgnoresEnemy = false;  // l
+    // areaHitAirAndLandAtSameTime (:69) is m, and CustomUnit.java:1394-1397 answers it by forcing
+    // ad true / ae false, which is the only way past the height gate the constructor sets at
+    // Projectile:196 (ae starts true, so by default an air burst spares the ground and a ground burst
+    // spares the aircraft).
+    bool areaHitAirAndLandAtSameTime = false;   // m
+    // areaHitUnderwaterAlways (:70) -> ac: the burst reaches a hull more than 5px under the surface
+    // only when the weapon asks (Projectile:1482).
+    bool areaHitUnderwaterAlways = false;       // n
+    // areaDamageNoFalloff (:57) -> g: the ring pays the full areaDamage to every hull in it, at any
+    // distance (Projectile.a:1514-1516).
+    bool areaDamageNoFalloff = false;           // g
+    // areaIgnoreUnitsCloserThan (:58) -> j: a hull nearer to the blast than this takes nothing at all
+    // (:1503), which is how a self-detonating weapon spares the thing that detonated it.
+    float areaIgnoreUnitsCloserThan = 0;        // j
+    // areaRadiusFromEdge (:59) -> h: the ring is measured to the target's hull edge, not its centre,
+    // and the broad query that feeds it widens by 150px to catch the big ones (:1445-1447, :1493-1502).
+    bool areaRadiusFromEdge = false;            // h
     // buildingDamageMultiplier: only scales damage dealt to buildings (Projectile.a:228)
     float buildingDamageMult = 1;
     // How a shot spends itself against a shielded hull (BaseUnit.setTarget:1567-1589): it drains
@@ -95,6 +306,23 @@ struct ProjectileTpl {
     float shieldDamageMult = 1, shieldDeflectMult = 1, hullDamageMult = 1;
     float armourIgnore = 0;
     bool largeHit = false;
+    // [projectile_N] flameWeapon (CustomProjectileTemplate.java, copied at CustomUnit.java:1377): the hit
+    // drops a short fire emitter instead of any blast (Projectile.java:1163-1166).
+    bool flameWeapon = false;
+    // [projectile_N] explodeEffect / explodeEffectOnShield (CustomProjectileTemplate.java:236-243) are the
+    // same spawn-list grammar as shoot_flame, run at the impact point with the *victim* as the GameObject
+    // (Projectile.java:1045-1070), so an attached effect rides the hull that was hit. Presence matters as
+    // much as content: a list that exists -- even `NONE`, RWX's noneSpawnItems sentinel -- replaces the
+    // generic blast outright (:1170, :1173, :1186), which is what the two `has` flags decide. A victim
+    // carrying more than 10 shield swaps to the OnShield list, and when that one is absent RWX draws a
+    // small pale flash instead (:1151-1162).
+    bool hasExplodeEffect = false, hasExplodeEffectOnShield = false;
+    std::vector<FlameSpec> explodeEffect, explodeEffectOnShield;
+    // [projectile_N] effectOnCreate (CustomProjectileTemplate.java:153-156) is the same grammar again, run
+    // once at the muzzle with the SHOT as the GameObject (CustomUnit.java:1468-1469) rather than a hull, so
+    // an attached entry rides the round downrange and ends when the round does.
+    bool hasEffectOnCreate = false;
+    std::vector<FlameSpec> effectOnCreate;
     // targetGround (CustomProjectileTemplate.java:48): the shot is never guided onto the unit. The
     // firing code freezes a lead-predicted ground point instead (CustomProjectileTemplate.a():377-405)
     // and leaves Projectile.l null, so only the splash can hurt anything. targetGroundSpread (:224)
@@ -112,9 +340,66 @@ struct ProjectileTpl {
     // means "leave the shot's own 40 / 60" (CustomUnit.java:1490-1495 with Projectile:204-205).
     bool ballistic = false;
     float ballisticDelayHeight = -1, ballisticHeight = -1;
+    // [projectile_N] tags (CustomProjectileTemplate.java:251) is an AnimationTag name list, copied onto
+    // every shot at CustomUnit.java:1503. RWX uses tags for animations and for the retargeting filters;
+    // the one shipped use that reaches gameplay is the [turret_N] interceptProjectiles_withTags hunt
+    // below, which is why nuke_launcher.ini:167 marks its rocket `nuke`. AnimationTag.a():33-51 splits on
+    // commas, drops empty names and lowercases the rest, and an empty list is read as no tags.
+    std::vector<std::string> tags;
+    // interceptProjectile_removeTargetLifeOnly (:56) -- what an interceptor round does to its quarry: the
+    // default destroys the chased shot (Projectile.b():303-317, which plays that shot's own detonation
+    // effect), while this instead zeroes its remaining life so Projectile.update:1411 simply drops it.
+    bool interceptRemoveTargetLifeOnly = false;
+    // [projectile_N] spawnProjectilesOnEndOfLife (CustomProjectileTemplate.java:166, read by
+    // UnitSpawnList.b():26-113 and run at Projectile.update:1411-1415) turns a round that flew out its
+    // `life` short of its target into one or more fresh rounds at the same point. The shipped data uses it
+    // as a two-stage missile: heavy_sub.ini:120 fires a 30-tick torpedo that becomes a 300-tick, 6 deg/tick
+    // `torpedoLocked`, and nautilus.ini:372 launches a life 0, damage 0 carrier round that immediately
+    // splits into two 123-damage `scoutBotProjectileSplit`, each of which relaunches itself as the 9 deg/tick
+    // `scoutBotProjectileSplitFastTurn` at 90 ticks. `spawnProjectilesOnExplode` and `...OnCreate` (:167,
+    // :168) are the same list shape at the other two moments; no shipped weapon writes either.
+    struct SpawnEntry {
+        std::string name;          // the [projectile_*] section, matched case-insensitively (UnitSpawnList:63)
+        int proj = -1;             // resolved index into UnitTemplate::projectiles; -1 stays unbuilt, as RWX logs it
+        int count = 1;             // `name*3` (:52-56, the entry simply runs three times)
+        float chance = 1.0f;       // spawnChance
+        int maxPerCall = 2000000000;  // maxSpawnLimit, RWX's Integer.MAX_VALUE
+        int recursionLimit = 3;    // recursionLimit, measured against the round's own generation
+        float offsetX = 0, offsetY = 0;   // offsetX/offsetY, also spelt xOffsetAbsolute/yOffsetAbsolute
+        float offsetZ = 0;         // offsetHeight
+        float offsetDir = 0;       // offsetDir, degrees
+        float relX = 0, relY = 0;  // xOffsetRelative/yOffsetRelative, along and across the incoming heading
+        float rndX = 0, rndY = 0;  // offsetRandomX/offsetRandomY (offsetRandomXY sets both)
+        float rndDir = 0;          // offsetRandomDir, degrees either side
+    };
+    std::vector<SpawnEntry> onEndOfLife;
+
+    // UnitSpawner.b():47-171, the grammar of a [projectile_N] spawnUnit value. SpawnConfig.java:49-77 is the
+    // defaults this mirrors: count 1, chance 1.0, limit Integer.MAX_VALUE, every offset 0, every flag false.
+    // RWX's two parsers are near-clones of each other and this deliberately stays a second one rather than a
+    // shared abstraction -- the key sets differ (no recursionLimit or relative offsets here, but team, overlap
+    // and falling flags instead) and each mirrors its own Java line-for-line.
+    struct SpawnUnit {
+        std::string name;          // a unit type name, matched case-insensitively (:66-70)
+        std::string addResources;
+        int count = 1;             // `name*3` (:71-77)
+        float chance = 1.0f;       // spawnChance (:98)
+        int maxPerCall = 2000000000;  // maxSpawnLimit (:100, RWX's Integer.MAX_VALUE)
+        float offsetX = 0, offsetY = 0;   // offsetX/offsetY (:122-125)
+        float offsetZ = 0;         // offsetHeight (:131)
+        float offsetDir = 0;       // offsetDir, degrees (:135)
+        float rndX = 0, rndY = 0;  // offsetRandomX/offsetRandomY (offsetRandomXY sets both, :126-130)
+        float rndDir = 0;          // offsetRandomDir, degrees either side (:133)
+        bool neutralTeam = false;        // (:88, TEAM_ALL -- RP has no neutral team, see Game::spawnUnitsOnHit)
+        bool aggressiveTeam = false;     // (:92, TEAM_UNKNOWN, same story)
+        bool toLastAttackerTeam = false; // setToTeamOfLastAttacker (:90)
+        bool skipIfOverlapping = false;  // (:106)
+        bool startDirAtZero = false;     // alwaysStartDirAtZero, and RWX's typo alias (:116-121)
+    };
+    std::vector<SpawnUnit> spawnUnits;
 };
 
-struct BuildOption { std::string unitName; float pos = 1; };
+struct BuildOption { std::string unitName; float pos = 1; std::string visible; bool forceNano = false; };
 
 // One keyframe of a body animation. `t` is in ticks: a key written "0.8s" is 48 (the trailing 's' is
 // worth 60, IniFile.parseUnitValue:761-783), and the animation clock steps by 1 per logic tick because
@@ -122,18 +407,21 @@ struct BuildOption { std::string unitName; float pos = 1; };
 // (GameLogic.java:1495-1523, where gameTimeMillis grows by f * 16.666666).
 struct AnimKey { float t = 0, v = 0; };
 
-// RWX AnimationConfig (units/custom/AnimationConfig.java) cut down to the two key lists that move the
-// hull sprite: the frame index (CustomUnit.animationFrameIndex) and a scale that multiplies
-// [graphics] imageScale (CustomUnit.getDrawScale:2328 `imageScale * currentFrameTime`). Both ini forms
-// compile to this: the old-style [graphics] animation_moving_* keys build the lists straight from
-// start/end/speed/scale_start/scale_end (AnimationConfig.java:103-146) and a [animation_*] section
-// spells them out as body_0.8s : {frame:3} keyframes instead (AnimationConfig.a():211-248).
-struct BodyAnim {
-    std::vector<AnimKey> frame, scale;   // CustomUnitAnimationSet.e, sorted by time
-    float maxTime = 0;                   // AnimationConfig.n, the loop length in ticks
-    bool pingPong = false;               // AnimationConfig.g
+enum class LegAnimProperty { X, Y, DIRECTION, HEIGHT, ALPHA };
+struct LegAnimTrack {
+    int index = -1;
+    LegAnimProperty property = LegAnimProperty::X;
+    std::vector<AnimKey> keys;
+};
 
-    bool valid() const { return !frame.empty() || !scale.empty(); }
+struct BodyAnim {
+    std::vector<AnimKey> frame, scale;
+    std::vector<LegAnimTrack> legs;
+    float maxTime = 0;
+    float blendIn = 0, blendOut = 0, queuedUnitPlayAt = 0;
+    bool pingPong = false;
+
+    bool valid() const { return !frame.empty() || !scale.empty() || !legs.empty(); }
     // CustomUnitAnimationSet.b(time):116-135 -- hold the first and last key, linear in between
     static float valueAt(const std::vector<AnimKey>& k, float t) {
         if (k.empty()) return 0.0f;
@@ -152,27 +440,101 @@ struct BodyAnim {
 
 // [action_upgradeT2] / action_N_* self-actions, e.g. unit upgrades (RWX displayType:upgrade)
 struct UnitAction {
-    std::string convertTo;
-    std::string text;
-    float price = 0;
-    float buildSpeed = 0.001f; // per-tick progress
-    int pos = 0;
+    std::string name, convertTo, text, textUnit, textPostfix, buildAnimation;
+    std::string visible, active, require, autoTrigger, events, tags;
+    std::string addResources, setStats, triggerActions, queueActions, triggerCondition;
+    std::string messageTo, messageTags, playAnimation;
+    std::vector<FlameSpec> effects;
+    float price = 0, buildSpeed = 0.001f, pos = 0;
+    float setBuilt = -1, cooldown = 0, allCooldown = 0, addEnergy = 0;
+    float parentShield = 0;
+    int checkRate = 1;
+    bool hidden = false, supported = true, cannotMove = false, highPriority = false;
+};
+
+struct LegTpl {
+    std::string name;
+    bool placeholder = true;
+    bool isLeg = true, hidden = false;
+    float x = 0, y = 0;
+    float attachX = 0, attachY = 0;
+    float liftHeight = 2, targetHeight = 0;
+    bool targetHeightRelative = true;
+    float endDirOffset = 0, resetAngle = 0;
+    bool lockMovement = false;
+    float estimatingMultiplier = 1, alpha = 1;
+    float moveSpeed = 1, moveWarmUp = 0, rotateSpeed = 3;
+    std::string imageLeg, imageFoot, imageShadow;
+    bool footTeamColors = false, legTeamColors = false;
+    float heightSpeed = 0.3f;
+    bool drawFootOnTop = false, dust = true;
+    bool drawLegZoomedOut = true, drawFootZoomedOut = true, explicitZoom = false;
+    float holdDisMin = 7;
+    int maxMovingLegs = 3;
+    bool holdMoveOnlyIfFurthest = true, checkNeighbours = true, favourOpposite = false;
+    float holdDisMax = 16, hardLimit = 50;
+    bool drawOverBody = false, drawUnderAllUnits = false;
+    float drawDirOffset = 0, spinRate = 0;
+    std::vector<int> neighbours;
+};
+
+struct AttachmentTpl {
+    std::string name, showActions;
+    std::vector<ProjectileTpl::SpawnUnit> spawn;
+    float x = 0, y = 0, height = 0, idleDir = 0, reverseDir = 0;
+    bool rotateWithParent = true, lockRotation = false, resetRotation = false;
+    bool lockLegs = true, freezeLegs = false;
+    bool damageable = false, unselectable = true, untargetable = true;
+    bool visible = true, hidden = false, showMiniHp = true, hideHp = false;
+    bool redirectDamage = false, shieldOnly = false, keepAlive = false;
+    bool incompleteWithParent = true, keepOnConvert = false, keepTeam = false;
+    bool onTop = true, onBottom = false, addTransported = false;
+    bool canAttack = true, prioritizeTarget = true, onlyParentTarget = false;
+    bool alwaysParentTarget = false;
 };
 
 struct UnitTemplate {
     std::string name;
+    std::vector<std::string> tags;
+    std::vector<AttachmentTpl> attachments;
+    bool unselectable = false, untargetable = false, cannotBeAttacked = false;
+    bool disableDeathOnZeroHp = false;
+    float autoCooldown = 60, fallingAcceleration = 0.03f;
+    int autoCheckRate = 1;
     std::string overrideName;
     std::string displayText;
     std::string image, imageWreak, imageTurret;
     // RWX [graphics] image_shadow: "AUTO" = the body silhouette in black, offset by shadowOffsetX/Y world px
     std::string imageShadow;
     float shadowOffX = 0, shadowOffY = 0;
+    // [graphics] image_offsetX/Y/H (:1312-1316) are only ever read through CustomUnit.getUnitBounds():2834-2840,
+    // which slides the view-space body rect by (offsetX, offsetY - offsetH) -- and every caller of that rect is a
+    // draw method (CustomUnit.c():2426, OrderableUnit:4371, BaseBuilding.c():346/d():364, Tree.c():212,
+    // FireUnit.c():230). The hull sprite is drawn *into* that rect, so the art slides off the hit-box while the
+    // shadow (:2405), the shield bubble (:2510, plain pos/posZ) and the turret pivots stay where they are.
+    // A wreck takes the other branch (:946-951 sets ew, drawn at plain pos at :2417-2423), so it ignores this.
+    int imageOffsetX = 0, imageOffsetY = 0;
+    float imageOffsetH = 0;
+    bool hasImageOffset = false;
+    // getUnitBounds():2837 -- hasImageOffset is what gates the whole translate.
+    float bodyOffsetDrawX() const { return hasImageOffset ? (float)imageOffsetX : 0.0f; }
+    float bodyOffsetDrawY() const { return hasImageOffset ? (float)imageOffsetY - imageOffsetH : 0.0f; }
     // [graphics] lock_body_rotation_with_main_turret (:1583) draws the body sprite along the main
     // turret's aim instead of the heading the unit travels on (CustomUnit.getRenderRotation:2345-2347),
     // so a bug or mech keeps facing its prey while strafing past it. Only the sprite turns -- the hull's
     // game rotation still drives movement and turret pivots. lock_shadow_rotation_with_main_turret
     // (:1584) does the same for the shadow and takes the body's value as its default.
     bool lockBodyRot = false, lockShadowRot = false;
+    // [graphics] lock_leg_rotation_with_main_turret (:1585) -- the leg rig aims along the main turret
+    // instead of the heading (CustomUnitLegController.java:32-34, :150-152).
+    bool lockLegRot = false;
+    std::vector<LegTpl> legs;
+    // RWX bakes ten variants of every hull sprite (PlayerTeam.getTeamColorTextures():1421-1508) and draws the
+    // one at the owner's colour index, so a red team's tank really is dyed red. Index 0 is the raw art, which
+    // is why the green team looks undyed. CustomUnitConfigParser.java:1405 always builds the hull array.
+    int teamColoringMode = kTCModePureGreen;
+    // :1406-1408 -- the [graphics] image_turret array is only baked when this is on *and* image_turret exists.
+    bool teamColorsOnTurret = false;
     std::string sourceDir;   // directory of the ini, for image resolution
 
     float price = 100, maxHp = 100, mass = 1000;
@@ -194,15 +556,94 @@ struct UnitTemplate {
     bool shieldOnlyDeflectionFlash = false;   // shieldDisplayOnlyDeflection
     bool showShieldBar = true;                // [graphics] showShieldBar
     std::string imageShield;                  // [graphics] image_shield, empty = drawable/shield_mid.png
+    // RWX [core] energy (CustomUnitStats.maxEnergy, read at CustomUnitConfigParser:1689-1694): a second
+    // pool that weapons spend from instead of credits. energyRegen refills it per tick; once a shot has
+    // drained the pool below what the next shot needs, energyNeedsToRechargeToFull latches the unit off
+    // until the pool is whole again and refills it at energyRegenWhenRecharging (default the same rate).
+    // dieOnZeroEnergy kills the unit instead of parking it at an empty pool.
+    float maxEnergy = 0;
+    float energyRegen = 0;
+    float energyStartingPercentage = 1.0f;
+    float energyRegenWhenRecharging = 0;
+    bool energyNeedsToRechargeToFull = false;
+    bool dieOnZeroEnergy = false;
+    bool startEnergyAtZero = false;
+    bool showEnergyBar = true;                // [graphics] showEnergyBar, :1951
     // [core] armour: a flat amount taken off every hit before the shield, with armourMinDamageToKeep
     // as the floor so weak weapons still chip away.
     float armour = 0, armourMinKeep = 1;
     int techLevel = 1;
     float buildSpeed = 0.001f;
+    // [core] nanoFactorySpeed (CustomUnitConfigParser.java:1779, default 1.0): a multiplier on the whole
+    // production queue, applied by FactoryQueueManager.a:249 as `action buildSpeed * nanoFactorySpeed *
+    // tick` to the *producer's* progress. It belongs to whoever builds, not to what is built, so a mobile
+    // factory like the nautilus (2) churns out lightSubs twice as fast as a seaFactory does.
+    float nanoFactorySpeed = 1.0f;
+    // [core] exit_moveAwayAmount / exit_dirOffset (CustomUnitConfigParser.java:1717-1720). A finished
+    // queue item is born 5 px south of its producer's centre (FactoryQueueManager.a:135-136) and
+    // immediately ordered down the exit line for exit_moveAwayAmount pixels -- 70 by default, and the
+    // reason RWX's carriers and gunships raise it to 140 to throw their launches clear of the hull. The
+    // line is the hull angle + exit_dirOffset + 90 for a building and plain 90 for anything else, because
+    // CustomUnit.a:4300-4310 only reads dirOffset `if (unitConfig.isBuildingUnit && ... != null)`.
+    // (exit_x/exit_y/exit_heightOffset are below: the factory path only ever reads them through
+    // HovercraftUnit.a, while the transport-unload place uses all three.)
+    float exitDirOffset = 0, exitMoveAway = 70;
+    bool exitDirSet = false;
+    // [core] exit_x / exit_y / exit_heightOffset / exitHeightIgnoreParent (CustomUnitConfigParser.java
+    // :1715-1719). The unload point is this offset from the carrier's centre, rotated into the carrier's
+    // frame by CustomUnit.b():728-731 as `pos + (cos(a)*exit_y - sin(a)*exit_x, sin(a)*exit_y +
+    // cos(a)*exit_x)` with a = hull angle + exit_dirOffset (180 degrees when the key is absent, :721-723)
+    // -- note the two axes swap, so exit_y is the along-the-nose distance and exit_x the sideways one.
+    float exitX = 0, exitY = 9, exitHeightOffset = 0;
+    bool exitHeightIgnoreParent = false;
+
+    // ---- transport (CustomUnit.java:312-456, 718-809, 1953-1980) ----
+    // [core] maxTransportingUnits (:1818) is the cargo capacity in *slots*, not in units: a hull occupies
+    // its own [core] transportSlotsNeeded (:1846, default 1) unless the carrier sets
+    // transportUnitsEachUnitAlwaysUsesSingleSlot (:1830). So a dropship's 12 slots hold twelve tanks or
+    // one experimental spider (8) plus a mech (2) plus a builder (2).
+    int maxTransportingUnits = 0;
+    int transportSlotsNeeded = 1;
+    bool transportEachUnitSingleSlot = false;
+    // transportUnitsRequireMovementType (:1824-1828) restricts the cargo to the listed movement types.
+    // Empty = anything, which is what the two defaults below key off.
+    std::vector<MoveType> transportRequireMovementType;
+    // transportUnitsBlockAirAndWaterUnits (:1831, default true only when no movement type is listed) drops
+    // aircraft and ships; transportUnitsBlockOtherTransports (:1832, default true) stops one transport
+    // boarding another. Both are applied by GameViewUtils.a():119-130, which also rejects a target that is
+    // a building, already riding, or attached to something.
+    bool transportBlockAirAndWater = true, transportBlockOtherTransports = true;
+    // transportUnitsUnloadDelayBetweenEachUnit (:1822, getTime, 30 ticks): how often one hull is put down
+    // while unloading. transportUnitsKeepWaypoints (:1835) leaves the cargo's orders alone instead of
+    // clearing them and giving the exit-line move. transportUnitsKillOnDeath (:1834, default true) takes
+    // the cargo down with the carrier, and transportUnitsHealBy (:1836) mends it per tick while aboard.
+    float transportUnloadDelay = 30;
+    bool transportKeepWaypoints = false, transportKillOnDeath = true;
+    float transportHealBy = 0;
+    // transportUnitsKeepBuiltUnits (:1833) makes a mobile factory load what it builds instead of setting it
+    // down; it only matters for a hull that is both a factory and a transport.
+    bool transportKeepBuiltUnits = false;
+    UnloadCond transportCanUnload;
+    // [graphics] showTransportBar (:1953, default true) -- whether the cargo readout is drawn over the
+    // carrier (CustomUnit.getTransportedUnitsWeight:531-544 returns -1 without it).
+    bool showTransportBar = true;
     bool isBuilding = false, isBuilder = false, isFactory = false;
     int footL = 0, footU = 0, footR = 0, footD = 0; // footprint in tiles (relative to center tile)
+    // RWX BaseUnit.getTileOffsetX/Y (:2338-2345) answer halfTileWorldSize, and CustomUnit.getTileOffsetX/Y
+    // (:4092-4101) overwrite that answer with [core] buildingToFootprintOffsetX/Y (parsed :1709-1710, and
+    // the parse default is the same 10 px). The offset is how far a building's position sits inside its
+    // footprint's top-left tile corner: placement adds it (BaseBuilding.canBuildingBePlacedAt:72-74,
+    // CustomUnitConfig:1301) and the tile index subtracts it again (BaseUnit.a(TileMap,Point):2355-2358).
+    // turret_common_land and its four anti-air children ask for 20, laboratory for offsetY 0, so a hull
+    // that ignores the key lands 10 px off its RWX art while still blocking the same tiles.
+    float buildingToFootprintOffsetX = TILE_SIZE * 0.5f;
+    float buildingToFootprintOffsetY = TILE_SIZE * 0.5f;
+    // The world position a building takes when its footprint's top-left tile is (tx,ty).
+    Vec2 footprintPos(int tx, int ty) const {
+        return { tx * (float)TILE_SIZE + buildingToFootprintOffsetX,
+                 ty * (float)TILE_SIZE + buildingToFootprintOffsetY };
+    }
     float fogSight = 0;
-    float energyUse = 0;
     // RWX [core] explodeOnDeath (default true) / hideScorchMark: an exploding unit leaves a
     // permanent ground mark (ScorchMark.java) unless it is hidden or died over water.
     bool explodeOnDeath = true;
@@ -220,18 +661,49 @@ struct UnitTemplate {
     // [animation_build] onActions: underConstructionWithLinkedBuiltTime -- CustomUnit.java:1791-1795
     // pins the clock to buildProgress instead of ticks, so a foundation pops from scale 0 to 1.2 as it
     // is paid for. `animUnderConstruction` is the :1788-1790 variant, driven by ticks at priority 8.
-    BodyAnim animBuild, animUnderConstruction;
+    BodyAnim animBuild, animUnderConstruction, animQueued;
+    std::map<std::string, BodyAnim> animations;
     std::string drawLayer;
+    bool dustEffect = false, splashEffect = false;
+    bool dustEffectReverse = true, splashEffectReverse = true;
+    std::vector<FlameSpec> movementEffect, movementEffectReverse;
+    float movementEffectRate = 11.0f;
+    bool movementEffectReverseFlipEffects = false;
 
     bool canAttack = false;
     bool canAttackFlying = false, canAttackLand = true, canAttackUnderwater = false;
+    // [attack] canAttackNotTouchingWaterUnits (parser:2291-2293, where a written `true` is thrown away and
+    // reads back as the default). OrderableUnit.canAttackUnitType:3356 puts it between the flying/underwater
+    // domains and canAttackSurfaceUnits, so a sub with `false` acquires only targets standing in water --
+    // isTouchingWater is BaseUnit:2082's water-tile-and-posZ<=2 test, not a movement type. See TurretTpl's
+    // copy of this flag for the identical firing-side gate at CustomUnit:1308.
+    bool canAttackNotTouchingWater = true;
     bool isFixedFiring = false;
+    // [attack] turretMultiTargeting (CustomUnitConfigParser.java:2030): with more than one barrel the
+    // unit lets each barrel keep its own locked target instead of every barrel following the order
+    // target -- and only for barrels that cannot engage the order target at all (see
+    // OrderableUnit.syncAttackTargetToMovementLevels:3072-3105). CustomUnit.java:4218 gates it behind
+    // getTechLevel() > 1, i.e. it does nothing for a single-barrel hull.
+    bool turretMultiTargeting = false;
     // [attack] turretRotateWithBody: the hull's turn is added to every barrel's aim (default true)
     bool turretRotateWithBody = true;
     // RWX parser defaults: CustomUnitConfigParser.java:2042 (shootDelay 50 ticks), :2015
     // (turretTurnSpeed 8 deg/tick), :1959-1961/:2008-2009 (every numeric [movement] key is 1.0f),
     // :1774 (nanoRepairSpeed 0.2 hp/tick).
-    float attackRange = 0, shootDelay = 50, turretSize = 0, turretTurnSpeed = 8;
+    float attackRange = 0, shootDelay = 50, turretSize = 1.0f, turretTurnSpeed = 8;
+    // [attack] aimOffsetSpread (:2041, default 0.6f) -- the hull-wide aim jitter every barrel inherits at
+    // TurretConfig.java:331. See TurretTpl::aimOffsetSpread for what it does.
+    float aimOffsetSpread = 0.6f;
+    // [attack] isMelee (:2046-2056) installs no damage rule at all. It turns meleeEngangementDistance on,
+    // which is 250 unless the ini overwrites it and stays 0 for a non-melee hull (writing the distance
+    // without isMelee:true is a parse error in RWX), and that bonus has exactly two consumers:
+    // getPassiveTargetSearchRangeBonus:4625 feeds it to getTargetSearchRange:3475, so a bug with a 9px
+    // bite *notices* a tank from 259px away, and isChaseAttackMode:4631 answers true, which at
+    // updateAttackTargeting:3215-3220 paths the hull onto the target with pathTargetRadius 0 instead of
+    // stopping at range. What it does NOT do is lengthen the bite: a melee hull still only fires inside
+    // getEngagementRange:4482, which adds the two hull radii to maxAttackRange for melee and nothing else.
+    bool isMelee = false;
+    float meleeRange = 0;
 
     MoveType moveType = MoveType::NONE;
     float moveSpeed = 1, accel = 1, decel = 1, maxTurnSpeed = 1, turnAccel = 1;
@@ -242,6 +714,13 @@ struct UnitTemplate {
     // velocity with a 1.41x steering rate and no throttle ramp (:893-918, :3009-3010) -- glide, not
     // strafing. Both default false.
     bool moveIgnoringBody = false, moveSlidingMode = false;
+    // [movement] landOnGround (:1982-1991) takes true / false / onlyIdle, and only an AIR hull reads it:
+    // CustomUnit.update:2003-2007 lets one settle down to posZ 2 once it has stood still for more than
+    // three ticks off open water, with onlyIdle adding "and no waypoint left" (:2005). That is not just
+    // cosmetic, because isAirborne is a height test (i():636-638) -- a landed bomber is ground for every
+    // turret's domain check, so ordinary land guns can hit it. bugFly, bugPickup and bomber use it; the
+    // gunships write false.
+    bool landOnGround = false, landOnGroundOnlyIdle = false;
     // [movement] targetHeight / targetHeightDrift / heightChangeRate / startingHeightOffset
     // (CustomUnitConfigParser.java:1993-2006). An AIR hull cruises at targetHeight and bobs a sine of
     // +-targetHeightDrift around it; both default to 35 and 1.5 for air and 0 otherwise. A negative
@@ -264,6 +743,33 @@ struct UnitTemplate {
     // (isUnrepairableUnit), plus nanoRangeForRepair (:1760-1763, unset -1 means use nanoRange).
     bool canRepairBuildings = false, canRepairUnits = false, isUnrepairableUnit = false;
     float nanoRangeForRepair = 0;
+    // [core] autoRepair (:1748-1750) is not a self-heal and not a rate: writing it true bolts
+    // AutoRepairRenderHook.a onto the hull, and that hook's b():14-20 spends its whole body as a timer --
+    // every 40 ticks, and only while the hull has no waypoint to follow, it runs RepairBay.a(this, f, 0,
+    // false), the very search the repair bay building uses. That search (AutoRepairCallback:71-95) walks
+    // friendlies inside y() (nanoRange, or BaseUnit's 85 when the ini leaves it out) and picks the *lowest
+    // health* one it may repair, ignoring construction sites that would cost credits (:78-80) and anything
+    // with a resource rate (:89), then queues a repeating repair command. So an idle mech engineer,
+    // gunship, spider or carrier mends the worst-hurt ally nearby instead of standing about; the five
+    // shipped hulls that write it all also say canRepairUnits and canRepairBuildings.
+    bool autoRepair = false;
+    // [core] canReclaimResources (:1807, default false; the shipped data writes it on the four builders and
+    // the bug mod's robotCrab only) is the gate BaseUnit.h(BaseUnit,boolean):3719-3730 puts in front of the
+    // reclaim command, and the three rates below are what it costs. They are not one number:
+    // OrderableUnit.updateRepairOrReclaimCommand:2380-2429 takes [core] nanoUnbuildSpeed (:1777, 1.0 *
+    // 0.001 * 5.1 = 0.0051 of the site per tick) off an unfinished foundation, and [core] nanoReclaimSpeed
+    // (:1775, default nanoRepairSpeed * 5.1) off a finished hull's *health*, or
+    // target.resourceRate * [core] resourceReclaimMultiplier (:1776, CustomUnit.calculateUnitSpeed:2252-2258)
+    // when the target produces credits. Credits come back two different ways (:2405-2446), see reclaimPrice.
+    bool canReclaimResources = false;
+    float nanoReclaimSpeed = 0, nanoUnbuildSpeed = 0.0051f, resourceReclaimMultiplier = 1;
+    // [core] reclaimPrice (:1494) is written by robotCrab alone in the shipped data, and RWX tells "0" from
+    // absent: UnitPrice.b() turns an all-zero string into its non-null empty sentinel (UnitPrice:229-232),
+    // so a hull *with* the key refunds reclaimPrice -- dripped as it dies if it produces credits (:2408-2420)
+    // or paid in full on collapse if it does not (:2432-2435) -- while a hull without it refunds
+    // 80% of its build price on collapse only (:2437-2442).
+    bool hasReclaimPrice = false;
+    float reclaimPrice = 0;
     // [core] selfBuildRate (:1781, getInvertedTime) raises a foundation without a builder
     // (CustomUnit.update:1774-1782); [core] dieOnConstruct (:1782) gives the builder to the site it
     // places (CustomUnit.m():3668-3679).
@@ -272,21 +778,44 @@ struct UnitTemplate {
     // [core] selfRegenRate (:1780, plain getFloat) is HP per tick recovered with no builder and no
     // shield involved; it runs for every live unit, foundation included (CustomUnit.update:1821-1826).
     float selfRegenRate = 0;
+    // [core] nukeOnDeath (:1792-1795, defaults false/250/5400) detonates a nuke under the dying hull
+    // (CustomUnit.java:864-876): NukeLauncher.a(unit, x, y, x, y) with aH cleared so the missile skips its
+    // climb and dives straight onto its own footprints, then Z=range and Y=damage overwrite the defaults.
+    // The blast damages friendlies as readily as enemies (that Projectile carries neither aa nor ab), hits
+    // air and land together (ad=true, ae=false), and its ring grows over the launcher's W=X=75 ticks.
+    bool nukeOnDeath = false;
+    float nukeOnDeathRange = 250, nukeOnDeathDamage = 5400;
+    // :1795 -- this only suppresses the blast while the lobby's "no nukes" room rule is on. Single player
+    // leaves that rule false (RoomSettings default), and RP has no lobby at all, so it is parsed and inert.
+    bool nukeOnDeathDisableWhenNoNuke = false;
 
     std::vector<TurretTpl> turrets;
     std::vector<ProjectileTpl> projectiles;
+    // Every [effect_NAME] section of this unit's ini, in file order -- the pool a shoot_flame (or any other
+    // spawn list) name is looked up in by CustomUnitConfig.resolveEffect:1189-1196.
+    std::vector<EffectTpl> effects;
     std::vector<BuildOption> canBuild;
     std::vector<BuildOption> builtFrom;
     std::vector<UnitAction> actions;
 
     bool placeOnlyOnResPool = false;
     bool placeOnlyOnWater = false; // RWX SeaFactory: must sit on water
+    // [core] generation_credits / generation_resources "credits=8": the lump paid out once per
+    // generation_delay ticks (CustomUnit.update:1869-1884), not a per-second rate -- RWX only divides it
+    // by delay/40 for the HUD readout at getCreditIncomeRate():1214-1219.
     float creditIncomeRate = 0; // for extractors
+    // [core] resourceRate (:1546, plain getFloat, default 0) is a different number from the generation lump:
+    // BaseUnit.getResourceRate()/y() read only this one, so in the shipped data it is nonzero on the crystal
+    // deposit (0.1) and the credit crate (5) and *zero on every extractor*. It is what marks a reclaim target
+    // as sellable (OrderableUnit:2364-2366) and what CustomUnit.calculateUnitSpeed:2252-2258 drains off it.
+    float resourceRate = 0;
+    // [core] generation_delay, default 40 (CustomUnitConfigParser.java:1520-1527); 0 is forced up to 1 and
+    // a negative is a hard parse error there.
+    int generationDelay = 40;
     bool useAsBuilder = false, useAsAttacker = false, useAsHarvester = false;
 
     // resolved texture id (raylib), -1 until loaded / missing
     int texId = -1, texWreakId = -1, texTurretId = -1;
-    mutable int texFrameWpx = 0; // body sprite frame width in px (set by renderer, for pivot scaling)
 
     bool blocksGround() const { return moveType == MoveType::NONE; } // buildings/static
     bool isStatic() const { return moveType == MoveType::NONE; }
@@ -294,6 +823,12 @@ struct UnitTemplate {
     int footprintTilesH() const { return footD - footU + 1; }
     bool isWaterUnit() const { return moveType == MoveType::WATER; }
     bool isAirUnit() const { return moveType == MoveType::AIR || moveType == MoveType::HOVER; }
+    // CustomUnit.canTransportUnits():316-318
+    bool canTransportUnits() const { return maxTransportingUnits > 0; }
+    // GameViewUtils.a():123 blocks aircraft and ships by their *class*, not their height: a hover hull is
+    // a HoverLandUnit, i.e. a LandUnit subclass, so it boards a transport like any tank even though RP's
+    // isAirUnit() lumps it in with the aircraft.
+    bool isAirOrWaterHull() const { return moveType == MoveType::AIR || moveType == MoveType::WATER; }
 };
 
 class TemplateStore {
@@ -309,3 +844,20 @@ public:
 };
 
 extern TemplateStore g_templates;
+
+// UnitSpawnList.b():26-113, the grammar of a spawnProjectilesOn* value: "name, name*3(key = value, ...)".
+// Exposed for the harness in out/sim_main.cpp, which cannot feed it through an ini file.
+std::vector<ProjectileTpl::SpawnEntry> parseSpawnList(const std::string& raw);
+
+// UnitSpawner.b():47-171, the same shape read by [projectile_N] spawnUnit: "name, name*3(key = value, ...)",
+// where "NONE" and a missing string are an empty list again (:50-53). Exposed for the harness too.
+std::vector<ProjectileTpl::SpawnUnit> parseUnitSpawnList(const std::string& raw);
+
+// CustomUnitSpawnList.c():36-59 plus CustomUnitConfig.resolveEffect:1175-1239 for one spawn-list value --
+// [turret_N] shoot_flame and [projectile_N] explodeEffect(OnShield) share the grammar. `effects` is the unit's
+// own [effect_*] pool, which a plain name searches before the built-ins and a CUSTOM: name searches alone.
+// `shootFlame` is TurretState's single flame slot: a barrel passes its address and the first small/medium/large
+// lands there, while a projectile passes nullptr because RWX runs every entry through the same list. A `none`
+// value clears the list, and `missing` counts the names RWX would have thrown ConfigParseException over.
+void parseFlameList(const std::string& raw, const std::vector<EffectTpl>& effects,
+                    int* shootFlame, std::vector<FlameSpec>& flames, int& missing);
