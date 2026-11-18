@@ -55,12 +55,39 @@ TurretTpl& visibleTurret(UnitTemplate& t, float x, float y, float size, const ch
     return t.turrets.back();
 }
 
-ProjectileTpl& shot(UnitTemplate& t, float damage, float speed, int life, int frame = 1) {
+// RWX builds the built-in rounds in Java by poking Projectile fields directly; the field map is
+// (Projectile.java: r/t/U/h/P/x/ar, :858-903 movement):
+//   U = directDamage, t = initial speed, r = target speed (:903), s = speed accel (:903),
+//   h = life, P = sprite frame, x = drawSize, ar = ARGB colour.
+// RP stores colour as 0xRRGGBBAA (parseRgba / Renderer.cpp:826), RWX as 0xAARRGGBB (KoolArgbColor.a),
+// so ARGB -> RP swaps the alpha from the top byte to the bottom one. The JADX build replaces small
+// integers in ar with Android keycode names: STB_INPUT=180, TV_DATA_SERVICE=230, TV_TERRESTRIAL_ANALOG=235.
+// A round with no P is a plain coloured dot in RWX (ProjectileTemplate.java:84) -> frame=-1 here.
+constexpr uint32_t argbToRp(unsigned a, unsigned r, unsigned g, unsigned b) {
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+struct ShotSpec {
+    float damage;        // U
+    float speed;         // t
+    int life;            // h
+    float targetSpeed;   // r, 0 = no acceleration (flies at constant t)
+    float accel;         // s
+    int frame;           // P, -1 = plain dot
+    float drawSize;      // x
+    uint32_t color;      // ar, already argbToRp()
+};
+
+ProjectileTpl& shot(UnitTemplate& t, const ShotSpec& s) {
     ProjectileTpl p;
-    p.directDamage = damage;
-    p.speed = speed;
-    p.life = life;
-    p.frame = frame;
+    p.directDamage = s.damage;
+    p.speed = s.speed;
+    p.life = s.life;
+    if (s.targetSpeed > 0.0f) p.targetSpeed = s.targetSpeed;
+    if (s.accel > 0.0f) p.targetSpeedAccel = s.accel;
+    p.frame = s.frame;
+    p.drawSize = s.drawSize;
+    p.color = s.color;
     t.projectiles.push_back(p);
     return t.projectiles.back();
 }
@@ -114,7 +141,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         waterMovement(t, 1.5f, 0.06f, 0.2f, 2.8f, 0.35f);
         t.canAttack = true; t.attackRange = 120; t.shootDelay = 60; t.turretSize = 12;
         invisibleTurret(t, 0, 0, 12);
-        shot(t, 12, 6, 30);
+        // GunBoat.java:118-135 U=q()=12, t=8, h=30, x=1, ar=a(255,180,180,0) gold dot (no P -> plain).
+        shot(t, {12, 8, 30, 0, 0, -1, 1, argbToRp(255, 180, 180, 0)});
     }
     {
         // BattleShip.java:105-108 radius 20, hp 1200; :51 mass 9000; damage 65, range 240, speed 0.8,
@@ -129,7 +157,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.canAttack = true; t.attackRange = 240; t.shootDelay = 60; t.turretSize = 26;
         visibleTurret(t, 0, -10, 26, "");
         visibleTurret(t, 0, 10, 26, "");
-        shot(t, 65, 5, 80, 2);
+        // BattleShip.java:129-147 U=q()=65, t=4, h=80, x=2, ar=a(255,180,180,0) gold; no P.
+        shot(t, {65, 4, 80, 0, 0, -1, 2, argbToRp(255, 180, 180, 0)});
     }
     {
         // MissileShip.java:81-86 sprite 17x31, radius 15, displayRadius radius-2, hp 350; damage 62,
@@ -143,7 +172,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         waterMovement(t, 1.2f, 0.05f, 0.1f, 1.9f, 0.2f);
         t.canAttack = true; t.attackRange = 200; t.shootDelay = 170; t.turretSize = 14;
         invisibleTurret(t, 0, 0, 14);
-        shot(t, 62, 4, 190, 3);
+        // MissileShip.java:127-134 primary missile U=62, t=2, h=190, ar=a(255,230,230,50) yellow.
+        shot(t, {62, 2, 190, 0, 0, -1, 1, argbToRp(255, 230, 230, 50)});
         st.byName["missileship"] = t;   // UnitTypeEnum.missileShip is the same class
     }
     {
@@ -159,7 +189,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.targetHeight = -8.0f; t.targetHeightDrift = 0.4f;
         t.canAttack = true; t.attackRange = 160; t.shootDelay = 60; t.turretSize = 14;
         invisibleTurret(t, 0, 0, 14);
-        shot(t, 40, 5, 190, 3);
+        // AttackSubmarine.java:356-363 primary torpedo U=42, t=2, h=190, ar=a(255,230,230,50) yellow.
+        shot(t, {42, 2, 190, 0, 0, -1, 1, argbToRp(255, 230, 230, 50)});
     }
     // ------------------------------------------------------------------ air
     {
@@ -173,7 +204,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         airMovement(t, 1.4f, 0.2f, 0.1f, 4.0f, 0.4f);
         t.canAttack = true; t.attackRange = 140; t.shootDelay = 40; t.turretSize = 14;
         invisibleTurret(t, 0, 0, 14);
-        shot(t, 35, 6, 80);
+        // Gunship.java:119-135 U=q()=35, t=4, h=80, x=2, ar=a(255,150,230,40) (blue keycode 230).
+        shot(t, {35, 4, 80, 0, 0, -1, 2, argbToRp(255, 150, 230, 40)});
     }
     {
         // Dropship.java: radius 20, hp 500; :51 mass 16000; range 140, reload 40, speed 2.3, turn 1.4,
@@ -200,7 +232,10 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.canAttack = true; t.isMelee = true; t.meleeRange = 43; t.attackRange = 43;
         t.shootDelay = 17; t.turretSize = 4;
         invisibleTurret(t, 0, 0, 4);
-        shot(t, 20, 6, 20);
+        // Ladybug.java:123-127 a(BaseUnit) = Projectile.a(this, target, 14.0f, null, false): an instant
+        // contact bite for 14, no travelling round. :131 m()=43 reach, :136 b()=17 reload.
+        ProjectileTpl& bite = shot(t, {14, 6, 1, 0, 0, -1, 1, 0xFFFFFFFF});
+        bite.instant = true;
     }
     {
         // ExperimentalHoverTank.java: radius 30, displayRadius radius+1, hp 3500; :51 mass 80000;
@@ -222,7 +257,12 @@ void registerBuiltinUnits(TemplateStore& st) {
         visibleTurret(t, 0, -8, 26, "");
         visibleTurret(t, 0, 0, 30, "");
         visibleTurret(t, 0, 8, 26, "");
-        shot(t, 25, 7, 60, 2);
+        // ExperimentalHoverTank.java:207-237 q()=0 but the weapon is a continuous beam:
+        // projectileA.U=380 (:233), A=true instant (:220), J=70 impact range (:225), h=reload+10.
+        // RP models it like the shipped laser_tank: instant + laserEffect + instantReuseLast, which draws
+        // the light beam and re-hits each shot (RP has no per-tick channel, so damage lands per barrage).
+        ProjectileTpl& beam = shot(t, {380, 6, 10, 0, 0, -1, 1, argbToRp(255, 50, 230, 50)});
+        beam.instant = true; beam.laserEffect = true; beam.instantReuseLast = true;
     }
     {
         // CrystalResource.java: radius 11, displayRadius radius+1, hp 600, price 5000. A placeable
@@ -256,7 +296,9 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.isFixedFiring = true; t.attackRange = 280; t.shootDelay = 70; t.turretSize = 18;
         t.turretTurnSpeed = 3;
         invisibleTurret(t, 0, 8, 18);
-        shot(t, 70, 5, 180);
+        // CommandCenter.java:231-254 U=q()=70, t=2 initial, r=5 target (:247), h=180,
+        // ar=a(255,230,230,50) yellow missile. s is unset in Java, so t ramps to r at RP's default accel.
+        shot(t, {70, 2, 180, 5, 0, -1, 1, argbToRp(255, 230, 230, 50)});
         canBuild(t, "builder", 1);
     }
     {
@@ -371,9 +413,98 @@ void registerBuiltinUnits(TemplateStore& st) {
         TurretTpl& tur = visibleTurret(t, 0, 0, 21, "");
         tur.turnSpeed = 3.0f; tur.turnAccel = 1.0f;
         tur.recoil = -2; tur.recoilOut = 4; tur.recoilReturn = 6;
-        shot(t, 50, 5, 60);
+        // HeavyTankUnit.java:158-182 main gun U=q()=50, t=4, h=60, x=2,
+        // ar=a(235,150,230,40) (Terrrestrial=235 alpha, blue=230). Secondary missile on upgrade omitted.
+        shot(t, {50, 4, 60, 0, 0, -1, 2, argbToRp(235, 150, 230, 40)});
     }
     // ------------------------------------------------------------------ remaining UnitTypeEnum hulls
+    {
+        // HoverTankUnit.java:60-71 constructor: radius 7, displayRadius radius+2, hp 150; no mass override
+        // (hover land hull inherits a light default, use 800 like the other light tanks). :98-137 damage 23,
+        // range 140, reload 90, projectile life 85 / speed 6. :141-172 moveSpeed 1.0, accel 0.04, decel D()=0.09,
+        // turn 180 (JADX deg units -- HoverLandUnit turns about its own axis), turnAccel B()=0.5. :56-58 d(int)=null
+        // (no turret art, invisible barrel). :36-38 art hover_tank / hover_tank_dead / hover_tank_shadow.
+        // :94 / :176-183 it is a sliding, order-ignoring hover hull that bobs at posZ~4.
+        UnitTemplate& t = add(st, "hoverTank", "Hover Tank");
+        t.price = 600; t.maxHp = 150; t.mass = 800;
+        t.radius = 7; t.displayRadius = 9;
+        t.image = "hover_tank.png"; t.imageWreak = "hover_tank_dead.png";
+        t.imageShadow = "hover_tank_shadow.png";
+        t.moveType = MoveType::HOVER;
+        t.moveSpeed = 1.0f; t.accel = 0.04f; t.decel = 0.09f;
+        t.maxTurnSpeed = 180.0f; t.turnAccel = 0.5f;
+        t.targetHeight = 4.0f; t.targetHeightDrift = 1.5f;
+        t.canAttack = true; t.canAttackFlying = true; t.attackRange = 140; t.shootDelay = 90; t.turretSize = 7;
+        invisibleTurret(t, 0, 0, 7);
+        // HoverTankUnit.java:98-121 U=q()=23, t=6, s=0.2, h=85, P=6 (plasma sprite frame),
+        // x=1, ar=a(255,50,230,50). This is the one built-in with an explicit projectile sprite.
+        shot(t, {23, 6, 85, 0, 0.2f, 6, 1, argbToRp(255, 50, 230, 50)});
+    }
+    {
+        // HovercraftUnit.java:170-182 constructor T(20)/U(32), radius 15, displayRadius radius, hp 450;
+        // :423 mass 12000. :342-372 moveSpeed 0.9 on land / 1.2 over liquid, turn 1.4 / 1.8, accel 0.03,
+        // decel D()=0.05, turnAccel B()=0.1. :237-241 / :458 it is a transport, 4 cargo slots, no weapon
+        // (:381 canAttack=false). :146-148 art hovercraft / hovercraft_dead / hovercraft_shadow.
+        UnitTemplate& t = add(st, "hovercraft", "Hovercraft");
+        t.price = 2000; t.maxHp = 450; t.mass = 12000;
+        t.radius = 15; t.displayRadius = 15;
+        t.image = "hovercraft.png"; t.imageWreak = "hovercraft_dead.png";
+        t.imageShadow = "hovercraft_shadow.png";
+        t.moveType = MoveType::HOVER;
+        t.moveSpeed = 0.9f; t.accel = 0.03f; t.decel = 0.05f;
+        t.maxTurnSpeed = 1.4f; t.turnAccel = 0.1f;
+        t.targetHeight = 3.0f; t.targetHeightDrift = 1.5f;
+        t.maxTransportingUnits = 4; t.transportSlotsNeeded = 1;
+        t.canAttack = false;
+    }
+    {
+        // BuilderShip.java:108-123 constructor radius 13, displayRadius radius, hp 500; :59 mass 6000.
+        // :141-175 moveSpeed 0.8, accel 0.03, decel D()=0.1, turn 1.9, turnAccel B()=0.12. :225 canAttack=false.
+        // :275-286 build menu: extractor 1, turret 2, antiAirTurret 3, landFactory 4, airFactory 5,
+        // seaFactory 6, fabricator 7, laserDefence 8, repairbay 9. :65-67 art builder_ship / _dead / _turret.
+        UnitTemplate& t = add(st, "builderShip", "Builder Ship");
+        t.price = 700; t.maxHp = 500; t.mass = 6000;
+        t.radius = 13; t.displayRadius = 13;
+        t.image = "builder_ship.png"; t.imageWreak = "builder_ship_dead.png";
+        t.imageTurret = "builder_ship_turret.png";
+        t.imageShadow = "AUTO"; t.shadowOffX = 3; t.shadowOffY = 3;
+        waterMovement(t, 0.8f, 0.03f, 0.1f, 1.9f, 0.12f);
+        t.techLevel = 1;
+        t.buildSpeed = 0.001f;   // UnitTypeEnum.builderShip D()
+        t.isBuilder = true;
+        t.nanoRange = 145; t.nanoBuildSpeed = 2.0f; t.nanoRepairSpeed = 0.5f;  // :299 y()=145
+        t.canRepairBuildings = true;
+        canBuild(t, "extractor", 1);
+        canBuild(t, "turret", 2);
+        canBuild(t, "antiAirTurret", 3);
+        canBuild(t, "landFactory", 4);
+        canBuild(t, "airFactory", 5);
+        canBuild(t, "seaFactory", 6);
+        canBuild(t, "fabricator", 7);
+        canBuild(t, "laserDefence", 8);
+        canBuild(t, "repairbay", 9);
+    }
+    {
+        // LaserDefense.java:177-190 constructor a(level1Textures[0],2) = 2 frames, radius 19,
+        // displayRadius radius, hp 500, target/velocity rect (0,0,1,1). :341-341 m() range 160 (L1) / 210 (L2).
+        // :182 currentEnergy starts 1.0; :233 energy regen 4.0E-4/tick (L1), +2.0E-4 (L2); :249 it intercepts
+        // incoming rounds at 0.11 energy each (L1) / 0.05 (L2). It is NOT a weapon (:369 canAttack=false):
+        // RP bolts point defence on an invisible canShoot:false [turret] with laserDefenceEnergyUse (see
+        // Game::updateLaserDefence and the shipped laser_defense.ini). :166-168 art laser_defence / _t2 / _dead.
+        UnitTemplate& t = add(st, "laserDefence", "Laser Defence");
+        t.price = 750; t.maxHp = 500; t.mass = 4000;
+        t.radius = 19; t.displayRadius = 19;
+        t.totalFrames = 2;
+        t.image = "laser_defence.png"; t.imageWreak = "laser_defence_dead.png";
+        t.imageShadow = "NONE";
+        buildingCommon(t, 0, 0, 1, 1, 18);
+        t.canAttack = false;
+        t.maxEnergy = 1.0f; t.energyRegen = 0.0004f; t.energyStartingPercentage = 1.0f;
+        t.showEnergyBar = false;  // the energy is an internal interceptor pool, not a manna bar (:380)
+        TurretTpl& pd = invisibleTurret(t, 0, 0, 1);
+        pd.canShoot = false; pd.laserDefence = true; pd.laserDefenceEnergyUse = 0.11f;
+        pd.range = 160.0f;
+    }
     {
         // MegaTankUnit.java:64-67 sprite 20x25, radius 12, displayRadius radius+1, hp 550; :51 mass 7000;
         // range 140, reload 70, projectile damage 50 / life 60, speed 0.8, turn 1.2.
@@ -386,7 +517,9 @@ void registerBuiltinUnits(TemplateStore& st) {
         landMovement(t, 0.8f, 0.05f, 0.1f, 1.2f, 0.2f);
         t.canAttack = true; t.attackRange = 140; t.shootDelay = 70; t.turretSize = 18;
         visibleTurret(t, 0, 0, 18, "");
-        shot(t, 50, 6, 60, 2);
+        // MegaTankUnit.java:101-112 main gun U=50 (literal), t=3, h=60, x=2, ar=a(255,150,230,40).
+        // Secondary missile (:114-125 U=40) on upgrade omitted.
+        shot(t, {50, 3, 60, 0, 0, -1, 2, argbToRp(255, 150, 230, 40)});
     }
     {
         // TankDestroyer.java sprite 16x30, radius 11, displayRadius radius+2, hp 350; range 150,
@@ -400,7 +533,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         landMovement(t, 1.0f, 0.07f, 0.12f, 1.9f, 0.2f);
         t.canAttack = true; t.attackRange = 150; t.shootDelay = 70; t.turretSize = 16;
         visibleTurret(t, 0, 0, 16, "");
-        shot(t, 35, 6, 60, 2);
+        // TankDestroyer.java:90-97 U=35 (literal), t=3, h=60; no ar -> RWX default white, no x/P.
+        shot(t, {35, 3, 60, 0, 0, -1, 1, 0xFFFFFFFF});
     }
     {
         // WallVertical.java: radius 15, hp 700, price 100 -- a one-tile wall segment.
