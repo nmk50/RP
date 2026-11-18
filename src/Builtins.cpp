@@ -156,7 +156,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.imageTurret = "battle_ship_t2_turret.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 2; t.shadowOffY = 2;
         waterMovement(t, 0.8f, 0.03f, 0.1f, 1.8f, 0.08f);
-        t.canAttack = true; t.attackRange = 240; t.shootDelay = 60; t.turretSize = 26;
+        // BattleShip.java:266 b(i)=120-(i*28) -> slot0 main gun reload 120 ticks.
+        t.canAttack = true; t.attackRange = 240; t.shootDelay = 120; t.turretSize = 26;
         visibleTurret(t, 0, -10, 26, "");
         visibleTurret(t, 0, 10, 26, "");
         // BattleShip.java:129-147 U=q()=65, t=4, h=80, x=2, ar=a(255,180,180,0) gold; no P.
@@ -167,7 +168,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // range 200, reload 170, speed 1.2, turn 1.9, accel 0.05, decel 0.1. MapTile.java:163 loads the
         // map name `scoutShip` as this class, so both names point at one template.
         UnitTemplate& t = add(st, "scoutShip", "Scout Ship");
-        t.price = 900; t.maxHp = 350; t.mass = 4000;
+        t.price = 900; t.maxHp = 350; t.mass = 3000;  // MissileShip.java: no getPushMass override -> BaseUnit default 3000
         t.radius = 15; t.displayRadius = 13;
         t.image = "scout_ship.png"; t.imageWreak = "scout_ship_dead.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
@@ -185,13 +186,14 @@ void registerBuiltinUnits(TemplateStore& st) {
         // decel 0.1, turnAccel 0.06. The hull rides at targetHeight -8 (see light_sub.ini, the custom
         // unit built from the same role), which is what makes it fade under the water.
         UnitTemplate& t = add(st, "attackSubmarine", "Attack Submarine");
-        t.price = 800; t.maxHp = 260; t.mass = 4000;
+        t.price = 800; t.maxHp = 260; t.mass = 3000;  // no getPushMass override -> default 3000
         t.radius = 15; t.displayRadius = 13;
         t.image = "attack_submarine.png"; t.imageWreak = "attack_submarine_dead.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
-        waterMovement(t, 1.0f, 0.018f, 0.1f, 1.2f, 0.06f);
+        waterMovement(t, 0.8f, 0.018f, 0.1f, 1.2f, 0.06f);  // :255 speed surfaced 0.8 (submerged 0.45)
         t.targetHeight = -8.0f; t.targetHeightDrift = 0.4f;
-        t.canAttack = true; t.attackRange = 160; t.shootDelay = 60; t.turretSize = 14;
+        // AttackSubmarine.java:236 m()=250 surfaced / 180 submerged; :243 b()=170 reload.
+        t.canAttack = true; t.attackRange = 250; t.shootDelay = 170; t.turretSize = 14;
         invisibleTurret(t, 0, 0, 14);
         // AttackSubmarine.java:356-363 primary torpedo U=42, t=2, h=190, ar=a(255,230,230,50) yellow.
         // aH=true (:361) homing torpedo -> RP missile sprite (drawType 2 / frame 4), not a plain dot.
@@ -221,7 +223,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.image = "dropship.png"; t.imageWreak = "dropship_dead.png";
         t.imageShadow = "dropship_shadow.png";
         airMovement(t, 2.3f, 0.03f, 0.05f, 1.4f, 0.2f);
-        t.maxTransportingUnits = 2;
+        t.maxTransportingUnits = 4;  // Dropship.java:141 getMaxTransportWeight=4, :418 hard-coded slot cap 4
         t.transportSlotsNeeded = 1;
         t.canAttack = false;
     }
@@ -230,10 +232,10 @@ void registerBuiltinUnits(TemplateStore& st) {
         // Ladybug.java:77-82 sprite 17x26, radius 5, displayRadius radius+3, hp 130; range 43, reload 17,
         // speed 1.7, accel 0.07, decel 0.12, turn 5.5. A bug bites at contact range.
         UnitTemplate& t = add(st, "ladyBug", "Ladybug");
-        t.price = 400; t.maxHp = 130; t.mass = 800;
+        t.price = 400; t.maxHp = 130; t.mass = 3000;  // no override -> default 3000
         t.radius = 5; t.displayRadius = 8;
         t.image = "ladybug.png";
-        landMovement(t, 1.7f, 0.07f, 0.12f, 5.5f, 0.3f);
+        landMovement(t, 1.7f, 0.07f, 0.12f, 5.5f, -1);  // Ladybug.java: B() not overridden -> -1 (snap)
         t.canAttack = true; t.isMelee = true; t.meleeRange = 43; t.attackRange = 43;
         t.shootDelay = 17; t.turretSize = 4;
         invisibleTurret(t, 0, 0, 4);
@@ -248,13 +250,14 @@ void registerBuiltinUnits(TemplateStore& st) {
         // Three barrels and its own shield bubble (experimental_hovertank_shield.png).
         UnitTemplate& t = add(st, "experimentalHoverTank", "Experimental Hover Tank");
         t.price = 21000; t.maxHp = 3500; t.mass = 80000;
+        t.buildSpeed = 0.0002f;  // UnitTypeEnum.experimentalHoverTank D() = 2.0E-4
         t.radius = 30; t.displayRadius = 31;
         t.image = "experimental_hovertank.png";
         t.imageWreak = "experimental_hovertank_dead.png";
         t.imageTurret = "experimental_hovertank_turret.png";
         t.imageShield = "experimental_hovertank_shield.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 3; t.shadowOffY = 3;
-        t.maxShield = 2000; t.shieldRegen = 1.0f; t.shieldRenderRadius = 34;
+        t.maxShield = 5000; t.shieldRegen = 1.0f; t.shieldRenderRadius = 34;  // :122-123 unitEnergyMax=shield=5000
         t.moveType = MoveType::HOVER;
         t.moveSpeed = 0.6f; t.accel = 0.02f; t.decel = 0.02f;
         t.maxTurnSpeed = 1.1f; t.turnAccel = 0.03f;
@@ -262,25 +265,27 @@ void registerBuiltinUnits(TemplateStore& st) {
         visibleTurret(t, 0, -8, 26, "");
         visibleTurret(t, 0, 0, 30, "");
         visibleTurret(t, 0, 8, 26, "");
-        // ExperimentalHoverTank.java:207-237 q()=0 but the weapon is a continuous beam:
-        // projectileA.U=380 (:233), A=true instant (:220), J=70 impact range (:225), h=reload+10.
-        // RP models it like the shipped laser_tank: instant + laserEffect + instantReuseLast, which draws
-        // the light beam and re-hits each shot (RP has no per-tick channel, so damage lands per barrage).
-        ProjectileTpl& beam = shot(t, {380, 6, 10, 0, 0, -1, 0, 1, argbToRp(255, 50, 230, 50)});
+        // ExperimentalHoverTank.java:207-245 q()=0 but the weapon is a continuous beam:
+        // projectileA.U=380 (:233), A=true instant (:237), E=true (:239), J=70 (:240), F=230 (:241),
+        // ak=0.75 (:242), h=b(i)+e(i)+5 = 8+8+5 = 21 (:227). RP models it like laser_tank:
+        // instant + laserEffect + instantReuseLast (no per-tick channel, damage lands per barrage).
+        ProjectileTpl& beam = shot(t, {380, 6, 21, 0, 0, -1, 0, 1, argbToRp(255, 50, 230, 50)});
         beam.instant = true; beam.laserEffect = true; beam.instantReuseLast = true;
     }
     {
         // CrystalResource.java: radius 11, displayRadius radius+1, hp 600, price 5000. A placeable
         // crystal that pays out credits, so it is a static hull with an income rate and no weapons.
         UnitTemplate& t = add(st, "crystalResource", "Crystal");
-        t.price = 5000; t.maxHp = 600; t.mass = 9000;
+        t.price = 5000; t.maxHp = 600; t.mass = 3000;  // no override -> default 3000
         t.radius = 11; t.displayRadius = 12;
         t.image = "crystal.png";
         t.moveType = MoveType::NONE;
         t.isBuilding = true;
         t.canAttack = false;
-        t.resourceRate = 1.0f;
-        t.creditIncomeRate = 1;
+        // CrystalResource.java:82-84 getResourceRate()=0.02f -- a reclaimable resource marker, NOT an
+        // income stream. :111 canAttack=false. (The old creditIncomeRate=1 was wrong.)
+        t.resourceRate = 0.02f;
+        t.creditIncomeRate = 0;
     }
     // ------------------------------------------------------------------ buildings
     {
@@ -289,13 +294,14 @@ void registerBuiltinUnits(TemplateStore& st) {
         // :86-90 art base/base_dead, with base_back.png as the overlay layer. :231-267 damage 70,
         // range 280, reload 70, projectile speed 5 / life 180. :290 builds a builder at slot 1.
         UnitTemplate& t = add(st, "commandCenter", "Command Center");
-        t.price = 3000; t.maxHp = 4000; t.mass = 4000;
+        t.price = 3000; t.maxHp = 4000; t.mass = 3000;  // no getPushMass override -> default 3000
         t.radius = 30; t.displayRadius = 30;
         t.totalFrames = 4;
         t.image = "base.png"; t.imageWreak = "base_dead.png";
         t.imageShadow = "NONE";
-        t.buildSpeed = 0.001f;   // UnitTypeEnum.commandCenter D()
-        buildingCommon(t, -1, -1, 1, 1, 22);
+        t.buildSpeed = 0.0005f;  // UnitTypeEnum.commandCenter D() = 5.0E-4
+        t.creditIncomeRate = 18.0f;  // CommandCenter.java:226-228 getCreditIncomeRate()=18
+        buildingCommon(t, -1, -1, 1, 2, 22);  // :112 buildingVelocityRect(-1,-1,1,2) = footprint
         t.canAttack = true; t.canAttackFlying = true; t.canAttackLand = true;
         t.canAttackUnderwater = false;
         t.isFixedFiring = true; t.attackRange = 280; t.shootDelay = 70; t.turretSize = 18;
@@ -313,12 +319,12 @@ void registerBuiltinUnits(TemplateStore& st) {
         // laserTank 8. RP has no per-building upgrade level, so the whole list is offered.
         // Constructor: radius 30, displayRadius 30, hp 1200, target rect (-1,-1,1,1).
         UnitTemplate& t = add(st, "landFactory", "Land Factory");
-        t.price = 700; t.maxHp = 1200; t.mass = 4000;
+        t.price = 700; t.maxHp = 1200; t.mass = 3000;
         t.radius = 30; t.displayRadius = 30;
         t.image = "land_factory_front.png"; t.imageWreak = "land_factory_dead.png";
         t.imageShadow = "NONE";
         t.buildSpeed = 0.001f;
-        buildingCommon(t, -1, -1, 1, 1, 18);
+        buildingCommon(t, -1, -1, 1, 3, 18);  // :94 buildingVelocityRect (-1,-1,1,3)
         t.isFactory = true;
         canBuild(t, "builder", 1);
         canBuild(t, "tank", 2);
@@ -335,13 +341,13 @@ void registerBuiltinUnits(TemplateStore& st) {
         // the list is always offered. Constructor: T(40)/U(61) (air_factory.png is 200x63, five
         // frames), radius 30, displayRadius 30, hp 1000, target rect (-1,-1,1,1).
         UnitTemplate& t = add(st, "airFactory", "Air Factory");
-        t.price = 1000; t.maxHp = 1000; t.mass = 4000;
+        t.price = 1000; t.maxHp = 1000; t.mass = 3000;
         t.radius = 30; t.displayRadius = 30;
         t.totalFrames = 5;
         t.image = "air_factory.png"; t.imageWreak = "air_factory_dead.png";
         t.imageShadow = "NONE";
         t.buildSpeed = 0.001f;
-        buildingCommon(t, -1, -1, 1, 1, 18);
+        buildingCommon(t, -1, -1, 1, 2, 18);  // :93 buildingVelocityRect(-1,-1,1,2) = footprint
         t.isFactory = true;
         canBuild(t, "dropship", 3.2f);
         canBuild(t, "gunShip", 4);
@@ -352,12 +358,12 @@ void registerBuiltinUnits(TemplateStore& st) {
         // battleShip 5, attackSubmarine 6. Constructor: radius 45, displayRadius 45, hp 1000,
         // target rect (-1,-1,1,2) on water.
         UnitTemplate& t = add(st, "seaFactory", "Sea Factory");
-        t.price = 1000; t.maxHp = 1000; t.mass = 4000;
+        t.price = 1000; t.maxHp = 1000; t.mass = 3000;
         t.radius = 45; t.displayRadius = 45;
         t.image = "sea_factory.png"; t.imageWreak = "sea_factory_dead.png";
         t.imageShadow = "NONE";
-        t.buildSpeed = 0.001f;   // UnitTypeEnum.seaFactory D()
-        buildingCommon(t, -1, -1, 1, 2, 18);
+        t.buildSpeed = 0.0007f;  // UnitTypeEnum.seaFactory D() = 7.0E-4
+        buildingCommon(t, -2, -1, 2, 4, 18);  // :68 buildingVelocityRect(-2,-1,2,4) = footprint (18-units-buildings.md:63)
         t.placeOnlyOnWater = true;
         t.isFactory = true;
         canBuild(t, "builderShip", 1);
@@ -379,7 +385,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // seaFactory 6, laserDefence 7, repairbay 8, fabricator 9, experimentalLandFactory 10,
         // NukeLaucher 14, AntiNukeLaucher 15.
         UnitTemplate& t = add(st, "builder", "Builder");
-        t.price = 500; t.maxHp = 170; t.mass = 1200;
+        t.price = 500; t.maxHp = 170; t.mass = 3000;  // no override -> default 3000
         t.radius = 10; t.displayRadius = 12;
         t.image = "builder.png"; t.imageWreak = "builder_dead.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
@@ -432,7 +438,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // (no turret art, invisible barrel). :36-38 art hover_tank / hover_tank_dead / hover_tank_shadow.
         // :94 / :176-183 it is a sliding, order-ignoring hover hull that bobs at posZ~4.
         UnitTemplate& t = add(st, "hoverTank", "Hover Tank");
-        t.price = 600; t.maxHp = 150; t.mass = 800;
+        t.price = 450; t.maxHp = 150; t.mass = 3000;  // UnitTypeEnum.hoverTank c()=450; no mass override -> 3000
         t.radius = 7; t.displayRadius = 9;
         t.image = "hover_tank.png"; t.imageWreak = "hover_tank_dead.png";
         t.imageShadow = "hover_tank_shadow.png";
@@ -452,7 +458,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // decel D()=0.05, turnAccel B()=0.1. :237-241 / :458 it is a transport, 4 cargo slots, no weapon
         // (:381 canAttack=false). :146-148 art hovercraft / hovercraft_dead / hovercraft_shadow.
         UnitTemplate& t = add(st, "hovercraft", "Hovercraft");
-        t.price = 2000; t.maxHp = 450; t.mass = 12000;
+        t.price = 600; t.maxHp = 450; t.mass = 12000;  // UnitTypeEnum.hovercraft c()=600
         t.radius = 15; t.displayRadius = 15;
         t.image = "hovercraft.png"; t.imageWreak = "hovercraft_dead.png";
         t.imageShadow = "hovercraft_shadow.png";
@@ -469,7 +475,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // :275-286 build menu: extractor 1, turret 2, antiAirTurret 3, landFactory 4, airFactory 5,
         // seaFactory 6, fabricator 7, laserDefence 8, repairbay 9. :65-67 art builder_ship / _dead / _turret.
         UnitTemplate& t = add(st, "builderShip", "Builder Ship");
-        t.price = 700; t.maxHp = 500; t.mass = 6000;
+        t.price = 500; t.maxHp = 500; t.mass = 6000;  // UnitTypeEnum.builderShip c()=500
         t.radius = 13; t.displayRadius = 13;
         t.image = "builder_ship.png"; t.imageWreak = "builder_ship_dead.png";
         t.imageTurret = "builder_ship_turret.png";
@@ -498,7 +504,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // RP bolts point defence on an invisible canShoot:false [turret] with laserDefenceEnergyUse (see
         // Game::updateLaserDefence and the shipped laser_defense.ini). :166-168 art laser_defence / _t2 / _dead.
         UnitTemplate& t = add(st, "laserDefence", "Laser Defence");
-        t.price = 750; t.maxHp = 500; t.mass = 4000;
+        t.price = 1200; t.maxHp = 500; t.mass = 3000;  // UnitTypeEnum.laserDefence c()=1200; no mass override
         t.radius = 19; t.displayRadius = 19;
         t.totalFrames = 2;
         t.image = "laser_defence.png"; t.imageWreak = "laser_defence_dead.png";
@@ -531,7 +537,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         // TankDestroyer.java sprite 16x30, radius 11, displayRadius radius+2, hp 350; range 150,
         // reload 70, damage 35 / life 60, speed 1.0, turn 1.9, accel 0.07, decel 0.12.
         UnitTemplate& t = add(st, "tankDestroyer", "Tank Destroyer");
-        t.price = 800; t.maxHp = 350; t.mass = 4000;
+        t.price = 800; t.maxHp = 350; t.mass = 3000;  // no override -> default 3000
         t.radius = 11; t.displayRadius = 13;
         t.image = "tank2.png"; t.imageWreak = "tank2_dead.png";
         t.imageTurret = "tank2_turret.png";
@@ -545,17 +551,17 @@ void registerBuiltinUnits(TemplateStore& st) {
     {
         // WallVertical.java: radius 15, hp 700, price 100 -- a one-tile wall segment.
         UnitTemplate& t = add(st, "wall_v", "Wall");
-        t.price = 100; t.maxHp = 700; t.mass = 4000;
+        t.price = 100; t.maxHp = 700; t.mass = 3000;
         t.radius = 15; t.displayRadius = 15;
         t.image = "wall_v.png";
         t.imageShadow = "NONE";
-        buildingCommon(t, 0, 0, 0, 0, 4);
+        buildingCommon(t, 0, 0, 1, 0, 4);  // :59 buildingVelocityRect(0,0,1,0) = footprint
         t.canAttack = false;
     }
     {
         // SupplyDepot.java: radius 20, hp 800, price 1000 -- the transport supply building.
         UnitTemplate& t = add(st, "supplyDepot", "Supply Depot");
-        t.price = 1000; t.maxHp = 800; t.mass = 4000;
+        t.price = 1000; t.maxHp = 800; t.mass = 3000;
         t.radius = 20; t.displayRadius = 20;
         t.image = "supply_depot.png"; t.imageWreak = "supply_depot_dead.png";
         t.imageShadow = "NONE";
@@ -563,13 +569,13 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.canAttack = false;
     }
     {
-        // FogRevealer.java: price 1000 and no art at all -- an invisible hull that only opens the fog
-        // around itself, so it is untouchable and draws nothing.
+        // FogRevealer.java: price 1000, no art, DummyUnit (no own radius/hp -- these are placeholders).
+        // :49 sightRange=14, :50 lifeTimer=60. Invisible untouchable fog opener, draws nothing.
         UnitTemplate& t = add(st, "fogRevealer", "Fog Revealer");
-        t.price = 1000; t.maxHp = 100; t.mass = 1000;
+        t.price = 1000; t.maxHp = 100; t.mass = 3000;  // no override -> default 3000
         t.radius = 10; t.displayRadius = 10;
         t.moveType = MoveType::NONE;
-        t.fogSight = 40;
+        t.fogSight = 14;  // :49 sightRange=14
         t.unselectable = true; t.untargetable = true; t.cannotBeAttacked = true;
         t.canAttack = false;
     }
@@ -578,11 +584,28 @@ void registerBuiltinUnits(TemplateStore& st) {
         // Tree.java:102-108 -- radius 3, displayRadius radius+1, hp 100, no .ini at all. Drawn by
         // Renderer::drawTree from the shared trees.png atlas rather than a body sprite.
         UnitTemplate& t = add(st, "tree", "Tree");
-        t.price = 0; t.maxHp = 100;
+        t.price = 0; t.maxHp = 100; t.mass = 3000;  // no override -> default 3000
         t.radius = 3; t.displayRadius = 4;
         t.image = "trees.png";
         t.unselectable = true; t.untargetable = true; t.cannotBeAttacked = true;
         t.teamColoringMode = kTCModeDisabled;
+    }
+
+    // UnitTypeEnum.D() is each hull's build speed. Set explicitly from source for every built-in so
+    // none inherits RP's 0.001 default by accident (values: UnitTypeEnum.java, one D() per enum).
+    struct DEntry { const char* name; float d; };
+    static const DEntry kBuildSpeed[] = {
+        {"gunboat",0.005f},{"battleship",0.001f},{"scoutship",0.001f},{"missileship",0.001f},
+        {"attacksubmarine",0.001f},{"gunship",0.001f},{"dropship",0.001f},{"ladybug",0.004f},
+        {"experimentalshovertank",0.0002f},{"crystalresource",0.001f},{"commandcenter",0.0005f},
+        {"landfactory",0.001f},{"airfactory",0.001f},{"seafactory",0.0007f},{"builder",0.002f},
+        {"heavytank",0.0011f},{"hovertank",0.002f},{"hovercraft",0.003f},{"buildership",0.001f},
+        {"laserdefence",0.001f},{"megatank",0.0015f},{"tankdestroyer",0.003f},{"wall_v",0.003f},
+        {"supplydepot",0.001f},{"fogrevealer",0.0006f},{"tree",0.0025f},
+    };
+    for (const DEntry& e : kBuildSpeed) {
+        auto it = st.byName.find(e.name);
+        if (it != st.byName.end()) it->second.buildSpeed = e.d;
     }
 
     // These templates are registered straight into the store, bypassing the ini pass where
