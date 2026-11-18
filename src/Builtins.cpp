@@ -6,8 +6,9 @@
 // `overrideAndReplace : tank`) still wins because it is loaded afterwards.
 //
 // The numbers come straight from the Java classes; the citation on each block is the line the value was
-// read from. Movement values for the six units that used to live in assets/units/rp_builtin keep the
-// tuned numbers those ini files had, since they were already validated in game.
+// read from. This also covers the six units that used to live in assets/units/rp_builtin: their movement,
+// build speed (UnitTypeEnum.D()) and build/production menus (addAvailableActions) now follow the Java
+// source instead of the hand-tuned ini values, so the deleted filler inis are fully replaced by code.
 #include "UnitTemplate.h"
 #include <cctype>
 #include <cmath>
@@ -238,15 +239,17 @@ void registerBuiltinUnits(TemplateStore& st) {
     }
     // ------------------------------------------------------------------ buildings
     {
-        // CommandCenter.java:86-88 art base/base_dead; :259-267 range 280, reload 70; damage 70,
-        // projectile speed 5 / life 180.
+        // CommandCenter.java:94-111 -- T(53)/U(68) (base.png is 212x68, so four frames), radius 30,
+        // displayRadius 30, hp 4000, buildingTargetRect (-1,-1,1,1), buildingVelocityRect (-1,-1,1,2).
+        // :86-90 art base/base_dead, with base_back.png as the overlay layer. :231-267 damage 70,
+        // range 280, reload 70, projectile speed 5 / life 180. :290 builds a builder at slot 1.
         UnitTemplate& t = add(st, "commandCenter", "Command Center");
         t.price = 3000; t.maxHp = 4000; t.mass = 4000;
         t.radius = 30; t.displayRadius = 30;
         t.totalFrames = 4;
         t.image = "base.png"; t.imageWreak = "base_dead.png";
         t.imageShadow = "NONE";
-        t.buildSpeed = 0.0005f;
+        t.buildSpeed = 0.001f;   // UnitTypeEnum.commandCenter D()
         buildingCommon(t, -1, -1, 1, 1, 22);
         t.canAttack = true; t.canAttackFlying = true; t.canAttackLand = true;
         t.canAttackUnderwater = false;
@@ -257,7 +260,10 @@ void registerBuiltinUnits(TemplateStore& st) {
         canBuild(t, "builder", 1);
     }
     {
-        // LandFactory.java: radius 30, hp 1200, price 700.
+        // LandFactory.java:177-186 -- the factory's real queue: builder 1, tank 2, hoverTank 3,
+        // artillery 4, then at upgrade level 2 hovercraft 5 / heavyTank 6 / heavyHoverTank 7 /
+        // laserTank 8. RP has no per-building upgrade level, so the whole list is offered.
+        // Constructor: radius 30, displayRadius 30, hp 1200, target rect (-1,-1,1,1).
         UnitTemplate& t = add(st, "landFactory", "Land Factory");
         t.price = 700; t.maxHp = 1200; t.mass = 4000;
         t.radius = 30; t.displayRadius = 30;
@@ -266,78 +272,91 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.buildSpeed = 0.001f;
         buildingCommon(t, -1, -1, 1, 1, 18);
         t.isFactory = true;
+        canBuild(t, "builder", 1);
         canBuild(t, "tank", 2);
+        canBuild(t, "hoverTank", 3);
         canBuild(t, "artillery", 4);
+        canBuild(t, "hovercraft", 5);
         canBuild(t, "heavyTank", 6);
+        canBuild(t, "heavyHoverTank", 7);
+        canBuild(t, "laserTank", 8);
     }
     {
-        // AirFactory.java: radius 30, hp 1000, price 1000; 5 animation frames.
+        // AirFactory.java:186-191 -- a level-1 air factory builds nothing at all; dropship 3.2,
+        // gunShip 4 and amphibiousJet 5 only appear once it is upgraded. RP has no upgrade level, so
+        // the list is always offered. Constructor: T(40)/U(61) (air_factory.png is 200x63, five
+        // frames), radius 30, displayRadius 30, hp 1000, target rect (-1,-1,1,1).
         UnitTemplate& t = add(st, "airFactory", "Air Factory");
         t.price = 1000; t.maxHp = 1000; t.mass = 4000;
-        t.radius = 30; t.displayRadius = 20;
+        t.radius = 30; t.displayRadius = 30;
         t.totalFrames = 5;
         t.image = "air_factory.png"; t.imageWreak = "air_factory_dead.png";
         t.imageShadow = "NONE";
         t.buildSpeed = 0.001f;
         buildingCommon(t, -1, -1, 1, 1, 18);
         t.isFactory = true;
-        canBuild(t, "c_interceptor", 1);
-        canBuild(t, "lightGunship", 2);
-        canBuild(t, "bomber", 3);
-        canBuild(t, "c_helicopter", 4);
+        canBuild(t, "dropship", 3.2f);
+        canBuild(t, "gunShip", 4);
+        canBuild(t, "amphibiousJet", 5);
     }
     {
-        // SeaFactory.java: radius 45, hp 1000, price 1000, footprint 3x4 on water.
+        // SeaFactory.java:145-155 -- builderShip 1, gunBoat 2, missileShip 3, hovercraft 4,
+        // battleShip 5, attackSubmarine 6. Constructor: radius 45, displayRadius 45, hp 1000,
+        // target rect (-1,-1,1,2) on water.
         UnitTemplate& t = add(st, "seaFactory", "Sea Factory");
         t.price = 1000; t.maxHp = 1000; t.mass = 4000;
         t.radius = 45; t.displayRadius = 45;
         t.image = "sea_factory.png"; t.imageWreak = "sea_factory_dead.png";
         t.imageShadow = "NONE";
-        t.buildSpeed = 0.0007f;
+        t.buildSpeed = 0.001f;   // UnitTypeEnum.seaFactory D()
         buildingCommon(t, -1, -1, 1, 2, 18);
         t.placeOnlyOnWater = true;
         t.isFactory = true;
-        canBuild(t, "lightSub", 1);
-        canBuild(t, "nautilusSubmarine", 2);
-        canBuild(t, "heavyAAShip", 3);
-        canBuild(t, "heavyMissileShip", 4);
-        canBuild(t, "heavyBattleship", 5);
+        canBuild(t, "builderShip", 1);
+        canBuild(t, "gunBoat", 2);
+        canBuild(t, "missileShip", 3);
+        canBuild(t, "hovercraft", 4);
+        canBuild(t, "battleShip", 5);
+        canBuild(t, "attackSubmarine", 6);
     }
     // ------------------------------------------------------------------ builder / tanks
     {
-        // BuilderUnit.java: sprite 20x20, radius 10, displayRadius radius+2, hp 170, price 500.
+        // BuilderUnit.java:308-350 -- T(20)/U(20) (builder.png is 20x20), radius 10,
+        // displayRadius radius+2, hp 170. getMoveSpeed 0.8 on land / 0.6 over liquid,
+        // getMaxTurnSpeed 3.8 / 1.7, turn acceleration 0.35, acceleration 0.04, deceleration 0.1.
+        // The reach comes from BaseUnit.y():1895 = 85, which is what a built-in builder inherits
+        // (CustomUnit.y():1641-1646 falls back to it whenever [core] nanoRange is unset).
+        // UnitTypeEnum.builder D() = 0.002 is its build speed.
+        // :358-372 the build menu: extractor 1, turret 2, antiAirTurret 3, landFactory 4, airFactory 5,
+        // seaFactory 6, laserDefence 7, repairbay 8, fabricator 9, experimentalLandFactory 10,
+        // NukeLaucher 14, AntiNukeLaucher 15.
         UnitTemplate& t = add(st, "builder", "Builder");
         t.price = 500; t.maxHp = 170; t.mass = 1200;
         t.radius = 10; t.displayRadius = 12;
         t.image = "builder.png"; t.imageWreak = "builder_dead.png";
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
+        t.buildSpeed = 0.002f;
         t.isBuilder = true;
-        t.nanoRange = 90; t.nanoBuildSpeed = 2.0f; t.nanoRepairSpeed = 0.5f;
+        t.nanoRange = 85; t.nanoBuildSpeed = 2.0f; t.nanoRepairSpeed = 0.5f;
         t.canRepairBuildings = true;
-        landMovement(t, 0.8f, 0.07f, 0.17f, 4.0f, 0.25f);
-        canBuild(t, "extractor", 3);
-        canBuild(t, "turret", 3.1f);
-        canBuild(t, "turret_artillery", 3.15f);
-        canBuild(t, "c_turret_t1_lightning", 3.18f);
-        canBuild(t, "antiAirTurret", 3.2f);
+        landMovement(t, 0.8f, 0.04f, 0.1f, 3.8f, 0.35f);
+        canBuild(t, "extractor", 1);
+        canBuild(t, "turret", 2);
+        canBuild(t, "antiAirTurret", 3);
         canBuild(t, "landFactory", 4);
-        canBuild(t, "mechFactory", 4.2f);
-        canBuild(t, "fabricator", 4.4f);
-        canBuild(t, "airFactory", 4.5f);
-        canBuild(t, "seaFactory", 4.6f);
-        canBuild(t, "turretT2", 5);
-        canBuild(t, "c_turret_t2_artillery", 5.1f);
-        canBuild(t, "c_turret_t2_lightning", 5.2f);
-        canBuild(t, "turret_flamethrower", 5.3f);
-        canBuild(t, "antiAirTurretT2", 5.5f);
-        canBuild(t, "turretT3", 6);
-        canBuild(t, "c_antiAirTurretT3", 6.1f);
-        canBuild(t, "laboratory", 7);
-        canBuild(t, "outpostT1", 8);
+        canBuild(t, "airFactory", 5);
+        canBuild(t, "seaFactory", 6);
+        canBuild(t, "laserDefence", 7);
+        canBuild(t, "repairbay", 8);
+        canBuild(t, "fabricator", 9);
+        canBuild(t, "experimentalLandFactory", 10);
+        canBuild(t, "NukeLaucher", 14);
+        canBuild(t, "AntiNukeLaucher", 15);
     }
     {
-        // HeavyTankUnit.java: radius 15, displayRadius radius+1, hp 600; :51 mass 7000; damage 50,
-        // range 160, reload 70; 3 moving frames; turret art heavy_tank_turret.png.
+        // HeavyTankUnit.java:298-306 -- radius 15, displayRadius radius+1, hp 600; :51 mass 7000.
+        // a(c[7], 3) splits heavy_tank.png (66x36) into three frames. damage 50, range 160, reload 70,
+        // projectile life 60, speed 0.8, turn 1.9, acceleration 0.05, deceleration 0.1.
         UnitTemplate& t = add(st, "heavyTank", "Heavy Tank");
         t.price = 800; t.maxHp = 600; t.mass = 7000;
         t.radius = 15; t.displayRadius = 16;
@@ -347,7 +366,7 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
         t.techLevel = 2;
         t.buildSpeed = 0.0011f;
-        landMovement(t, 0.8f, 0.05f, 0.12f, 3.0f, 0.2f);
+        landMovement(t, 0.8f, 0.05f, 0.1f, 1.9f, 0.2f);
         t.canAttack = true; t.attackRange = 160; t.shootDelay = 70; t.turretSize = 21;
         TurretTpl& tur = visibleTurret(t, 0, 0, 21, "");
         tur.turnSpeed = 3.0f; tur.turnAccel = 1.0f;
