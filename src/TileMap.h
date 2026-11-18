@@ -36,6 +36,8 @@ struct TilesetRender {
     std::string imageKey;
     int tileWidth = 20, tileHeight = 20;
     int strideX = 20, strideY = 20;
+    // Tiled's `margin`: the blank border around the atlas (units.tsx uses margin=1 spacing=1).
+    int marginX = 0, marginY = 0;
 };
 
 // RWX MapLayer: raw per-tile global ids kept for rendering, in map layer order. The Units layer holds

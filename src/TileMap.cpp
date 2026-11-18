@@ -109,6 +109,36 @@ static const TileSetInfo* findTileset(const std::vector<TileSetInfo>& sets, uint
     return best;
 }
 
+// RWX reads map files through a virtual file system that falls back to the shipped asset tree, so a map
+// authored on another machine keeps working even though its tileset sources point outside the map
+// folder ("../../units.tsx", "internet/rustedWarfareMaps-testing/terrain/Long Grass.tsx"). RP tries the
+// literal path, then the same path under assets/tilesets, then the bare file name anywhere under it.
+static const std::unordered_map<std::string, std::string>& tilesetIndex() {
+    static std::unordered_map<std::string, std::string> idx;
+    static std::string builtFor;
+    if (builtFor == g_assetsRoot) return idx;
+    idx.clear(); builtFor = g_assetsRoot;
+    FilePathList fl = LoadDirectoryFilesEx((g_assetsRoot + "/tilesets").c_str(), ".tsx", true);
+    for (unsigned i = 0; i < fl.count; ++i) {
+        std::string p = fl.paths[i];
+        std::string bn = ToLower(p.substr(p.find_last_of("/\\") + 1));
+        if (!idx.count(bn)) idx[bn] = p;   // first match wins; the shipped tree has no duplicate names
+    }
+    UnloadDirectoryFiles(fl);
+    TraceLog(LOG_INFO, TextFormat("Tileset index: %zu .tsx files", idx.size()));
+    return idx;
+}
+
+static std::string resolveTilesetPath(const std::string& base, const std::string& src) {
+    std::string p = base + "/" + src;
+    if (FileExists(p.c_str())) return p;
+    p = g_assetsRoot + "/tilesets/" + src;
+    if (FileExists(p.c_str())) return p;
+    const auto& idx = tilesetIndex();
+    auto it = idx.find(ToLower(src.substr(src.find_last_of("/\\") + 1)));
+    return it == idx.end() ? std::string() : it->second;
+}
+
 // RWX Tileset.markAllDescriptorsUnused: imageKey = basename of <image source>; stride = tile + spacing.
 static void fillRender(TilesetRender& tr, XMLElement* root, int firstgid) {
     tr.firstgid = firstgid;
@@ -120,11 +150,13 @@ static void fillRender(TilesetRender& tr, XMLElement* root, int firstgid) {
             tr.imageKey = (p == std::string::npos) ? s : s.substr(p + 1);
         }
     }
-    int tw = 20, th = 20, spacing = 0;
+    int tw = 20, th = 20, spacing = 0, margin = 0;
     root->QueryIntAttribute("tilewidth", &tw);
     root->QueryIntAttribute("tileheight", &th);
     root->QueryIntAttribute("spacing", &spacing);
+    root->QueryIntAttribute("margin", &margin);
     tr.tileWidth = tw; tr.tileHeight = th;
+    tr.marginX = tr.marginY = margin;
     tr.strideX = tw + spacing; tr.strideY = th + spacing;
 }
 
@@ -186,12 +218,7 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
         TilesetRender tr;
         tr.firstgid = ts.firstgid;
         if (src) {
-            std::string lp = src;
-            // resolve relative to map dir, else to assets/tilesets
-            std::string cand1 = base + "/" + lp;
-            std::string cand2 = g_assetsRoot + "/tilesets/" + lp;
-            std::string use;
-            if (!readFile(cand1).empty()) use = cand1; else if (!readFile(cand2).empty()) use = cand2;
+            std::string use = resolveTilesetPath(base, src);
             XMLDocument tdoc;
             if (!use.empty() && tdoc.LoadFile(use.c_str()) == XML_SUCCESS) {
                 XMLElement* troot = tdoc.FirstChildElement("tileset");
@@ -203,14 +230,26 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
                     // still alive; keeping an XMLElement* past this scope dangles.
                     fillRender(tr, troot, ts.firstgid);
                 }
-            } else if (nm) ts.name = nm;
+            } else {
+                // Unresolved tileset: keep the name so the atlas can still be guessed from it below.
+                TraceLog(LOG_WARNING, TextFormat("tileset not found: %s (map %s)", src, path.c_str()));
+                if (nm) ts.name = nm;
+            }
         } else {
             ts.name = nm ? nm : "unknown";
             collectTiles(tsE, ts);
             fillRender(tr, tsE, ts.firstgid);
         }
         sets.push_back(ts);
-        if (tr.imageKey.empty() && nm) tr.imageKey = nm;
+        // A tileset whose .tsx could not be found still carries a name, and the shipped atlases are named
+        // after it (units.tsx -> units.png); guessing the bitmap keeps the layer visible instead of blank.
+        if (tr.imageKey.empty()) {
+            std::string guess = !ts.name.empty() ? ts.name : (nm ? nm : "");
+            if (!guess.empty()) {
+                if (guess.find('.') == std::string::npos) guess += ".png";
+                tr.imageKey = guess;
+            }
+        }
         tilesets.push_back(tr);
     }
     std::sort(sets.begin(), sets.end(), [](const TileSetInfo& a, const TileSetInfo& b) { return a.firstgid < b.firstgid; });

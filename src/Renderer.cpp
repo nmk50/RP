@@ -183,10 +183,13 @@ bool Renderer::shared(const std::string& file, Texture2D& out) {
 }
 
 bool Renderer::tilesetTexture(const TilesetRender& ts, Texture2D& out, int& columns) {
+    auto cols = [&](const Texture2D& t) {
+        return std::max(1, (t.width - ts.marginX) / std::max(1, ts.strideX));
+    };
     auto it = tilesetCache_.find(ts.imageKey);
     if (it != tilesetCache_.end()) {
         out = it->second;
-        columns = std::max(1, it->second.width / std::max(1, ts.strideX));
+        columns = cols(it->second);
         return it->second.id != missing_.id;
     }
     std::string path = g_assetsRoot + "/tilesets/bitmaps/" + ts.imageKey;
@@ -195,7 +198,7 @@ bool Renderer::tilesetTexture(const TilesetRender& ts, Texture2D& out, int& colu
     if (tex.id == 0) tex = missing_;
     tilesetCache_[ts.imageKey] = tex;
     out = tex;
-    columns = std::max(1, tex.width / std::max(1, ts.strideX));
+    columns = cols(tex);
     return tex.id != missing_.id;
 }
 
@@ -288,7 +291,10 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
                     if (!tilesetTexture(*ts, tex, columns)) continue;
                     int local = variantLocalIndex(ts->imageKey, (int)gid - ts->firstgid, x, y);
                     int col = local % columns, row = local / columns;
-                    Rectangle src{ (float)(col * ts->strideX), (float)(row * ts->strideY), (float)ts->tileWidth, (float)ts->tileHeight };
+                    // Tiled's `margin` is a blank border around the atlas, so the first cell starts at
+                    // (marginX, marginY) rather than at the origin.
+                    Rectangle src{ (float)(ts->marginX + col * ts->strideX), (float)(ts->marginY + row * ts->strideY),
+                                   (float)ts->tileWidth, (float)ts->tileHeight };
                     Rectangle dst{ (float)(x * TILE_SIZE), (float)(y * TILE_SIZE), (float)TILE_SIZE, (float)TILE_SIZE };
                     DrawTexturePro(tex, src, dst, Vector2{ 0, 0 }, 0.0f, tint);
                 }

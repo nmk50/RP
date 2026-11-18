@@ -1053,6 +1053,7 @@ int main(int argc, char** argv) {
     std::string shotPath, mapOverride;
     int shotFrame = 3;
     bool startInGame = false, startInLevels = false;
+    bool checkMaps = false;
     // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
     // exists for the screenshot harness and for testing smaller windows.
     int winW = 1920, winH = 1080;
@@ -1062,6 +1063,7 @@ int main(int argc, char** argv) {
         else if (a == "--frames" && i + 1 < argc) { shotFrame = atoi(argv[++i]); }
         else if (a == "--game") startInGame = true;
         else if (a == "--levels") startInLevels = true;
+        else if (a == "--checkmaps") checkMaps = true;
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
         else if (a == "--size" && i + 1 < argc) {
             // "--size 1920x1080" -- the surface RWX's HUD metrics are authored against
@@ -1078,6 +1080,34 @@ int main(int argc, char** argv) {
     SetTargetFPS(120);
 
     g_assetsRoot = resolveAssetRoot();
+    if (checkMaps) {
+        // `--checkmaps` walks every shipped .tmx and reports the ones whose tileset descriptors could not
+        // be resolved to a bitmap; that is exactly what makes a map render with blank / missing tiles.
+        FilePathList fl = LoadDirectoryFilesEx((g_assetsRoot + "/maps").c_str(), ".tmx", true);
+        int bad = 0;
+        for (unsigned i = 0; i < fl.count; ++i) {
+            std::string p = fl.paths[i];
+            std::string rel = p.substr((g_assetsRoot + "/maps/").size());
+            TileMap m;
+            std::string err;
+            if (!m.loadTmx(p, &err)) {
+                TraceLog(LOG_WARNING, "MAPFAIL %-58s %s", rel.c_str(), err.c_str());
+                ++bad; continue;
+            }
+            int noArt = 0;
+            for (auto& ts : m.tilesets) {
+                std::string bmp = g_assetsRoot + "/tilesets/bitmaps/" + ts.imageKey;
+                if (ts.imageKey.empty() || !FileExists(bmp.c_str())) ++noArt;
+            }
+            TraceLog(LOG_INFO, "MAP %-58s %3dx%-3d sets=%2zu noart=%d spawns=%zu",
+                     rel.c_str(), m.w, m.h, m.tilesets.size(), noArt, m.spawns.size());
+            if (noArt) ++bad;
+        }
+        UnloadDirectoryFiles(fl);
+        TraceLog(LOG_INFO, "checkmaps: %d of %u map(s) need attention", bad, fl.count);
+        CloseWindow();
+        return 0;
+    }
     std::string currentMapRel = mapOverride.empty() ? MAP_REL : mapOverride;
     TraceLog(LOG_INFO, "Loading unit templates...");
     g_templates.loadAll(g_assetsRoot);
