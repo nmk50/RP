@@ -584,4 +584,17 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.unselectable = true; t.untargetable = true; t.cannotBeAttacked = true;
         t.teamColoringMode = kTCModeDisabled;
     }
+
+    // These templates are registered straight into the store, bypassing the ini pass where
+    // Templates.cpp:1661 does `else if (tt.shootDelay < 0) tt.shootDelay = t.shootDelay` (RWX
+    // TurretConfig.java:344-351: a barrel with no own `delay` inherits [attack] shootDelay). Replicate
+    // that fallback here, otherwise every built-in barrel keeps shootDelay=-1, its cooldown resets to 0
+    // in one tick (Game.cpp:2043 moveTowards) and the hull fires every frame with no reload.
+    // Range needs no such fallback: Game.cpp:234/2197 already fall back to t.attackRange.
+    for (const std::string& key : st.order) {
+        UnitTemplate& u = st.byName[key];
+        for (TurretTpl& tt : u.turrets) {
+            if (tt.linkDelay < 0 && tt.shootDelay < 0) tt.shootDelay = u.shootDelay;
+        }
+    }
 }
