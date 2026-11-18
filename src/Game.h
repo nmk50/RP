@@ -60,6 +60,9 @@ struct Unit {
     std::string tplKey;
     const UnitTemplate* tpl = nullptr;
     int team = 0;
+    // RWX Tree.b(int,int): the atlas (0 palm / 1 trees / 2 trees_snow) and the sub type that picks the
+    // atlas row. -1 means "not given", which Tree fills with a deterministic roll off the object id.
+    int treeType = 1, treeSub = -1;
     Vec2 pos;
     float facing = 0;        // body direction (radians)
     std::vector<TurretState> tur;   // one entry per tpl->turrets

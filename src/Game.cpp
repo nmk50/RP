@@ -263,7 +263,16 @@ bool Game::init(const std::string& mapPath, std::string* err) {
 
     for (auto& s : map.spawns) {
         Vec2 pos = tileSpawnPos(g_templates.find(ToLower(s.unit)), s.tx, s.ty);
-        spawnUnit(s.unit, s.team, pos);
+        int id = spawnUnit(s.unit, s.team, pos);
+        // RWX Tree.a_(String):"<atlas>.<subType>" from the tileset's `type` property
+        if (id >= 0 && !s.type.empty() && ToLower(s.unit) == "tree") {
+            Unit* u = get(id);
+            if (u) {
+                const char* dot = strchr(s.type.c_str(), '.');
+                u->treeType = atoi(s.type.c_str());
+                u->treeSub = dot ? atoi(dot + 1) : -1;
+            }
+        }
     }
 
     auto ensure = [&](int teamId) {

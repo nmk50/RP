@@ -1703,6 +1703,28 @@ void TemplateStore::loadAll(const std::string& assetsRoot) {
         UnloadDirectoryFiles(fl);
     }
 
+    // RWX has a hard-coded UnitTypeEnum.tree (Tree.java) with no .ini template;
+    // the maps refer to it as `unit=tree`. RP mirrors it as a built-in template so
+    // Game::init's spawnUnit() can create the map's decorative trees.
+    {
+        UnitTemplate tree;
+        tree.name = "tree";
+        tree.displayText = "Tree";
+        tree.image = "trees.png";
+        tree.sourceDir = "";
+        tree.price = 0;
+        tree.maxHp = 100;
+        // Tree(boolean):102-103 -- radius 3, displayRadius = radius + 1
+        tree.radius = 3;
+        tree.displayRadius = 4;
+        tree.unselectable = true;
+        tree.untargetable = true;
+        tree.cannotBeAttacked = true;
+        tree.teamColoringMode = kTCModeDisabled;
+        byName["tree"] = tree;
+        order.push_back("tree");
+    }
+
     // reverse-link production graph: unit.builtFrom_X -> factory.canBuild
     auto hasOpt = [](const UnitTemplate& f, const std::string& lower) {
         for (auto& b : f.canBuild) if (ToLower(b.unitName) == lower) return true;

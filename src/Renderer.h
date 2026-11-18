@@ -22,6 +22,9 @@ public:
     void close();
     void drawWorld(Game& g, const ViewState& view);
     bool unitTexture(const std::string& name, int which, Texture2D& out);
+    // Offscreen render of a unit template with every layer (body + turrets + legs),
+    // used for command-bar icons. Cached by template name.
+    bool unitIcon(const std::string& tplName, Texture2D& out);
 
 private:
     std::unordered_map<std::string, Texture2D> cache_;
@@ -39,6 +42,7 @@ private:
     void drawUnitShadow(const Unit& u);
     void drawUnit(Game& g, const Unit& u, const Camera2D& cam);
     void drawLegs(Game& g, const Unit& u, int pass, const Camera2D& cam);
+    void drawTree(const Unit& u);   // RWX Tree.c(): shared atlas sprite
     // RWX GameLogic.java:1915 / :1984 -- EffectManager.drawEffect(f, 1) runs before the game objects and
     // drawEffect(f, 2) after them, so `under` picks which of the two passes this is.
     void drawFx(Game& g, bool under);
@@ -47,4 +51,6 @@ private:
 private:
     std::unordered_map<std::string, Texture2D> teamCache_;
     std::unordered_map<std::string, Texture2D> tilesetCache_; // key: imageKey basename
+    std::unordered_map<std::string, Texture2D> iconCache_;    // full unit previews for the command bar
+    bool iconRender_ = false;    // true while drawing a command-bar icon (no HP/selection overlays)
 };

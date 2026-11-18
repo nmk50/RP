@@ -88,6 +88,8 @@ void Renderer::close() {
     teamCache_.clear();
     for (auto& kv : tilesetCache_) if (kv.second.id != missing_.id) UnloadTexture(kv.second);
     tilesetCache_.clear();
+    for (auto& kv : iconCache_) if (kv.second.id) UnloadTexture(kv.second);
+    iconCache_.clear();
     UnloadTexture(missing_);
 }
 
@@ -107,6 +109,8 @@ bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     std::string path = resolveImage(tmp, shadow);
     Texture2D tex = path.empty() ? missing_ : loadResolvedTexture(path, shadow);
     if (tex.id == 0) tex = missing_;
+    if (tex.id == missing_.id)
+        TraceLog(LOG_WARNING, "missing image: %s (unit %s, which %d)", nm.c_str(), t.name.c_str(), which);
     cache_[key] = tex;
     out = tex;
     return tex.id != missing_.id;
@@ -277,6 +281,7 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
                 for (int x = tx0; x <= tx1; ++x) {
                     uint32_t gid = layer.gids[(size_t)y * g.map.w + x];
                     if (gid == 0) continue;
+                    if (g.map.isUnitMarker(gid)) continue;   // spawn marker, the unit itself is the art
                     const TilesetRender* ts = findTs(gid);
                     if (!ts || ts->imageKey.empty()) continue;
                     Texture2D tex; int columns;
@@ -312,6 +317,48 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
 
 // RWX image_shadow: AUTO = the body frame with RGB forced to black, shifted by shadowOffsetX/Y world px.
 // Drawn in its own pass so one unit's shadow never stains a neighbour's sprite.
+// RWX Tree.b(int,int):133-169 -- a tree is a unit, but its sprite is one cell of a shared atlas.
+// Type 0 is palm_tree.png (27x41 cells with a 1 px margin on both axes, five sway frames in a row);
+// types 1/2 are trees.png / trees_snow.png (25x30 cells on a 26 px horizontal pitch, five sub types
+// stacked down the rows). Tree(boolean) itself calls b(1, -1), so every `unit=tree` in a tileset is a
+// type 1 whose sub type and scale come out of the object id, and the angle out of the position.
+void Renderer::drawTree(const Unit& u) {
+    unsigned h = (unsigned)u.id * 2654435761u;
+    const int type = u.treeType;
+    // Utility.getDeterministicRandomIntInRange(0, 4, objectId) when the tileset leaves the sub type open
+    const int sub = u.treeSub >= 0 ? (u.treeSub > 4 ? 4 : u.treeSub) : (int)((h >> 7) % 5u);
+    Texture2D tex{};
+    int cw, ch, ox, oy, shadowOff;
+    float scale;
+    if (type == 0) {
+        // palm_tree.png: 27x41 cells, a 1 px margin on both axes, five sway frames in one row (:136-142)
+        if (!shared("palm_tree.png", tex)) return;
+        cw = 27; ch = 41; ox = 1; oy = 1; shadowOff = 0;
+        scale = 1.0f;                       // b() only rolls a scale for the trees/trees_snow atlases
+    } else {
+        if (!shared(type == 2 ? "trees_snow.png" : "trees.png", tex)) return;
+        // 25x30 cells on a 26 px horizontal pitch, five sub types stacked down the rows (:151-164)
+        cw = 25; ch = 30; ox = 0; oy = ch * sub; shadowOff = cw;
+        // Utility.getRandomIntInRange(1.0f, 2.0f, objectId + 1) -- sub type 0 only rolls 1.0 .. 1.2
+        scale = 1.0f + ((h >> 3) % 101u) / 100.0f * (sub == 0 ? 0.2f : 1.0f);
+    }
+    float w = cw * scale, ht = ch * scale;
+    // Tree.n():373 -- the rotation is a hash of the position, which is what gives a forest its
+    // natural scatter. normalizeAngle(x, false) folds it back into -180 .. 180 degrees.
+    float rot = u.pos.y * 5.0f + u.pos.x * 3.0f;
+    rot -= 360.0f * std::floor((rot + 180.0f) / 360.0f);
+    Vector2 c{ u.pos.x, u.pos.y - u.posZ };
+    // Tree.c():212-228 -- the destination is getUnitBounds(), i.e. a cell-sized box centred on the unit,
+    // scaled and rotated about its own centre. The black silhouette one cell to the right is drawn first
+    // as the drop shadow, then the canopy on top.
+    Rectangle dst{ c.x - w / 2, c.y - ht / 2, w, ht };
+    Vector2 org{ w / 2, ht / 2 };
+    if (shadowOff)
+        DrawTexturePro(tex, Rectangle{ (float)(ox + shadowOff), (float)oy, (float)cw, (float)ch },
+                       dst, org, rot, WHITE);
+    DrawTexturePro(tex, Rectangle{ (float)ox, (float)oy, (float)cw, (float)ch }, dst, org, rot, WHITE);
+}
+
 void Renderer::drawUnitShadow(const Unit& u) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
@@ -331,6 +378,8 @@ void Renderer::drawUnitShadow(const Unit& u) {
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
+    // RWX UnitTypeEnum.tree is a NaturalUnit with its own sprite path (Tree.c()).
+    if (u.tplKey == "tree") { drawTree(u); return; }
     float r = std::max(6.0f, t.displayRadius);
     Color col = WHITE;
     if (u.underConstruction && u.tpl->isBuilding)
@@ -448,7 +497,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // drawable/shield_mid.png, drawn 1.25x over shieldRenderRadius on top of the whole unit. Its
     // alpha is how full the pool is plus how recently it soaked a hit, so a shielded unit glows
     // brighter the moment it is shot at.
-    if (u.shield > 0.0f && t.maxShield > 0) {
+    if (u.shield > 0.0f && t.maxShield > 0 && !iconRender_) {
         Texture2D sh;
         bool custom = !t.imageShield.empty() && byName(t, t.imageShield, sh);
         if (custom || shared("shield_mid.png", sh)) {
@@ -465,13 +514,13 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         }
     }
     // team ring under selection
-    if (u.selected) {
+    if (u.selected && !iconRender_) {
         DrawCircleLines((int)pv.x, (int)pv.y, r + 3, Color{ 60, 220, 90, 255 });
     }
     // hp bar
-    bool energyBar = t.maxEnergy > 0 && t.showEnergyBar && u.energy < t.maxEnergy;
-    if (u.hp < u.maxHp || u.selected || t.isBuilding || energyBar ||
-        (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
+    bool energyBar = !iconRender_ && t.maxEnergy > 0 && t.showEnergyBar && u.energy < t.maxEnergy;
+    if (!iconRender_ && (u.hp < u.maxHp || u.selected || t.isBuilding || energyBar ||
+        (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax))) {
         float bw = r * 2.0f, bh = 4;
         float frac = std::max(0.0f, u.hp / u.maxHp);
         Vector2 p{ pv.x - r, pv.y - (r + 8) };
@@ -522,7 +571,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         }
     }
     // upgrade-in-progress bar (RWX self action queue)
-    if (u.upgradeIdx >= 0) {
+    if (u.upgradeIdx >= 0 && !iconRender_) {
         float bw = r * 2.0f;
         Vector2 p{ pv.x - r, pv.y - (r + 13) };
         DrawRectangle((int)p.x, (int)p.y, (int)bw, 3, Color{ 30, 30, 30, 200 });
@@ -920,6 +969,78 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         DrawRectangle((int)x0, (int)y0, (int)w, (int)h, Color{ 90, 220, 90, 40 });
         DrawRectangleLines((int)x0, (int)y0, (int)w, (int)h, Color{ 90, 220, 90, 255 });
     }
+}
+
+// RWX UnitTypeEnum.drawUnit() builds a command-bar icon by drawing the full
+// template (hull + every turret + its leg rig) into an offscreen buffer. RP
+// renders that once per template into a cached texture instead of using only
+// the body sprite.
+bool Renderer::unitIcon(const std::string& tplName, Texture2D& out) {
+    std::string key = ToLower(tplName);
+    auto it = iconCache_.find(key);
+    if (it != iconCache_.end()) { out = it->second; return it->second.id != missing_.id; }
+    const UnitTemplate* t = g_templates.find(key);
+    if (!t) return false;
+
+    // A stand-in unit posed as RWX's preview: team 0 (undied art), turrets
+    // aimed north-west, hull at frame 0, legs reset at their attach points.
+    Unit u;
+    u.tpl = t;
+    u.tplKey = key;
+    u.team = 0;
+    u.pos = Vec2{ 0, 0 };
+    u.hp = u.maxHp = std::max(1.0f, t->maxHp);
+    u.facing = -3.14159265f / 2.0f;   // north, same as RWX's icon preview
+    u.animFrame = t->defaultFrame;
+    u.animScale = 1.0f;
+    u.tur.assign(t->turrets.size(), TurretState{});
+    for (auto& s : u.tur) s.angle = u.facing;
+    u.legs.assign(t->legs.size(), LegState{});
+    for (size_t i = 0; i < u.legs.size(); ++i) {
+        const LegTpl& C = t->legs[i];
+        u.legs[i].alpha = C.alpha;
+        u.legs[i].foot = Vec2{ C.attachX, C.attachY };
+        u.legs[i].angle = u.facing;
+        u.legs[i].z = 0;
+    }
+
+    // Frame the sprite: its natural size plus room for turrets/legs/shield.
+    Texture2D body{};
+    float bodyW = loaded(*t, 0, body) ? (body.width / (float)std::max(1, t->totalFrames)) * t->imageScale : 2 * t->displayRadius;
+    float bodyH = loaded(*t, 0, body) ? (float)body.height * t->imageScale : 2 * t->displayRadius;
+    float extent = std::max({ bodyW, bodyH, 2.0f * t->displayRadius, t->shieldRenderRadius * 2.0f });
+    for (const TurretTpl& tt : t->turrets) {
+        Texture2D bar{};
+        bool got = tt.image.empty() ? loaded(*t, 1, bar) : byName(*t, tt.image, bar);
+        float reach = 2.0f * (std::abs(tt.x) + std::abs(tt.y) + std::abs(tt.drawOffsetX) + std::abs(tt.drawOffsetY))
+                    + (got ? (float)bar.width * t->turretImageScale : 40.0f * t->turretImageScale);
+        extent = std::max(extent, reach);
+    }
+    const int SZ = 128;
+    // Sprite sheets carry a transparent margin, so framing on the raw extent leaves the preview looking
+    // lost in its box; pulling the extent in and allowing a little more zoom fills the button.
+    float zoom = std::min(4.5f, (SZ - 4) / std::max(14.0f, extent * 0.85f));
+    Camera2D cam{};
+    cam.zoom = zoom;
+    cam.offset = Vector2{ SZ / 2.0f, SZ / 2.0f };
+    cam.target = Vector2{ 0, 0 };
+
+    RenderTexture2D rt = LoadRenderTexture(SZ, SZ);
+    BeginTextureMode(rt);
+    ClearBackground(Color{ 0, 0, 0, 0 });
+    BeginMode2D(cam);
+    // The real Game is only needed for the HUD bars / transport readout, which
+    // don't belong on an icon; an empty stand-in is enough for drawUnit's passes.
+    static Game dummy;
+    iconRender_ = true;
+    drawLegs(dummy, u, 2, cam);             // under-all legs
+    drawUnit(dummy, u, cam);                // hull + turrets + over-body legs
+    iconRender_ = false;
+    EndMode2D();
+    EndTextureMode();
+    iconCache_[key] = rt.texture;
+    out = rt.texture;
+    return true;
 }
 
 bool Renderer::unitTexture(const std::string& name, int which, Texture2D& out) {

@@ -757,11 +757,15 @@ struct HudArt {
 };
 static HudArt g_hudArt;
 
-static void drawHudIcon(Texture2D t, Rectangle box, Color tint = WHITE) {
+static void drawHudIcon(Texture2D t, Rectangle box, Color tint = WHITE, bool flipY = false) {
     if (!t.id || box.width <= 0 || box.height <= 0) return;
     float s = std::min(box.width / t.width, box.height / t.height);
-    DrawTextureEx(t, Vector2{ box.x + (box.width - t.width * s) / 2,
-                              box.y + (box.height - t.height * s) / 2 }, 0, s, tint);
+    Rectangle dst{ box.x + (box.width - t.width * s) / 2, box.y + (box.height - t.height * s) / 2,
+                   t.width * s, t.height * s };
+    // A RenderTexture2D comes back Y-flipped (the framebuffer's origin is bottom-left), so a unit
+    // preview drawn from one needs a negative-height source rect to stand upright.
+    Rectangle src{ 0, 0, (float)t.width, flipY ? -(float)t.height : (float)t.height };
+    DrawTexturePro(t, src, dst, Vector2{ 0, 0 }, 0, tint);
 }
 
 // Gameplay HUD, following RWX's GameUI / GameInterfaceRenderer / Minimap:
@@ -779,10 +783,13 @@ static void renderHUD(Game& g, Camera2D& cam) {
     Team* me = nullptr;
     for (auto& t : g.teams) if (t.id == g.playerTeam()) me = &t;
 
-    // Right sidebar. The reference screenshot shows a narrow strip (~1/5 of the
-    // width) holding a square minimap and a compact two-column command grid.
-    float side = std::min(190.0f, std::max(100.0f, (float)SH / 4.3f));
-    side = std::min(side, (float)SW / 4.0f);
+    // RWX authors its HUD against a 1920x1080 surface: GameLogic.updateCameraSystem:2036-2049 sizes the
+    // sidebar, GameInterfaceRenderer.h():1027-1029 the button height. So every metric below is a 1080p
+    // constant times k, which keeps the strip's share of the screen the same at any window size.
+    float k = std::min((float)SW / 1920.0f, (float)SH / 1080.0f);
+    k = std::max(0.5f, std::min(2.0f, k));
+    auto px = [&](float v) { return (int)std::lround(v * k); };
+    float side = std::min(272.0f * k, (float)SW / 3.0f);
     float sideX = (float)SW - side;
 
     // ---- sidebar surface: dark panel, not the bright metal texture ----
@@ -806,8 +813,11 @@ static void renderHUD(Game& g, Camera2D& cam) {
     }
     for (auto& u : g.units) {
         if (!u.tpl || u.riding()) continue;
+        // Scenery is team -1 (the tileset says `team=none`) and RWX's Minimap only plots real units,
+        // so a forest never turns into a field of red dots.
+        if (u.team < 0 || u.tplKey == "tree") continue;
         Color c = u.team == g.playerTeam() ? Color{ 0, 255, 0, 255 } : Color{ 255, 60, 60, 255 };
-        float sz = u.tpl->isBuilding ? 3 : 2;
+        float sz = (u.tpl->isBuilding ? 3.0f : 2.0f) * std::max(1.0f, k);
         DrawRectangle(mm.x + u.pos.x * sx - sz / 2, mm.y + u.pos.y * sy - sz / 2, sz, sz, c);
     }
     Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam), br = GetScreenToWorld2D({ (float)SW, (float)SH }, cam);
@@ -823,12 +833,13 @@ static void renderHUD(Game& g, Camera2D& cam) {
     }
 
     // ---- top-left: small pause icon, green fps + status text ----
-    Rectangle pauseBtn{ 8, 8, 20, 20 };
+    Rectangle pauseBtn{ 8 * k, 8 * k, 27 * k, 27 * k };
     drawHudIcon(g_hudArt.pause, pauseBtn, Color{ 90, 220, 90, 255 });
     if (CheckCollisionPointRec(mouse, pauseBtn) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
         g_debug.paused = !g_debug.paused;
-    DrawText(TextFormat("%dfps", (int)GetFPS()), 12, 32, 14, Color{ 90, 220, 90, 255 });
-    DrawText(g_debug.paused ? "Paused" : "Editor Active", 12, 50, 13, Color{ 90, 220, 90, 255 });
+    DrawText(TextFormat("%dfps", (int)GetFPS()), px(14), px(42), px(20), Color{ 90, 220, 90, 255 });
+    DrawText(g_debug.paused ? "Paused" : "Editor Active", px(14), px(66), px(19),
+             Color{ 90, 220, 90, 255 });
 
     // ---- credits at top-right of the map, left of the minimap (GameUI.highlightRect) ----
     float income = 0;
@@ -840,10 +851,11 @@ static void renderHUD(Game& g, Camera2D& cam) {
     for (int i = (int)cs.size() - 3; i > 0; i -= 3) cs.insert(i, " ");
     char cbuf[96];
     snprintf(cbuf, sizeof(cbuf), "$%s(%+d)", cs.c_str(), (int)income);
-    int cw = MeasureText(cbuf, 18);
+    int rsize = px(26);
+    int cw = MeasureText(cbuf, rsize);
     // subtle dark backing so the green text stays readable on light terrain
-    DrawRectangle(sideX - cw - 14, 6, cw + 10, 26, Color{ 0, 0, 0, 90 });
-    DrawText(cbuf, sideX - cw - 9, 9, 18, Color{ 90, 220, 90, 255 });
+    DrawRectangle(sideX - cw - px(18), px(8), cw + px(14), px(36), Color{ 0, 0, 0, 90 });
+    DrawText(cbuf, sideX - cw - px(12), px(12), rsize, Color{ 90, 220, 90, 255 });
 
     // ---- selected units ----
     auto sel = g.selectedUnits();
@@ -867,8 +879,8 @@ static void renderHUD(Game& g, Camera2D& cam) {
     if (CheckCollisionPointRec(mouse, Rectangle{ sideX, mm.height, side, SH - mm.height }))
         ui.overPanel = true;
 
-    float cellW = (side - 12) / 2.0f, cellH = 40, gap = 3;
-    float gy = mm.height + 6;
+    float cellW = (side - 16 * k) / 2.0f, cellH = 52 * k, gap = 4 * k;
+    float gy = mm.height + 8 * k;
     // Selected-unit readout occupies the first row, like RWX's info cells.
     if (!sel.empty()) {
         const Unit* u = sel.front();
@@ -877,22 +889,23 @@ static void renderHUD(Game& g, Camera2D& cam) {
             snprintf(ib, sizeof(ib), "%zux %s", sel.size(), u->tpl ? u->tpl->displayText.c_str() : "Units");
         else
             snprintf(ib, sizeof(ib), "%s", u->tpl ? u->tpl->displayText.c_str() : "Unit");
-        DrawText(ib, sideX + 6, gy, 11, Color{ 150, 220, 150, 255 });
+        DrawText(ib, (int)(sideX + 8 * k), (int)gy, px(19), Color{ 150, 220, 150, 255 });
         if (u->maxHp > 0) {
-            Rectangle hb{ sideX + 6, gy + 15, side - 12, 6 };
+            Rectangle hb{ sideX + 8 * k, gy + 22 * k, side - 16 * k, 8 * k };
             DrawRectangleRec(hb, Color{ 60, 20, 20, 255 });
             DrawRectangle(hb.x, hb.y, hb.width * std::max(0.0f, u->hp / u->maxHp), hb.height,
                           Color{ 0, 200, 0, 255 });
             snprintf(ib, sizeof(ib), "%d/%d", (int)std::ceil(u->hp), (int)std::ceil(u->maxHp));
-            DrawText(ib, sideX + side - 6 - MeasureText(ib, 10), gy + 15, 10, WHITE);
+            DrawText(ib, (int)(sideX + side - 8 * k - MeasureText(ib, px(17))), (int)(gy + 22 * k),
+                     px(17), WHITE);
         }
-        gy += 26;
+        gy += 38 * k;
     }
 
     int cols = 2;
     for (size_t i = 0; i < btns.size(); ++i) {
         int col = (int)i % cols, row = (int)i / cols;
-        Rectangle btn{ sideX + 4 + col * (cellW + gap), gy + row * (cellH + gap), cellW, cellH };
+        Rectangle btn{ sideX + 6 * k + col * (cellW + gap), gy + row * (cellH + gap), cellW, cellH };
         if (btn.y + cellH > SH - 2) break;
         PBtn& b = btns[i];
         bool hover = CheckCollisionPointRec(mouse, btn);
@@ -904,26 +917,28 @@ static void renderHUD(Game& g, Camera2D& cam) {
         bool drew = false;
         if (!b.upgrade && !b.reclaim) {
             const UnitTemplate* t = g_templates.find(ToLower(b.key));
-            if (t && g_render.unitTexture(t->name, 0, icon)) {
-                drawHudIcon(icon, Rectangle{ btn.x + 4, btn.y + 2, btn.width - 8, btn.height - 16 });
+            if (t && g_render.unitIcon(t->name, icon)) {
+                drawHudIcon(icon, Rectangle{ btn.x + 5 * k, btn.y + 3 * k, btn.width - 10 * k,
+                                             btn.height - 20 * k }, WHITE, true);
                 drew = true;
             }
         }
         if (!drew)
             drawHudIcon(b.reclaim ? g_hudArt.buildIcon : g_hudArt.upgrade,
-                        Rectangle{ btn.x + 8, btn.y + 4, btn.width - 16, btn.height - 18 },
+                        Rectangle{ btn.x + 10 * k, btn.y + 5 * k, btn.width - 20 * k, btn.height - 22 * k },
                         Color{ 200, 230, 200, 255 });
 
-        if (i < 9) DrawText(TextFormat("%d", (int)i + 1), btn.x + 3, btn.y + 2, 9,
-                            Color{ 200, 200, 200, 220 });
+        if (i < 9) DrawText(TextFormat("%d", (int)i + 1), (int)(btn.x + 4 * k), (int)(btn.y + 3 * k),
+                            px(15), Color{ 200, 200, 200, 220 });
         std::string label = b.label.size() > 8 ? b.label.substr(0, 7) + "." : b.label;
-        int lw = MeasureText(label.c_str(), 9);
-        DrawText(label.c_str(), btn.x + (btn.width - std::min<float>(lw, btn.width - 4)) / 2,
-                 btn.y + btn.height - 13, 9,
+        int lsize = px(15);
+        int lw = MeasureText(label.c_str(), lsize);
+        DrawText(label.c_str(), (int)(btn.x + (btn.width - std::min<float>(lw, btn.width - 6 * k)) / 2),
+                 (int)(btn.y + btn.height - 17 * k), lsize,
                  afford ? Color{ 150, 220, 150, 255 } : Color{ 150, 110, 110, 255 });
         if (!b.reclaim && b.price > 0) {
             char pc[24]; snprintf(pc, sizeof(pc), "%d", (int)b.price);
-            DrawText(pc, btn.x + 3, btn.y + 2, 9,
+            DrawText(pc, (int)(btn.x + 4 * k), (int)(btn.y + 3 * k), px(15),
                      afford ? Color{ 240, 220, 90, 255 } : Color{ 160, 120, 120, 255 });
         }
 
@@ -945,12 +960,7 @@ static void renderHUD(Game& g, Camera2D& cam) {
         }
     }
 
-    // ---- selection outlines in the world (RWX unitSelectionBorderPaint) ----
-    for (auto* u : sel) if (u->tpl) {
-        Vector2 p = GetWorldToScreen2D({ u->pos.x, u->pos.y }, cam);
-        float r = u->tpl->radius * cam.zoom + 3;
-        DrawRectangleLines(p.x - r, p.y - r, r * 2, r * 2, Color{ 0, 220, 0, 255 });
-    }
+    // Selection circles are already drawn by Renderer::drawUnit; no extra HUD box.
 
     if (g.gameOver) {
         const char* msg = g.gameOverText == "VICTORY" ? "VICTORY  (R to restart)" : "DEFEAT  (R to restart)";
@@ -1043,6 +1053,9 @@ int main(int argc, char** argv) {
     std::string shotPath, mapOverride;
     int shotFrame = 3;
     bool startInGame = false, startInLevels = false;
+    // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
+    // exists for the screenshot harness and for testing smaller windows.
+    int winW = 1920, winH = 1080;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--shot" && i + 1 < argc) { shotPath = argv[++i]; }
@@ -1050,8 +1063,14 @@ int main(int argc, char** argv) {
         else if (a == "--game") startInGame = true;
         else if (a == "--levels") startInLevels = true;
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
+        else if (a == "--size" && i + 1 < argc) {
+            // "--size 1920x1080" -- the surface RWX's HUD metrics are authored against
+            const char* sz = argv[++i];
+            const char* x = strchr(sz, 'x');
+            if (x) { winW = atoi(sz); winH = atoi(x + 1); }
+        }
     }
-    const int SW = 1280, SH = 720;
+    const int SW = winW, SH = winH;
     SetTraceLogCallback(LogToFile);
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(SW, SH, "RP - Rusted Warfare C++ remake");

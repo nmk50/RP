@@ -78,7 +78,10 @@ static void applyTile(TileMap& map, int x, int y, const TileSetInfo& ts, uint32_
     if (unitIt != pm.end() && !unitIt->second.empty()) {
         SpawnPoint sp; sp.unit = unitIt->second;
         auto teamIt = pm.find("team");
-        sp.team = teamIt != pm.end() ? atoi(teamIt->second.c_str()) : 0;
+        // `team=none` is the tileset's way of saying "neutral" (every decoration carries it)
+        sp.team = (teamIt != pm.end() && teamIt->second != "none") ? atoi(teamIt->second.c_str()) : -1;
+        auto typeIt = pm.find("type");
+        if (typeIt != pm.end()) sp.type = typeIt->second;
         auto cu = pm.find("customunit");
         if (cu != pm.end() && !cu->second.empty()) sp.unit = cu->second;
         sp.tx = x; sp.ty = y;
@@ -212,6 +215,14 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
     }
     std::sort(sets.begin(), sets.end(), [](const TileSetInfo& a, const TileSetInfo& b) { return a.firstgid < b.firstgid; });
     std::sort(tilesets.begin(), tilesets.end(), [](const TilesetRender& a, const TilesetRender& b) { return a.firstgid < b.firstgid; });
+
+    // A tileset cell that carries a `unit` property is a spawn marker, not scenery: the editor paints
+    // the red "?" of tilesets/bitmaps/misc.png on it. RWX creates the unit from it and draws no tile,
+    // so collect the global ids here and let the terrain renderer skip them.
+    unitMarkerGids.clear();
+    for (const auto& s : sets)
+        for (const auto& kv : s.props)
+            if (kv.second.count("unit")) unitMarkerGids.insert((uint32_t)(s.firstgid + kv.first));
 
     auto processLayer = [&](XMLElement* layer) {
         std::string L = ToLower(layer->Attribute("name") ? layer->Attribute("name") : "");

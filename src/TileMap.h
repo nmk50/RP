@@ -2,6 +2,7 @@
 // classifies terrain by tile properties, and reads unit spawns from the Units layer.
 #pragma once
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "Common.h"
 
@@ -20,6 +21,9 @@ struct MapTile {
 
 struct SpawnPoint {
     std::string unit;
+    // The tileset's `type` property: RWX Tree.a_(String) parses "<atlas>.<subType>" out of it, which is
+    // how the misc tileset offers a hand-picked tree row (1.0 .. 1.4) next to the plain `unit=tree` roll.
+    std::string type;
     int team = 0;
     int tx = 0, ty = 0;
 };
@@ -56,6 +60,10 @@ public:
     // flat terrain colors. Gameplay classification above is independent of these.
     std::vector<TilesetRender> tilesets;
     std::vector<MapRenderLayer> renderLayers;
+    // Tileset cells whose only job is to carry a `unit` property (the editor paints a red "?" there).
+    // RWX turns such a tile into a spawn and draws nothing, so the renderer has to skip these gids.
+    std::unordered_set<uint32_t> unitMarkerGids;
+    bool isUnitMarker(uint32_t gid) const { return unitMarkerGids.count(gid) != 0; }
 
     MapTile& at(int x, int y) { return tiles[y * w + x]; }
     const MapTile& at(int x, int y) const { return tiles[y * w + x]; }
