@@ -1,7 +1,7 @@
-out/obj/
-out/*.exe
-out/*.dll
-out/*.txt
-out/*.png
-out/*.ps1
+# Build output, screenshots, logs and the one-off harness scripts that live beside them.
+# Everything under out/ is generated: rp.exe, the obj trees, the mapshot/sim harnesses, the .png
+# screenshots and the reports those scripts write. The harnesses worth keeping are the ones in the
+# repo root (mapshot_build.bat, sim_build.bat, survey_*.pl).
+out/
 build.log
+rp_log.txt

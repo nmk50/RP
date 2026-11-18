@@ -2,10 +2,12 @@
 #include "UnitTemplate.h"
 #include "Ini.h"
 #include "Variables.h"
+#include "Mods.h"
 #include <raylib.h>
 #include <set>
 #include <sstream>
 #include <functional>
+#include <algorithm>
 
 bool g_iniUnusedKeyReport = false;
 
@@ -999,6 +1001,9 @@ static void applyCopyFromSections(IniFile& ini) {
 static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
     UnitTemplate t;
     t.sourceDir = dirOf(iniPath);
+    // Death spawn lists are parsed after [effect_*] sections are collected, so keep the
+    // raw strings from [core] until then.
+    std::string fxDeath, fxDeathUnbuilt, fxDeathGround;
 
     if (const IniSection* c = ini.find("core")) {
         t.name = c->get("name");
@@ -1081,7 +1086,30 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.transportCanUnload = parseUnloadCond(c->get("transportunitscanunloadunits", ""));
         t.isBuilding = c->getBool("isbuilding", false);
         t.isBuilder = c->getBool("isbuilder", false);
-        t.fogSight = (float)c->getNum("fogofwarsightrange", 0);
+        // :1713 getLogicBooleanUnit(..., 15) -- the sight range is in tiles and defaults to 15, which is
+        // also what OrderableUnit.s():4926-4928 answers for a hull without a config.
+        t.fogSight = (float)c->getNum("fogofwarsightrange", 15);
+        // :1714 / :1797 / :1801-1804 -- death and while-unbuilt settings.
+        t.fogSightWhileNotBuilt = (float)c->getNum("fogofwarsightrangewhilenotbuilt", -1);
+        t.isBio = c->getBool("isbio", false);
+        t.explodeTypeOnDeath = ToLower(Trim(c->get("explodetypeondeath", "")));
+        // CustomUnitConfigParser.java:1797 getEnum(UnitSize) -- an unknown token is a hard parse error
+        // there; RP falls back to the radius default instead of dropping the unit.
+        t.explodeSizeOnDeath = UnitSize::Unknown;
+        if (t.explodeTypeOnDeath == "verysmall") t.explodeSizeOnDeath = UnitSize::VerySmall;
+        else if (t.explodeTypeOnDeath == "small") t.explodeSizeOnDeath = UnitSize::Small;
+        else if (t.explodeTypeOnDeath == "normal") t.explodeSizeOnDeath = UnitSize::Normal;
+        else if (t.explodeTypeOnDeath == "large") t.explodeSizeOnDeath = UnitSize::Large;
+        else if (t.explodeTypeOnDeath == "largeunit") t.explodeSizeOnDeath = UnitSize::LargeUnit;
+        else if (t.explodeTypeOnDeath == "building") t.explodeSizeOnDeath = UnitSize::Building;
+        else if (t.explodeTypeOnDeath == "buildingnoshockwaveorsmoke") t.explodeSizeOnDeath = UnitSize::BuildingNoShockwaveOrSmoke;
+        else if (t.explodeTypeOnDeath == "verylargebuilding") t.explodeSizeOnDeath = UnitSize::VeryLargeBuilding;
+        fxDeath = Trim(c->get("effectondeath", ""));
+        fxDeathUnbuilt = Trim(c->get("effectondeathifunbuilt", ""));
+        fxDeathGround = Trim(c->get("effectondeathgroundcollision", c->get("effectondeathgroundcollosion", "")));
+        t.hasEffectOnDeath = !fxDeath.empty();
+        t.hasEffectOnDeathIfUnbuilt = !fxDeathUnbuilt.empty();
+        t.hasEffectOnDeathGroundCollision = !fxDeathGround.empty();
         t.explodeOnDeath = c->getBool("explodeondeath", true);
         // :1800 the crash-on-touchdown flag, read through its historical misspelling as an alias.
         t.explodeOnDeathGroundCollision =
@@ -1218,6 +1246,13 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.isMelee = a->getBool("ismelee", false);
         float eng = (float)a->getNum("meleeengangementdistance", -1);
         t.meleeRange = t.isMelee ? (eng >= 0 ? eng : 250.0f) : 0.0f;
+        // :2017-2027 unknown values silently stay normal; strafing is stored but, exactly
+        // as in RWX's decompiled build, has no separate runtime branch.
+        std::string am = ToLower(Trim(a->get("attackmovement", "normal")));
+        if (am == "strafing") t.attackMovement = AttackMovement::Strafing;
+        else if (am == "bomber") t.attackMovement = AttackMovement::Bomber;
+        // :2279 -- fire once, then die.
+        t.dieOnAttack = a->getBool("dieonattack", false);
     }
     if (const IniSection* m = ini.find("movement")) {
         t.moveType = parseMoveType(m->get("movementtype", "NONE"));
@@ -1227,6 +1262,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.decel = (float)m->getNum("movedecelerationspeed", 1);
         t.maxTurnSpeed = (float)m->getNum("maxturnspeed", 1);
         t.turnAccel = (float)m->getNum("turnacceleration", 1);
+        // :1962-1973 / :2013 -- buildings are always ignoreMoveOrders in RWX; RP's
+        // isStatic hulls are already refused by orderMove, so only the explicit key matters.
+        t.ignoreMoveOrders = m->getBool("ignoremoveorders", false);
+        t.joinsGroupFormations = m->getBool("joinsgroupformations", true);
         t.reverseSpeed = (float)m->getNum("reversespeedpercentage", 0.6);
         // :2010-2011, both plain booleans defaulting to false
         t.moveSlidingMode = m->getBool("moveslidingmode", false);
@@ -1300,6 +1339,15 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
     // in hand before the projectiles and the barrels are parsed, because explodeEffect and shoot_flame both
     // name one of them.
     parseEffectSections(ini, t.effects);
+    {
+        int missing = 0;
+        // CustomUnitConfigParser.java:1801-1804 -- "NONE" is a written value that suppresses
+        // the default; parseFlameList already turns it into an empty list, so the has flags
+        // captured above are what distinguish "written NONE" from "not written".
+        if (t.hasEffectOnDeath) parseFlameList(fxDeath, t.effects, nullptr, t.effectOnDeath, missing);
+        if (t.hasEffectOnDeathIfUnbuilt) parseFlameList(fxDeathUnbuilt, t.effects, nullptr, t.effectOnDeathIfUnbuilt, missing);
+        if (t.hasEffectOnDeathGroundCollision) parseFlameList(fxDeathGround, t.effects, nullptr, t.effectOnDeathGroundCollision, missing);
+    }
     parseRuntimeSections(ini, t);
     if (const IniSection* g = ini.find("graphics")) {
         t.splashEffect = g->getBool("splasteffect", false);
@@ -1325,6 +1373,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (key.empty() || projIdx.count(key)) continue;   // RWX rejects a repeated name outright
             projIdx[key] = (int)t.projectiles.size();
             ProjectileTpl p;
+            // CustomProjectileTemplate.java:73-74 -- fog flags; stored for parity until RP
+            // has a fog system, so no runtime branch consumes them yet.
+            p.shouldRevealFog = s.getBool("shouldrevealfog", false);
+            p.alwaysVisibleInFog = s.getBool("alwaysvisibleinfog", false);
             p.directDamage = (float)s.getNum("directdamage", 0);
             p.areaDamage = (float)s.getNum("areadamage", 0);
             p.areaRadius = (float)s.getNum("arearadius", 0);
@@ -1586,6 +1638,18 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
                 if (it != turIdx.end() && it->second != i) tt.linkDelay = it->second;
             }
             if (s.has("idledir")) tt.idleDir = (float)s.getNum("idledir", 0);
+            // TurretConfig.java:397-407 -- only a written key wins; the fallback (idleDir + 180, or 0 for
+            // an attached barrel) is filled in by the post-pass below, once attachedTo has been resolved.
+            if (s.has("idledirreversing")) {
+                tt.idleDirReversing = (float)s.getNum("idledirreversing", 0);
+                tt.hasIdleDirReversing = true;
+            }
+            if (s.has("warmupshootdelaytransfer"))
+                tt.warmupShootDelayTransfer = (float)s.getNum("warmupshootdelaytransfer", 0);
+            if (s.getBool("ismainnanoturret", false)) {
+                tt.mainNanoTurret = true;
+                t.mainNanoTurret = (int)i;
+            }
             // :487 the barrel may restate the jitter, defaulting to whatever it already holds
             if (s.has("aimoffsetspread")) tt.aimOffsetSpread = (float)s.getNum("aimoffsetspread", tt.aimOffsetSpread);
             if (s.has("shouldresetturret")) tt.shouldResetTurret = s.getBool("shouldresetturret", true);
@@ -1609,6 +1673,15 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
                 if (c.rfind("if ", 0) == 0) c = Trim(c.substr(3));
                 if (c == "false") tt.idleSweepCond.never = true;
                 else if (c != "true" && !c.empty()) parseCondAtoms(c, tt.idleSweepCond);
+            }
+            // TurretConfig.java:438,544 -- canAttackCondition, the gate CustomUnit.a(TurretConfig,..):1287
+            // reads against the shooter before a barrel may acquire or fire. Same LogicBoolean shape as
+            // idleSweepCondition: an absent key is null (always true).
+            if (s.has("canattackcondition")) {
+                std::string c = ToLower(Trim(s.get("canattackcondition", "")));
+                if (c.rfind("if ", 0) == 0) c = Trim(c.substr(3));
+                if (c == "false") tt.canAttackCond.never = true;
+                else if (c != "true" && !c.empty()) parseCondAtoms(c, tt.canAttackCond);
             }
             if (s.has("canattackflyingunits")) tt.canAttackFlying = s.getBool("canattackflyingunits", true);
             if (s.has("canattacklandunits")) tt.canAttackLand = s.getBool("canattacklandunits", true);
@@ -1691,6 +1764,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         else if (tt.shootDelay < 0) tt.shootDelay = t.shootDelay;
         if (tt.range <= 0) tt.range = t.attackRange;
         if (tt.turnDecel < 0) tt.turnDecel = tt.turnAccel;
+        // TurretConfig.java:401-407 -- an unwritten idleDirReversing is filled in here, now that
+        // attachedTo has been resolved: a barrel bolted to another never flips (0), a free one flips
+        // by its own rest angle plus a half turn.
+        if (!tt.hasIdleDirReversing) tt.idleDirReversing = tt.attached >= 0 ? 0.0f : tt.idleDir + 180.0f;
     }
     // a forceNano option is placed and nano-built by the hull, never queued, so it does not make a factory
     t.isFactory = false;
@@ -1699,54 +1776,71 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
 }
 
 void TemplateStore::loadAll(const std::string& assetsRoot) {
-    struct Dir { std::string sub; };
-    // builtin_mods are optional mods, disabled by default in RWX (builtin_mods_enabled) - not loaded
-    const char* roots[] = { "units" };
+    // RWX loads the core units root and then every *enabled* mod, each root being either a directory or
+    // a single .ini file (ModManager.loadModsFromDir:404). Load order is the override order: a later
+    // file's template simply replaces an earlier one in byName, which is how a mod retunes a shipped
+    // hull. g_mods owns the discovery + selection side of that, so this function is just the parser.
+    g_mods.scan(assetsRoot);
+    g_mods.loadSelection();
+
+    byName.clear();
+    order.clear();
     std::vector<std::pair<std::string, std::string>> aliases; // aliasKey -> realKey
-    // RWX's hard-coded units ship as ini here too (assets/units/builtin), so there is one loader path:
-    // every hull below goes through the same parser, which is what applies the turret/delay/projectile
-    // fallbacks the C++ registration used to have to replicate by hand.
-    for (const char* sub : roots) {
-        std::string base = assetsRoot + "/" + sub;
-        FilePathList fl = LoadDirectoryFilesEx(base.c_str(), nullptr, true);
-        for (uint32_t i = 0; i < fl.count; ++i) {
-            std::string path = fl.paths[i];
-            if (!EndsWith(ToLower(path), ".ini")) continue;
-            IniFile ini;
-            if (!ParseIni(path, ini)) continue;
-            if (!ini.find("core")) continue;
-            applyCopyFrom(ini, path, 0);
-            applyCopyFromSections(ini);
-            // CustomUnitConfigParser.java:1220 - ${...} is resolved on the merged file before any key is
-            // read, so a numeric expression never reaches a getter as text.
-            {
-                std::vector<std::string> warn;
-                varsub::substitute(ini, path, warn);
-                for (size_t w = 0; w < warn.size() && w < 20; ++w) printf("varsub: %s\n", warn[w].c_str());
-            }
-            UnitTemplate t = buildTemplate(ini, path);
-            if (g_iniUnusedKeyReport) {
-                std::string rel = path;
+
+    auto loadIni = [&](const std::string& path) {
+        IniFile ini;
+        if (!ParseIni(path, ini)) return;
+        if (!ini.find("core")) return;
+        applyCopyFrom(ini, path, 0);
+        applyCopyFromSections(ini);
+        // CustomUnitConfigParser.java:1220 - ${...} is resolved on the merged file before any key is
+        // read, so a numeric expression never reaches a getter as text.
+        {
+            std::vector<std::string> warn;
+            varsub::substitute(ini, path, warn);
+            for (size_t w = 0; w < warn.size() && w < 20; ++w) printf("varsub: %s\n", warn[w].c_str());
+        }
+        UnitTemplate t = buildTemplate(ini, path);
+        if (g_iniUnusedKeyReport) {
+            // Report the path relative to the assets root, so a key that came from a mod reads as
+            // "builtin_mods/mega_builders/..." instead of an absolute path.
+            std::string rel = path;
+            const std::string& ar = g_mods.assetsRoot();
+            if (rel.size() > ar.size() && rel.compare(0, ar.size(), ar) == 0) {
+                rel = rel.substr(ar.size());
+                while (!rel.empty() && (rel[0] == '/' || rel[0] == '\\')) rel.erase(0, 1);
+            } else {
                 size_t slash = rel.find("/units/");
                 if (slash != std::string::npos) rel = rel.substr(slash + 7);
-                for (const auto& sec : ini.sections) {
-                    for (const auto& kvp : sec.kv) {
-                        std::string lk = ToLower(Trim(kvp.first));
-                        if (sec.readKeys.count(lk)) continue;
-                        TraceLog(LOG_INFO, "UNUSED %s [%s] %s = %s", rel.c_str(),
-                                 sec.name.c_str(), kvp.first.c_str(), kvp.second.c_str());
-                    }
+            }
+            for (const auto& sec : ini.sections) {
+                for (const auto& kvp : sec.kv) {
+                    std::string lk = ToLower(Trim(kvp.first));
+                    if (sec.readKeys.count(lk)) continue;
+                    TraceLog(LOG_INFO, "UNUSED %s [%s] %s = %s", rel.c_str(),
+                             sec.name.c_str(), kvp.first.c_str(), kvp.second.c_str());
                 }
             }
-            if (t.name.empty()) continue;
-            byName[ToLower(t.name)] = t;
-            order.push_back(ToLower(t.name));
-            if (!t.overrideName.empty()) {
-                byName[ToLower(t.overrideName)] = t; // alias
-                aliases.push_back({ ToLower(t.overrideName), ToLower(t.name) });
-            }
         }
+        if (t.name.empty()) return;
+        byName[ToLower(t.name)] = t;
+        order.push_back(ToLower(t.name));
+        if (!t.overrideName.empty()) {
+            byName[ToLower(t.overrideName)] = t; // alias
+            aliases.push_back({ ToLower(t.overrideName), ToLower(t.name) });
+        }
+    };
+
+    for (const std::string& root : g_mods.loadRoots()) {
+        if (!DirectoryExists(root.c_str())) { loadIni(root); continue; }
+        FilePathList fl = LoadDirectoryFilesEx(root.c_str(), ".ini", true);
+        std::vector<std::string> files;
+        for (uint32_t i = 0; i < fl.count; ++i) files.push_back(fl.paths[i]);
         UnloadDirectoryFiles(fl);
+        // The directory order raylib hands back is not guaranteed, and it decides which of two files
+        // that define the same unit name wins, so sort it to keep a reload reproducible.
+        std::sort(files.begin(), files.end());
+        for (const std::string& p : files) loadIni(p);
     }
 
     // reverse-link production graph: unit.builtFrom_X -> factory.canBuild

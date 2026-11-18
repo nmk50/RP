@@ -365,6 +365,41 @@ void Renderer::drawTree(const Unit& u) {
     DrawTexturePro(tex, Rectangle{ (float)ox, (float)oy, (float)cw, (float)ch }, dst, org, rot, WHITE);
 }
 
+// RWX draws the fog as a tile atlas over the ground layer (TileMap.buildFogSmoothAtlas, MapLayer's
+// alphaFillPaints) keyed off PlayerTeam.fogOfWarData. The three states are all that matters:
+//   0  in sight    -> nothing drawn
+//   5  explored    -> a dim wash, the terrain is still recognisable
+//   10 never seen  -> solid black, TileMap:1731 skips the tile entirely
+// RP keeps the same three states and paints them as merged horizontal runs, which is a few hundred
+// rectangles per frame instead of one per tile.
+void Renderer::drawFog(Game& g, const Camera2D& cam) {
+    if (!g.fogEnabled || g.fog.empty()) return;
+    Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam);
+    Vector2 br = GetScreenToWorld2D({ (float)GetScreenWidth(), (float)GetScreenHeight() }, cam);
+    int x0 = std::max(0, (int)std::floor(tl.x / TILE_SIZE));
+    int y0 = std::max(0, (int)std::floor(tl.y / TILE_SIZE));
+    int x1 = std::min(g.map.w - 1, (int)std::floor(br.x / TILE_SIZE));
+    int y1 = std::min(g.map.h - 1, (int)std::floor(br.y / TILE_SIZE));
+    const Color explored{ 0, 0, 0, 150 };
+    for (int y = y0; y <= y1; ++y) {
+        int x = x0;
+        while (x <= x1) {
+            uint8_t f = g.fog[(size_t)y * g.map.w + x];
+            if (f == Game::FOG_VISIBLE) { ++x; continue; }
+            // A run of tiles that share the same state becomes one rectangle; that also removes the
+            // 1 px seams a per-tile fill leaves at fractional camera zooms.
+            int run = x;
+            while (run <= x1 && g.fog[(size_t)y * g.map.w + run] == f) ++run;
+            // 1..4 is the sight rim (Game::revealFogAt ramps it), 5 is explored, 10 is never seen.
+            Color c = f >= Game::FOG_UNSEEN ? Color{ 0, 0, 0, 255 }
+                    : (f >= Game::FOG_EXPLORED ? explored
+                                               : Color{ 0, 0, 0, (uint8_t)(f * 30) });
+            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, (run - x) * TILE_SIZE, TILE_SIZE, c);
+            x = run;
+        }
+    }
+}
+
 void Renderer::drawUnitShadow(const Unit& u) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
@@ -756,12 +791,16 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     // RWX GameLogic.java:1915 -- EffectManager.drawEffect(f, 1) is the ground pass, ahead of every game
     // object, so a drawUnderUnits effect ends up beneath the hulls and their shadows.
     drawFx(g, true);
+    // The fog goes over the ground decals and under every hull, which is the layer order RWX gets from
+    // painting the fog into the map layers (MapLayer) rather than as a separate scene pass. Hulls are
+    // filtered by Game::visibleToPlayer, so what is left on top is exactly what the player can see.
+    drawFog(g, view.cam);
     // under-construction + normal units sorted so buildings draw first. A hull in someone's hold is not
     // drawn at all (CustomUnit.a(GameEngine):4656) -- it reappears where b():718-809 puts it.
-    for (auto& u : g.units) if (!u.riding()) drawUnitShadow(u);
-    for (auto& u : g.units) if (!u.riding()) drawLegs(g, u, 2, view.cam);
-    for (auto& u : g.units) if (u.tpl && u.tpl->isStatic() && !u.riding()) drawUnit(g, u, view.cam);
-    for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic() && !u.riding()) drawUnit(g, u, view.cam);
+    for (auto& u : g.units) if (!u.riding() && g.visibleToPlayer(u)) drawUnitShadow(u);
+    for (auto& u : g.units) if (!u.riding() && g.visibleToPlayer(u)) drawLegs(g, u, 2, view.cam);
+    for (auto& u : g.units) if (u.tpl && u.tpl->isStatic() && !u.riding() && g.visibleToPlayer(u)) drawUnit(g, u, view.cam);
+    for (auto& u : g.units) if (u.tpl && !u.tpl->isStatic() && !u.riding() && g.visibleToPlayer(u)) drawUnit(g, u, view.cam);
 
     // RWX projectile trail (Projectile.update:921-939): effects.png cell 0 is a 25x25 grey puff taken
     // from the sheet at x=1+26*cell, y=1 (EffectManager.java:665-678). It fades in over 5 ticks to
@@ -823,6 +862,14 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
         // RWX clears shouldDraw once an ordinary shot lands (:1038-1040), but a beam keeps it and stays
         // drawn until its life runs out, so a landed beam is still rendered here.
         if (p.hit && !p.isBeam) continue;
+        // [projectile_N] alwaysVisibleInFog (CustomProjectileTemplate.java:74): a round keeps flying
+        // through the fog instead of disappearing. Everything else follows the same rule as a hull --
+        // the shooter's own rounds are always visible, a hostile one only while its tile is lit.
+        if (g.fogEnabled && !g.fog.empty() && p.team != g.playerTeam()) {
+            bool always = p.from && p.fromProj >= 0 && p.fromProj < (int)p.from->projectiles.size() &&
+                          p.from->projectiles[p.fromProj].alwaysVisibleInFog;
+            if (!always && g.fogAtWorld(p.pos) >= Game::FOG_EXPLORED) continue;
+        }
         Color tint{ (uint8_t)(p.color >> 24), (uint8_t)((p.color >> 16) & 0xFF),
                     (uint8_t)((p.color >> 8) & 0xFF), (uint8_t)p.color };
         if (p.isBeam) {

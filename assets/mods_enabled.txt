@@ -1,0 +1,3 @@
+# RP mod selection -- written by the Mods screen.
+# <id>|<folder>|<enabled|disabled>
+c3ac1ebe6902ccf0|mega_builders|disabled

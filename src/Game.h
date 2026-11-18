@@ -576,6 +576,28 @@ public:
     Vec2 nearestEnemyPos(int team);
     int playerTeam() const { return 0; }
 
+    // ---- fog of war ----
+    // RWX keeps one byte per tile per team (PlayerTeam.fogOfWarData) with three meaningful values:
+    // 0 = in sight right now, 5 = explored but out of sight, 10 = never seen (TileMap:1056-1058 fills
+    // the array with 10, updateFogVisibilityForTeamCircle:1519-1580 drops it to 0 inside a sight
+    // circle and ramps 0..10 across the rim). Everything >= 5 hides an enemy hull from the local
+    // player (BaseUnit.d(PlayerTeam):1431-1444) and dims the terrain, == 10 hides the terrain
+    // outright (TileMap:1731). RP keeps a single layer -- the one the human player sees -- because
+    // the AI has no visibility model to feed.
+    static constexpr uint8_t FOG_VISIBLE = 0;
+    static constexpr uint8_t FOG_EXPLORED = 5;
+    static constexpr uint8_t FOG_UNSEEN = 10;
+    std::vector<uint8_t> fog;      // w*h, row-major
+    bool fogEnabled = true;
+    void initFog();                // (re)allocate to map size and start fully unexplored
+    void updateFog();              // one pass: dim last tick's sight, then re-light every hull
+    void revealFogAt(Vec2 world, float tiles, uint8_t value);
+    uint8_t fogAt(int tx, int ty) const;
+    uint8_t fogAtWorld(Vec2 p) const;
+    // BaseUnit.d(PlayerTeam):1431-1444 -- the local player always sees its own hulls; anything else
+    // only while the tile it stands on is still lit.
+    bool visibleToPlayer(const Unit& u) const;
+
     float damage(Unit& target, float dmg, const Projectile* p = nullptr);
     void impact(Projectile& p, Unit* direct, Vec2 at);
     // UnitSpawner.a():203-449, the [projectile_N] spawnUnit list run at Projectile.update:1074-1076: the hulls

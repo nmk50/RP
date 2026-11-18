@@ -39,6 +39,9 @@ private:
     // RWX Tileset.initTextureMetrics: load tilesets/bitmaps/<imageKey>, columns = bitmapWidth / strideX.
     bool tilesetTexture(const TilesetRender& ts, Texture2D& out, int& columns);
     void drawMap(Game& g, const Camera2D& cam);
+    // RWX MapLayer's per-tile fog tint + the fog atlas behind it: never-seen tiles are black, explored
+    // ones are dimmed, tiles in sight get nothing. Drawn over the terrain and under every game object.
+    void drawFog(Game& g, const Camera2D& cam);
     void drawUnitShadow(const Unit& u);
     void drawUnit(Game& g, const Unit& u, const Camera2D& cam);
     void drawLegs(Game& g, const Unit& u, int pass, const Camera2D& cam);

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 #include "Game.h"
 #include "Renderer.h"
 #include "Debug.h"
+#include "Mods.h"
 
 // The map shipped with the project. Kept as a relative key so it can be joined
 // onto whichever assets root resolveAssetRoot() finds -- running rp.exe from the
@@ -75,6 +77,8 @@ struct UI {
     bool reclaimPick = false;
     // command marker anim
     bool markerOn = false; Vector2 markerPos; float markerT = 0;
+    // HUD tooltip text set while hovering the UnitInfo button (GameUI.drawActionTooltip).
+    std::string hudTip;
 };
 static UI ui;
 
@@ -85,8 +89,8 @@ static UI ui;
 //   About / Exit footer. Panel surface alpha is 0.52. RP lays the eight tiles out
 //   as 4 columns x 2 rows (RWX's own grid is two columns); the badge/label/footer
 //   styling still follows the Kotlin source.
-// Buttons that need engine features not ported yet (replay/multiplayer/mods/...)
-// fall back to a small "not available" toast; Single Player / Continue enter the game.
+// Buttons that need engine features not ported yet (replay/multiplayer/...) fall back to a small
+// "not available" toast; Single Player / Continue enter the game and Mods opens the mod screen.
 // ---------------------------------------------------------------------------
 enum class MenuAction { None, Continue, SinglePlayer, WatchReplay, Sandbox, Multiplayer,
                         Mods, ResourceBrowser, Settings, About, Exit };
@@ -672,6 +676,458 @@ struct LevelSelectScene {
 } // namespace LevelUI
 static LevelUI::LevelSelectScene g_levels;
 
+// ---------------------------------------------------------------------------
+// Mods screen, ported from RWX's Kotlin/Kool sources:
+//   ui/host/ModsSceneHost.kt          - scene layout: filter field + Back, one scrollable list
+//                                       grouped "Enabled" / "Disabled", Reload / Import File /
+//                                       Disable All / Apply action bar
+//   ui/component/ModsComponents.kt    - ModCard:160-248: 88dp card, 68dp thumbnail, title,
+//                                       author/version line, description clamped to 45dp,
+//                                       Enable/Disable button
+//   ui/UiTheme.kt:451-460             - content width 1180 (320..1560), viewport 560 (260..720),
+//                                       card 88, thumbnail 68, description 45
+//   app/ModsController.kt             - toggle/reload/disableAll/apply wiring
+// The data side is ModRegistry (src/Mods.h). Apply = ModManager.applyAndSaveMods():510-520, i.e.
+// persist the selection and reload every custom unit.
+// Delete is deliberately absent: ModInfo.canBeDeleted():584-595 answers false for anything that is
+// not a built-in archive, so on PC it is dead for every folder the user could point at.
+// Import File is a drag-and-drop here instead of a native file dialog -- dropping a folder or a
+// .rwmod onto the window copies it into assets/mods/units/ (ModRepository.importMod:68-75).
+// ---------------------------------------------------------------------------
+namespace ModUI {
+
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static std::string lower(std::string s) { for (char& c : s) c = (char)std::tolower((unsigned char)c); return s; }
+
+static std::string ellipsize(const std::string& s, int fs, float maxW) {
+    if (MeasureText(s.c_str(), fs) <= maxW) return s;
+    std::string t = s;
+    while (!t.empty() && MeasureText((t + "...").c_str(), fs) > maxW) t.pop_back();
+    return t + "...";
+}
+static void popLastChar(std::string& s) {
+    if (s.empty()) return;
+    size_t i = s.size() - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) --i;
+    s.erase(i);
+}
+static void popLastWord(std::string& s) {
+    while (!s.empty() && std::isspace((unsigned char)s.back())) popLastChar(s);
+    while (!s.empty() && !std::isspace((unsigned char)s.back())) popLastChar(s);
+}
+
+// Greedy word wrap that keeps a hard cap on the line count; the tail is folded into the last line
+// with an ellipsis, which is what ClampedText does in ModsComponents.kt:219-227.
+static std::vector<std::string> wrapText(const std::string& text, int fs, float maxW, int maxLines) {
+    std::vector<std::string> out;
+    std::string line;
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        if (c == '\n') {
+            out.push_back(line); line.clear(); ++i;
+            if ((int)out.size() >= maxLines) { line.clear(); break; }
+            continue;
+        }
+        if (!line.empty() && MeasureText((line + c).c_str(), fs) > maxW) {
+            size_t sp = line.find_last_of(' ');
+            if (c != ' ' && sp != std::string::npos && sp > 0) {
+                out.push_back(line.substr(0, sp));
+                line = line.substr(sp + 1);
+                if ((int)out.size() >= maxLines) { line.clear(); break; }
+                continue;                        // retry this character on the fresh line
+            }
+            out.push_back(line);
+            line.clear();
+            if ((int)out.size() >= maxLines) break;
+            if (c == ' ') { ++i; continue; }
+            continue;
+        }
+        line.push_back(c);
+        ++i;
+    }
+    if (!line.empty()) {
+        if ((int)out.size() < maxLines) out.push_back(line);
+        else if (!out.empty()) out.back() = ellipsize(out.back() + " " + line, fs, maxW);
+    }
+    return out;
+}
+
+struct ModScene {
+    static constexpr float CARD_H = 88, THUMB = 68, GAP = 6, HEADER_H = 30;
+    static constexpr float TOP_H = 46, BAR_H = 54, BACK_W = 96, BTN_W = 118, BTN_H = 34;
+
+    // A flattened list row: either a group header or an index into ModRegistry::all().
+    struct Row { int mod = -1; int header = 0; }; // header 1 = Enabled, 2 = Disabled
+
+    std::string query;
+    bool queryFocus = false, inited = false;
+    float scroll = 0, eraseRepeat = 0, caretBlink = 0;
+    std::string toast; float toastT = 0;
+    bool dirty = false;
+    std::vector<Row> rows;
+    std::unordered_map<std::string, Texture2D> thumbs;
+
+    struct Result { bool back = false; bool applied = false; };
+
+    void init() { if (!inited) { inited = true; rebuild(); } }
+    void close() {
+        for (auto& kv : thumbs) if (kv.second.id) UnloadTexture(kv.second);
+        thumbs.clear();
+        inited = false;
+    }
+    void showToast(const char* s) { toast = s; toastT = 2.5f; }
+
+    bool matches(const ModEntry& e) const {
+        std::string q = lower(Trim(query));
+        if (q.empty()) return true;
+        return lower(e.displayTitle()).find(q) != std::string::npos ||
+               lower(e.dirName).find(q) != std::string::npos ||
+               lower(e.description).find(q) != std::string::npos;
+    }
+
+    void rebuild() {
+        rows.clear();
+        const auto& all = g_mods.all();
+        for (int pass = 1; pass <= 2; ++pass) {
+            bool wantEnabled = (pass == 1);
+            int count = 0;
+            for (const ModEntry& e : all) if (e.enabled == wantEnabled && matches(e)) ++count;
+            if (count == 0) continue;
+            rows.push_back({ -1, pass });
+            for (size_t i = 0; i < all.size(); ++i)
+                if (all[i].enabled == wantEnabled && matches(all[i])) rows.push_back({ (int)i, 0 });
+        }
+    }
+
+    // Rescan the four roots but keep whatever the user has toggled in this session; a mod that was
+    // not on disk before takes its default state (ModManager.loadAllMods only resets new entries).
+    void reload() {
+        std::unordered_map<std::string, bool> keep;
+        for (const ModEntry& e : g_mods.all()) if (e.canToggle()) keep[e.uuid] = e.enabled;
+        g_mods.scan(g_assetsRoot);
+        for (ModEntry& e : g_mods.mutableAll()) {
+            auto it = keep.find(e.uuid);
+            if (it != keep.end()) e.enabled = it->second;
+        }
+        dirty = false;
+        scroll = 0;
+        rebuild();
+        showToast("Rescanned mods folder");
+    }
+
+    Texture2D* thumbFor(const ModEntry& e) {
+        if (e.thumbnail.empty()) return nullptr;
+        auto it = thumbs.find(e.thumbnail);
+        if (it == thumbs.end()) {
+            Texture2D t = LoadTexture(e.thumbnail.c_str());
+            it = thumbs.emplace(e.thumbnail, t).first;
+        }
+        return it->second.id ? &it->second : nullptr;
+    }
+
+    Result drawAndInput() {
+        Result res;
+        init();
+        int SW = GetScreenWidth(), SH = GetScreenHeight();
+        float k = clampf(std::min(SW / 1920.0f, SH / 1080.0f), 0.5f, 2.0f);
+        Vector2 mouse = GetMousePosition();
+
+        Color primary{ 90, 190, 220, 255 }, accent{ 240, 180, 70, 255 };
+        Color border{ 90, 100, 110, 180 }, surface{ 30, 35, 42, 235 }, sunken{ 20, 23, 28, 255 };
+        Color raised{ 46, 52, 60, 255 }, text{ 225, 230, 235, 255 }, sub{ 150, 160, 170, 255 };
+        Color danger{ 220, 100, 90, 255 };
+
+        DrawRectangle(0, 0, SW, SH, Color{ 10, 12, 16, 255 });
+        DrawRectangle(0, 0, SW, SH, Color{ 0, 0, 0, 133 });
+
+        float contentW = clampf(1180 * k, 320, 1560);
+        contentW = std::min(contentW, (float)SW - 40 * k);
+        float x0 = (SW - contentW) / 2;
+
+        int titleFs = (int)(26 * k);
+        DrawText("Mods", (int)x0, (int)(12 * k), titleFs, WHITE);
+        {
+            char st[192];
+            snprintf(st, sizeof(st), "%d of %d mod(s) enabled  |  %zu templates  |  drop a folder here to install",
+                     g_mods.enabledCount() - 1, g_mods.toggleableCount(), g_templates.order.size());
+            DrawText(st, (int)(x0 + MeasureText("Mods", titleFs) + 16 * k), (int)(18 * k), (int)(16 * k), sub);
+        }
+
+        // ---- top row: Back + filter (ModsFilterField) ----
+        float topY = (float)(12 * k) + titleFs + 10 * k;
+        Rectangle backR{ x0, topY, BACK_W * k, TOP_H * k };
+        bool backHot = CheckCollisionPointRec(mouse, backR);
+        DrawRectangleRec(backR, backHot ? raised : surface);
+        DrawRectangleLinesEx(backR, 1, backHot ? primary : border);
+        DrawText("Back", (int)(backR.x + (backR.width - MeasureText("Back", (int)(17 * k))) / 2),
+                 (int)(backR.y + (backR.height - 17 * k) / 2), (int)(17 * k), backHot ? primary : text);
+        if (backHot && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) res.back = true;
+
+        Rectangle input{ backR.x + backR.width + 10 * k, topY, contentW - backR.width - 10 * k, TOP_H * k };
+        bool inputHot = CheckCollisionPointRec(mouse, input);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) queryFocus = inputHot;
+        DrawRectangleRec(input, sunken);
+        DrawRectangleLinesEx(input, 1, queryFocus ? primary : border);
+        {
+            int fs = (int)(16 * k);
+            std::string shown = ellipsize(query.empty() && !queryFocus ? "Search mods" : query,
+                                          fs, input.width - 60 * k);
+            DrawText(shown.c_str(), (int)(input.x + 10 * k), (int)(input.y + (input.height - fs) / 2), fs,
+                     query.empty() ? sub : text);
+            if (queryFocus) {
+                caretBlink += GetFrameTime();
+                if (std::fmod(caretBlink, 1.0f) < 0.5f)
+                    DrawText("_", (int)(input.x + 11 * k + MeasureText(shown.c_str(), fs)),
+                             (int)(input.y + (input.height - fs) / 2 - 1), fs, primary);
+            }
+            if (!query.empty()) {
+                Rectangle clr{ input.x + input.width - 32 * k, input.y + (input.height - 26 * k) / 2, 26 * k, 26 * k };
+                bool clrHot = CheckCollisionPointRec(mouse, clr);
+                DrawRectangleRec(clr, clrHot ? Color{ 120, 70, 50, 255 } : Color{ 50, 40, 40, 255 });
+                DrawRectangleLinesEx(clr, 1, clrHot ? primary : border);
+                DrawText("x", (int)(clr.x + 9 * k), (int)(clr.y + 4 * k), (int)(17 * k), text);
+                if (clrHot && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { query.clear(); rebuild(); }
+            }
+        }
+        if (queryFocus) {
+            // Deletion is driven by key state only; raylib reports Backspace as char 8 on some
+            // platforms, so handling both would delete two characters per press.
+            int cp;
+            bool typed = false;
+            while ((cp = GetCharPressed()) > 0) {
+                if (cp >= 32 && cp < 127) { query += (char)cp; typed = true; }
+            }
+            bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            bool eraseDown = IsKeyDown(KEY_BACKSPACE) || IsKeyDown(KEY_DELETE);
+            if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_DELETE)) {
+                if (ctrl) popLastWord(query); else popLastChar(query);
+                eraseRepeat = 0.35f; typed = true;
+            } else if (eraseDown) {
+                eraseRepeat -= GetFrameTime();
+                if (eraseRepeat <= 0) {
+                    if (ctrl) popLastWord(query); else popLastChar(query);
+                    eraseRepeat = 0.06f; typed = true;
+                }
+            } else {
+                eraseRepeat = 0;
+            }
+            if (typed) rebuild();
+        } else {
+            eraseRepeat = 0;
+        }
+
+        // ---- bottom action bar (ModsActionBar) ----
+        float barY = (float)SH - BAR_H * k - 12 * k;
+        float listY = topY + TOP_H * k + 12 * k;
+        float listH = barY - 12 * k - listY;
+
+        // ---- scrollable list ----
+        float contentH = 0;
+        for (const Row& r : rows) contentH += (r.header ? HEADER_H : CARD_H) * k + GAP * k;
+        float maxScroll = std::max(0.0f, contentH - listH);
+        if (CheckCollisionPointRec(mouse, Rectangle{ x0, listY, contentW, listH })) {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f) scroll -= wheel * 60 * k;
+        }
+        if (IsKeyDown(KEY_DOWN) && !queryFocus) scroll += 400 * k * GetFrameTime();
+        if (IsKeyDown(KEY_UP) && !queryFocus) scroll -= 400 * k * GetFrameTime();
+        scroll = clampf(scroll, 0.0f, maxScroll);
+
+        BeginScissorMode((int)x0, (int)listY, (int)contentW, (int)listH);
+        float ry = listY - scroll;
+        for (const Row& r : rows) {
+            float h = (r.header ? HEADER_H : CARD_H) * k;
+            if (ry + h >= listY && ry <= listY + listH) {
+                if (r.header) drawHeader(Rectangle{ x0, ry, contentW, h }, r.header, k, text, sub, accent, primary);
+                else drawCard(Rectangle{ x0, ry, contentW, h }, r.mod, k, mouse,
+                              primary, accent, border, surface, sunken, raised, text, sub, danger);
+            }
+            ry += h + GAP * k;
+        }
+        if (rows.empty())
+            DrawText("No mods match the filter", (int)(x0 + 8 * k), (int)(listY + 12 * k), (int)(17 * k), sub);
+        EndScissorMode();
+
+        // scrollbar hint
+        if (maxScroll > 0.0f) {
+            float trackX = x0 + contentW + 6 * k;
+            float thumbH = std::max(24 * k, listH * (listH / contentH));
+            float t = scroll / maxScroll;
+            DrawRectangle((int)trackX, (int)(listY + t * (listH - thumbH)), (int)(4 * k), (int)thumbH,
+                          Color{ 120, 130, 140, 200 });
+        }
+
+        // ---- action bar: Reload / Disable All / Apply ----
+        struct BarBtn { const char* label; int id; };
+        BarBtn bar[3] = { { "Reload", 0 }, { "Disable All", 1 }, { "Apply", 2 } };
+        float bw = (contentW - 2 * 10 * k) / 3.0f;
+        for (int i = 0; i < 3; ++i) {
+            Rectangle r{ x0 + i * (bw + 10 * k), barY, bw, BAR_H * k };
+            bool hot = CheckCollisionPointRec(mouse, r);
+            bool strong = (bar[i].id == 2 && dirty);
+            Color fill = hot ? Color{ 60, 90, 110, 255 } : (strong ? Color{ 40, 70, 90, 255 } : surface);
+            DrawRectangleRec(r, fill);
+            DrawRectangleLinesEx(r, 1, hot || strong ? primary : border);
+            int fs = (int)(18 * k);
+            int tw = MeasureText(bar[i].label, fs);
+            DrawText(bar[i].label, (int)(r.x + (r.width - tw) / 2), (int)(r.y + (r.height - fs) / 2), fs,
+                     hot || strong ? WHITE : text);
+            if (hot && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+                if (bar[i].id == 0) reload();
+                else if (bar[i].id == 1) {
+                    g_mods.disableAll();
+                    dirty = true;
+                    rebuild();
+                } else {
+                    g_mods.saveSelection();
+                    res.applied = true;
+                }
+            }
+        }
+
+        // ---- drag & drop import (ModRepository.importMod:68-75) ----
+        if (IsFileDropped()) {
+            FilePathList dropped = LoadDroppedFiles();
+            int imported = 0;
+            for (unsigned i = 0; i < dropped.count; ++i) {
+                std::string src = dropped.paths[i];
+                size_t slash = src.find_last_of("/\\");
+                std::string name = (slash == std::string::npos) ? src : src.substr(slash + 1);
+                if (name.empty()) continue;
+                std::string dst = g_assetsRoot + "/mods/units/" + name;
+                std::error_code ec;
+                if (DirectoryExists(src.c_str())) {
+                    std::filesystem::copy(src, dst, std::filesystem::copy_options::recursive |
+                                                     std::filesystem::copy_options::overwrite_existing, ec);
+                } else if (EndsWith(lower(src), ".rwmod") || EndsWith(lower(src), ".zip")) {
+                    // An archive has to be unpacked, which RP cannot do without a zip reader; tell
+                    // the user to extract it rather than silently doing nothing.
+                    showToast("Extract the archive into assets/mods/units/ first");
+                    continue;
+                } else {
+                    std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+                }
+                if (!ec) ++imported;
+            }
+            UnloadDroppedFiles(dropped);
+            if (imported > 0) {
+                reload();
+                showToast("Imported - enable it above, then Apply");
+            }
+        }
+
+        // ---- toast ----
+        if (!toast.empty()) {
+            toastT -= GetFrameTime();
+            if (toastT <= 0) toast.clear();
+            else {
+                int fs = (int)(16 * k);
+                int tw = MeasureText(toast.c_str(), fs);
+                DrawRectangle(SW / 2 - tw / 2 - 12, (int)(barY - 40 * k), tw + 24, (int)(30 * k),
+                              Color{ 0, 0, 0, 210 });
+                DrawText(toast.c_str(), SW / 2 - tw / 2, (int)(barY - 33 * k), fs, accent);
+            }
+        }
+        return res;
+    }
+
+    void drawHeader(Rectangle r, int header, float k, Color text, Color sub, Color accent, Color primary) {
+        bool enabledGroup = (header == 1);
+        const char* label = enabledGroup ? "Enabled" : "Disabled";
+        int n = 0;
+        for (const ModEntry& e : g_mods.all()) if (e.enabled == enabledGroup && matches(e)) ++n;
+        int fs = (int)(18 * k);
+        DrawRectangle((int)r.x, (int)(r.y + r.height - 2 * k), (int)r.width, (int)(1 * k),
+                      Color{ 70, 80, 90, 160 });
+        DrawText(label, (int)(r.x + 4 * k), (int)(r.y + (r.height - fs) / 2), fs,
+                 enabledGroup ? primary : sub);
+        char cnt[32];
+        snprintf(cnt, sizeof(cnt), "(%d)", n);
+        DrawText(cnt, (int)(r.x + 8 * k + MeasureText(label, fs)), (int)(r.y + (r.height - fs) / 2), fs, accent);
+    }
+
+    void drawCard(Rectangle r, int index, float k, Vector2 mouse,
+                  Color primary, Color accent, Color border, Color surface, Color sunken,
+                  Color raised, Color text, Color sub, Color danger) {
+        if (index < 0 || index >= (int)g_mods.all().size()) return;
+        ModEntry& e = g_mods.mutableAll()[index];
+        bool hot = CheckCollisionPointRec(mouse, r);
+
+        DrawRectangleRec(r, hot ? Color{ 36, 42, 50, 245 } : surface);
+        DrawRectangleLinesEx(r, 1, e.error.empty() ? (hot ? primary : border) : danger);
+
+        float pad = 10 * k;
+        float x = r.x + pad;
+        // thumbnail (ModCardThumbnail:251-272)
+        if (Texture2D* t = thumbFor(e)) {
+            Rectangle box{ x, r.y + (r.height - THUMB * k) / 2, THUMB * k, THUMB * k };
+            DrawRectangleRec(box, Color{ 18, 20, 24, 255 });
+            DrawRectangleLinesEx(box, 1, border);
+            float s = std::min((box.width - 4 * k) / t->width, (box.height - 4 * k) / t->height);
+            DrawTextureEx(*t, Vector2{ box.x + (box.width - t->width * s) / 2,
+                                       box.y + (box.height - t->height * s) / 2 }, 0, s, WHITE);
+            x += THUMB * k + 12 * k;
+        }
+
+        // Enable/Disable button, right aligned (ModCardButton)
+        float btnW = (e.canToggle() ? BTN_W : 96) * k;
+        Rectangle btn{ r.x + r.width - btnW - pad, r.y + (r.height - BTN_H * k) / 2, btnW, BTN_H * k };
+        float textW = btn.x - x - 10 * k;
+
+        int titleFs = (int)(18 * k);
+        DrawText(ellipsize(e.displayTitle(), titleFs, textW).c_str(), (int)x, (int)(r.y + 8 * k), titleFs, text);
+
+        // meta line: kind + unit count + minVersion
+        {
+            char meta[192];
+            if (e.minVersion.empty())
+                snprintf(meta, sizeof(meta), "%s  |  %d ini", e.kindLabel(), e.iniCount);
+            else
+                snprintf(meta, sizeof(meta), "%s  |  %d ini  |  needs %s", e.kindLabel(), e.iniCount,
+                         e.minVersion.c_str());
+            DrawText(ellipsize(meta, (int)(14 * k), textW).c_str(), (int)x, (int)(r.y + 30 * k),
+                     (int)(14 * k), sub);
+        }
+        // description, clamped (modsCardDescriptionMaxHeight = 45dp)
+        {
+            int fs = (int)(14 * k);
+            std::string body = e.error.empty() ? e.description : e.error;
+            if (!body.empty()) {
+                auto lines = wrapText(body, fs, textW, 2);
+                for (size_t i = 0; i < lines.size(); ++i)
+                    DrawText(lines[i].c_str(), (int)x, (int)(r.y + 50 * k + i * (fs + 2 * k)), fs,
+                             e.error.empty() ? sub : danger);
+            } else {
+                DrawText(e.relPath.c_str(), (int)x, (int)(r.y + 50 * k), fs, Color{ 110, 120, 130, 255 });
+            }
+        }
+
+        // toggle button
+        bool btnHot = CheckCollisionPointRec(mouse, btn);
+        bool on = e.enabled;
+        Color fill = !e.canToggle() ? Color{ 40, 44, 50, 255 }
+                                  : (btnHot ? (on ? Color{ 120, 70, 50, 255 } : Color{ 40, 90, 70, 255 })
+                                            : (on ? Color{ 70, 45, 38, 255 } : Color{ 30, 60, 48, 255 }));
+        DrawRectangleRec(btn, fill);
+        DrawRectangleLinesEx(btn, 1, !e.canToggle() ? border : (btnHot ? accent : (on ? accent : primary)));
+        const char* lbl = !e.canToggle() ? "Always on" : (on ? "Disable" : "Enable");
+        int fs = (int)(16 * k);
+        int tw = MeasureText(lbl, fs);
+        DrawText(lbl, (int)(btn.x + (btn.width - tw) / 2), (int)(btn.y + (btn.height - fs) / 2), fs,
+                 e.canToggle() ? text : sub);
+        if (btnHot && e.canToggle() && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            e.enabled = !e.enabled;
+            dirty = true;
+            rebuild();
+        }
+    }
+};
+
+} // namespace ModUI
+static ModUI::ModScene g_modScene;
+
+
 // RWX draws the zoomed-out hull as teamColoredIconTextures[team.getTeamColorIndex()] (CustomUnit.v():664-668),
 // so the dot here takes the same slot of the same ten-colour table the sprites are dyed with.
 static Color TC(int t) {
@@ -810,6 +1266,13 @@ static void renderHUD(Game& g, Camera2D& cam) {
         Color c = t.water ? Color{ 40, 96, 160, 255 }
                 : (t.blocked ? Color{ 86, 86, 92, 255 }
                 : (t.resource ? Color{ 150, 140, 80, 255 } : Color{ 70, 130, 60, 255 }));
+        // Minimap:440-470 -- the terrain under fog is washed out, and a tile that was never seen is
+        // not drawn at all, which is what leaves the black border around the explored part.
+        if (g.fogEnabled && !g.fog.empty()) {
+            uint8_t f = g.fog[(size_t)y * g.map.w + x];
+            if (f >= Game::FOG_UNSEEN) continue;
+            if (f >= Game::FOG_EXPLORED) c = Color{ (uint8_t)(c.r / 3), (uint8_t)(c.g / 3), (uint8_t)(c.b / 3), 255 };
+        }
         DrawRectangle(mm.x + x * tsx, mm.y + y * tsy, std::ceil(tsx) + 0.5f, std::ceil(tsy) + 0.5f, c);
     }
     for (auto& u : g.units) {
@@ -817,6 +1280,9 @@ static void renderHUD(Game& g, Camera2D& cam) {
         // Scenery is team -1 (the tileset says `team=none`) and RWX's Minimap only plots real units,
         // so a forest never turns into a field of red dots.
         if (u.team < 0 || u.tplKey == "tree") continue;
+        // Minimap:465 -- a blip only shows while its tile is in sight, so an enemy army does not
+        // announce itself from inside the fog.
+        if (!g.visibleToPlayer(u)) continue;
         Color c = u.team == g.playerTeam() ? Color{ 0, 255, 0, 255 } : Color{ 255, 60, 60, 255 };
         float sz = (u.tpl->isBuilding ? 3.0f : 2.0f) * std::max(1.0f, k);
         DrawRectangle(mm.x + u.pos.x * sx - sz / 2, mm.y + u.pos.y * sy - sz / 2, sz, sz, c);
@@ -842,29 +1308,152 @@ static void renderHUD(Game& g, Camera2D& cam) {
     DrawText(g_debug.paused ? "Paused" : "Editor Active", px(14), px(66), px(19),
              Color{ 90, 220, 90, 255 });
 
-    // ---- credits at top-right of the map, left of the minimap (GameUI.highlightRect) ----
-    float income = 0;
-    for (auto& u : g.units)
-        if (u.team == g.playerTeam() && u.tpl && !u.dead) income += u.tpl->resourceRate;
-    income /= 40.0f;
-    int credits = me ? (int)me->credits : 0;
-    std::string cs = std::to_string(std::abs(credits));
-    for (int i = (int)cs.size() - 3; i > 0; i -= 3) cs.insert(i, " ");
-    char cbuf[96];
-    snprintf(cbuf, sizeof(cbuf), "$%s(%+d)", cs.c_str(), (int)income);
-    int rsize = px(26);
-    int cw = MeasureText(cbuf, rsize);
-    // subtle dark backing so the green text stays readable on light terrain
-    DrawRectangle(sideX - cw - px(18), px(8), cw + px(14), px(36), Color{ 0, 0, 0, 90 });
-    DrawText(cbuf, sideX - cw - px(12), px(12), rsize, Color{ 90, 220, 90, 255 });
-
-    // ---- selected units ----
+    // ---- team resources (GameUI.processTouchInput:1348-1360 / drawTeamResources:1403-1417) ----
+    // Always show the player's team; when the first controllable selected unit belongs to a
+    // different team, RWX draws that team's resources as a second row as well.
     auto sel = g.selectedUnits();
+    // BaseUnit.getCreditIncomeRate (CustomUnit:1215-1221) is the generation lump scaled by
+    // CustomUnitConfigParser:1527 generationRate = 40 / generationDelay, i.e. a per-40-tick
+    // figure. Per second that is lump * (40/delay) * 60/40 = lump * 60/delay; at the default
+    // delay of 40 it collapses to the familiar 1.5x.
+    auto incomePerSec = [](const UnitTemplate& t) -> float {
+        if (t.creditIncomeRate == 0.0f) return 0.0f;
+        float d = (float)(t.generationDelay > 0 ? t.generationDelay : 40);
+        return t.creditIncomeRate * (40.0f / d) * 1.5f;
+    };
+    // Utility.padString:602-607 / toHexString:610-615 -- a whole number loses its decimal,
+    // anything else keeps one digit. Both the button text and the tooltip use it.
+    auto fmtRate = [](float v) -> std::string {
+        char b[32];
+        float a = std::fabs(v);
+        if (a == (float)(int)a) snprintf(b, sizeof(b), "%d", (int)a);
+        else snprintf(b, sizeof(b), "%.1f", a);
+        return std::string(b);
+    };
+    auto teamIncome = [&](int teamId) {
+        float v = 0;
+        for (auto& u : g.units)
+            if (u.team == teamId && u.tpl && !u.dead) v += incomePerSec(*u.tpl);
+        return (int)std::lround(v);
+    };
+    auto drawTeamRow = [&](const Team* tm, int row, const char* prefix, Color col) {
+        if (!tm) return;
+        int inc = teamIncome(tm->id);
+        std::string cs = std::to_string((int)std::abs(tm->credits));
+        for (int i = (int)cs.size() - 3; i > 0; i -= 3) cs.insert(i, " ");
+        char b[128];
+        snprintf(b, sizeof(b), "%s$%s(%+d)", prefix, cs.c_str(), inc);
+        int fs = px(26);
+        int w = MeasureText(b, fs);
+        DrawRectangle(sideX - w - px(18), px(8) + row * px(32), w + px(14), px(32), Color{ 0, 0, 0, 90 });
+        DrawText(b, sideX - w - px(12), px(10) + row * px(32), fs, col);
+    };
+    drawTeamRow(me, 0, "", Color{ 90, 220, 90, 255 });
+    const Unit* firstSel = sel.empty() ? nullptr : sel.front();
+    if (firstSel && firstSel->team != g.playerTeam()) {
+        Team* other = nullptr;
+        for (auto& t : g.teams) if (t.id == firstSel->team) other = &t;
+        drawTeamRow(other, 1, "Enemy ", Color{ 240, 130, 110, 255 });
+    }
 
     // ---- command grid inside the sidebar: two compact columns ----
-    struct PBtn { bool upgrade; bool reclaim = false; std::string label; float price; std::string key; };
+    std::string detailTip;
+    struct PBtn { bool upgrade; bool reclaim = false; bool selType = false; int info = 0; std::string label; float price; std::string key; };
     std::vector<PBtn> btns;
-    for (auto* it : buildableOptions(g)) btns.push_back({ false, false, it->displayText, it->price, it->name });
+    // GameUI.setupInterfaceFlags:610-615 -- bO is true on PC, and SettingsEngine:188
+    // defaults showSelectedUnitsList to true, so every selection prepends one
+    // SelectUnitTypeAction per unit type (GameInterfaceRenderer:904-949). The label is
+    // "UnitName xN" (SelectUnitTypeAction:99-105); count desc is the PC sort order
+    // (:939-945: sort, reverse, then insert at 0).
+    std::vector<std::pair<std::string, int>> typeCounts;
+    for (auto* s : sel) {
+        if (!s || !s->tpl) continue;
+        std::string k = ToLower(s->tpl->name);
+        bool found = false;
+        for (auto& e : typeCounts) if (e.first == k) { ++e.second; found = true; break; }
+        if (!found) typeCounts.push_back({ k, 1 });
+    }
+    std::sort(typeCounts.begin(), typeCounts.end(),
+              [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b) {
+                  return a.second > b.second;
+              });
+    for (auto& e : typeCounts) {
+        const UnitTemplate* t = g_templates.find(e.first);
+        if (!t) continue;
+        PBtn b; b.upgrade = false; b.selType = true;
+        b.label = t->displayText + " x" + std::to_string(e.second);
+        b.price = 0; b.key = e.first;
+        btns.push_back(b);
+    }
+    // GameInterfaceRenderer:850-853 inserts UnitInfoAction(false) on PC. Its button
+    // text is the compact BaseUnit text (:2084-2112) and it stands for the selected
+    // hull, so RP draws that hull's own icon on it. The team-info action is intentionally
+    // omitted: the command grid must not show team information here. The detailed text
+    // (:2144-2238) is a hover tooltip from UnitInfoAction.getDescription():153-168.
+    ui.hudTip.clear();
+    if (!sel.empty()) {
+        const Unit* rep = nullptr;
+        for (auto* s : sel) if (s->team == g.playerTeam() && s->tpl && !s->dead) { rep = s; break; }
+        if (!rep && sel.front()->tpl) rep = sel.front();
+        if (rep && rep->tpl) {
+            // GameInterfaceRenderer.a(BaseUnit,boolean):2084-2112 is the button's display text
+            // (UnitInfoAction.d():86-101). It is a multi-line block: hp/maxHp (or the price form
+            // for a resource node), then "(shield/maxShield)", then one line per non-zero
+            // generation rate -- credits as "+$3" / "-$2" (Resource.a(double,true,false):285-305
+            // prints "$" for the credit resource). A zero rate prints nothing at all (:2106).
+            char ib[192];
+            if (rep->tpl->resourceRate > 0.0f) {
+                float frac = rep->maxHp > 0 ? rep->hp / rep->maxHp : 0.0f;
+                snprintf(ib, sizeof(ib), "$%.0f", rep->tpl->price * frac);
+            } else {
+                snprintf(ib, sizeof(ib), "%.0f/%d", std::ceil(rep->hp), (int)std::ceil(rep->maxHp));
+            }
+            std::string ilabel = ib;
+            if (rep->shieldMax > 0) {
+                snprintf(ib, sizeof(ib), "\n(%.0f/%.0f)", rep->shield, rep->shieldMax);
+                ilabel += ib;
+            }
+            float perSec = incomePerSec(*rep->tpl);
+            if (perSec != 0.0f) {
+                ilabel += perSec > 0 ? "\n+$" : "\n-$";
+                ilabel += fmtRate(perSec);
+            }
+            PBtn ibtn; ibtn.info = 1; ibtn.label = ilabel; ibtn.price = 0;
+            ibtn.key = rep->tpl->name;   // this button stands for the selected hull: show its own art
+            btns.push_back(ibtn);
+
+            const UnitTemplate& t = *rep->tpl;
+            detailTip = t.displayText;
+            snprintf(ib, sizeof(ib), "\nHP: %d/%d", (int)std::ceil(rep->hp), (int)std::ceil(rep->maxHp));
+            detailTip += ib;
+            if (rep->shieldMax > 0) {
+                snprintf(ib, sizeof(ib), "\nShield: %d/%d", (int)rep->shield, (int)rep->shieldMax);
+                detailTip += ib;
+            }
+            // :2182-2193 -- "Income: +$X" / "Income: -$X", and the whole line is skipped at 0.
+            float income = incomePerSec(t);
+            if (income != 0.0f) {
+                snprintf(ib, sizeof(ib), "\nIncome: %s$%s", income > 0 ? "+" : "-", fmtRate(income).c_str());
+                detailTip += ib;
+            }
+            if (t.maxEnergy > 0) {
+                snprintf(ib, sizeof(ib), "\nEnergy: %.0f/%.0f", rep->energy, t.maxEnergy);
+                detailTip += ib;
+            }
+            if (t.moveSpeed > 0) { snprintf(ib, sizeof(ib), "\nSpeed: %.2f", t.moveSpeed); detailTip += ib; }
+            if (t.canAttack) {
+                float dmg = 0;
+                if (!t.turrets.empty()) {
+                    int pi = t.turrets[0].projectile;
+                    if (pi >= 0 && pi < (int)t.projectiles.size()) dmg = t.projectiles[pi].directDamage;
+                }
+                snprintf(ib, sizeof(ib), "\nAttack: %.0f", dmg);
+                detailTip += ib;
+                if (t.attackRange > 0) { snprintf(ib, sizeof(ib), "\nRange: %.0f", t.attackRange); detailTip += ib; }
+            }
+        }
+    }
+    for (auto* it : buildableOptions(g)) btns.push_back({ false, false, false, 0, it->displayText, it->price, it->name });
     bool anyReclaimer = false;
     for (auto* s : sel) {
         if (s->team != g.playerTeam() || !s->tpl) continue;
@@ -872,79 +1461,163 @@ static void renderHUD(Game& g, Camera2D& cam) {
         for (auto& a : s->tpl->actions) {
             bool dup = false;
             for (auto& o : btns) if (o.upgrade && o.key == a.convertTo) dup = true;
-            if (!dup) btns.push_back({ true, false, a.text, a.price, a.convertTo });
+            if (!dup) btns.push_back({ true, false, false, 0, a.text, a.price, a.convertTo });
         }
     }
-    if (anyReclaimer) btns.push_back({ false, true, "Reclaim", 0, "" });
+    if (anyReclaimer) btns.push_back({ false, true, false, 0, "Reclaim", 0, "" });
 
     if (CheckCollisionPointRec(mouse, Rectangle{ sideX, mm.height, side, SH - mm.height }))
         ui.overPanel = true;
 
     float cellW = (side - 16 * k) / 2.0f, cellH = 52 * k, gap = 4 * k;
-    float gy = mm.height + 8 * k;
-    // Selected-unit readout occupies the first row, like RWX's info cells.
-    if (!sel.empty()) {
-        const Unit* u = sel.front();
-        char ib[64];
-        if (sel.size() > 1)
-            snprintf(ib, sizeof(ib), "%zux %s", sel.size(), u->tpl ? u->tpl->displayText.c_str() : "Units");
-        else
-            snprintf(ib, sizeof(ib), "%s", u->tpl ? u->tpl->displayText.c_str() : "Unit");
-        DrawText(ib, (int)(sideX + 8 * k), (int)gy, px(19), Color{ 150, 220, 150, 255 });
-        if (u->maxHp > 0) {
-            Rectangle hb{ sideX + 8 * k, gy + 22 * k, side - 16 * k, 8 * k };
-            DrawRectangleRec(hb, Color{ 60, 20, 20, 255 });
-            DrawRectangle(hb.x, hb.y, hb.width * std::max(0.0f, u->hp / u->maxHp), hb.height,
-                          Color{ 0, 200, 0, 255 });
-            snprintf(ib, sizeof(ib), "%d/%d", (int)std::ceil(u->hp), (int)std::ceil(u->maxHp));
-            DrawText(ib, (int)(sideX + side - 8 * k - MeasureText(ib, px(17))), (int)(gy + 22 * k),
-                     px(17), WHITE);
-        }
-        gy += 38 * k;
-    }
+    // RWX GameInterfaceRenderer.d():1241/1267-1269 -- the command grid starts at
+    // minimap.bottom + 2 + i() + 2, where i() is 36 at 1080p (:1965-1966). On PC the
+    // reserved strip stays empty: bQ is true (GameUI:614), so the unselect-all button
+    // and compact info text at :2030-2051 are skipped entirely.
+    float gy = mm.height + 40 * k;
 
-    int cols = 2;
+    int cols = 2, cmdIdx = 0;
     for (size_t i = 0; i < btns.size(); ++i) {
         int col = (int)i % cols, row = (int)i / cols;
         Rectangle btn{ sideX + 6 * k + col * (cellW + gap), gy + row * (cellH + gap), cellW, cellH };
         if (btn.y + cellH > SH - 2) break;
         PBtn& b = btns[i];
         bool hover = CheckCollisionPointRec(mouse, btn);
-        bool afford = me && me->credits >= b.price;
+        // SelectUnitTypeAction.getCostAmount() is 0 and getCost() is true: this button is
+        // always available regardless of the player's credits.
+        bool afford = b.selType || b.info > 0 || (me && me->credits >= b.price);
         DrawRectangleRec(btn, hover ? Color{ 58, 58, 62, 255 } : Color{ 34, 34, 38, 255 });
         DrawRectangleLinesEx(btn, 1, afford ? Color{ 90, 90, 95, 255 } : Color{ 60, 50, 50, 255 });
 
         Texture2D icon{};
         bool drew = false;
-        if (!b.upgrade && !b.reclaim) {
+        // The info block is multi-line, so the hull preview moves to the left edge and the
+        // numbers get the space beside it -- otherwise the text would bury the art the user
+        // asked this button to show.
+        bool infoLayout = (b.info == 1);
+        float textL = btn.x + 3 * k, textR = btn.x + btn.width - 3 * k;
+        // A unit-representing button (type button, build button, UnitInfo button)
+        // draws that unit's own preview via UnitTypeEnum.drawUnit (GIR:1585-1604).
+        if (!b.upgrade && !b.reclaim && (b.selType || b.info == 0 || b.info == 1)) {
             const UnitTemplate* t = g_templates.find(ToLower(b.key));
             if (t && g_render.unitIcon(t->name, icon)) {
-                drawHudIcon(icon, Rectangle{ btn.x + 5 * k, btn.y + 3 * k, btn.width - 10 * k,
-                                             btn.height - 20 * k }, WHITE, true);
+                Rectangle ir{ btn.x + 5 * k, btn.y + 3 * k, btn.width - 10 * k, btn.height - 20 * k };
+                if (infoLayout) {
+                    float isz = btn.height - 10 * k;
+                    ir = Rectangle{ btn.x + 4 * k, btn.y + 5 * k, isz, isz };
+                    textL = ir.x + ir.width + 2 * k;
+                    textR = btn.x + btn.width - 3 * k;
+                }
+                drawHudIcon(icon, ir, WHITE, true);
                 drew = true;
             }
         }
-        if (!drew)
+        // AbstractUnitAction.getIconTexture():429-434 only supplies an icon for upgrade
+        // actions; UnitInfoAction and SelectUnitTypeAction have none. A type button draws
+        // the unit itself (GIR:1585-1604), so a failed unitIcon must not fall back to the
+        // upgrade arrow.
+        if (!drew && (b.upgrade || b.reclaim))
             drawHudIcon(b.reclaim ? g_hudArt.buildIcon : g_hudArt.upgrade,
                         Rectangle{ btn.x + 10 * k, btn.y + 5 * k, btn.width - 20 * k, btn.height - 22 * k },
                         Color{ 200, 230, 200, 255 });
 
-        if (i < 9) DrawText(TextFormat("%d", (int)i + 1), (int)(btn.x + 4 * k), (int)(btn.y + 3 * k),
-                            px(15), Color{ 200, 200, 200, 220 });
-        std::string label = b.label.size() > 8 ? b.label.substr(0, 7) + "." : b.label;
+        // Info-unit buttons have no key binding (GameInterfaceRenderer:815-821 returns null
+        // for infoOnly actions), so the 1-9 hints belong only to real commands.
+        if (!b.selType && b.info == 0) {
+            if (cmdIdx < 9) DrawText(TextFormat("%d", cmdIdx + 1), (int)(btn.x + 4 * k), (int)(btn.y + 3 * k),
+                                     px(15), Color{ 200, 200, 200, 220 });
+            ++cmdIdx;
+        }
+        if (hover && b.info == 1) ui.hudTip = detailTip;
+        // GameInterfaceRenderer:1658-1718 -- an infoOnly action prints its whole display text,
+        // and for UnitInfoAction that is the multi-line "hp\n(shield)\n+$N" block. Multi-line
+        // text is split on '\n' and stacked, centred vertically in the button (:1710-1715).
+        std::vector<std::string> lines;
+        {
+            std::string cur;
+            for (char ch : b.label) {
+                if (ch == '\n') { lines.push_back(cur); cur.clear(); }
+                else cur.push_back(ch);
+            }
+            lines.push_back(cur);
+        }
         int lsize = px(15);
-        int lw = MeasureText(label.c_str(), lsize);
-        DrawText(label.c_str(), (int)(btn.x + (btn.width - std::min<float>(lw, btn.width - 6 * k)) / 2),
-                 (int)(btn.y + btn.height - 17 * k), lsize,
-                 afford ? Color{ 150, 220, 150, 255 } : Color{ 150, 110, 110, 255 });
+        float lineH = 17 * k;
+        float ly = btn.y + btn.height - lineH * (float)lines.size();
+        if (lines.size() > 1 && !drew) {
+            // No hull preview to sit on, but keep the same dark plate so the block stays legible
+            // over the button fill.
+            DrawRectangle((int)(btn.x + 2 * k), (int)(ly - 1 * k), (int)(btn.width - 4 * k),
+                          (int)(lineH * (float)lines.size() + 1 * k), Color{ 0, 0, 0, 110 });
+        }
+        // Fit each line into the button: shrink the font first and only cut characters when even the
+        // smallest step overflows. A blanket 8-character cap used to swallow the count on a type
+        // button's "Name xN" label, which is the one number that button exists to show.
+        float avail = textR - textL;
+        for (size_t li = 0; li < lines.size(); ++li) {
+            std::string label = lines[li];
+            int fs = lsize;
+            while (fs > px(11) && MeasureText(label.c_str(), fs) > avail) --fs;
+            while (label.size() > 1 && MeasureText(label.c_str(), fs) > avail) label.pop_back();
+            int lw = MeasureText(label.c_str(), fs);
+            DrawText(label.c_str(), (int)(textL + (avail - std::min<float>(lw, avail)) / 2),
+                     (int)(ly + li * lineH), fs,
+                     afford ? Color{ 150, 220, 150, 255 } : Color{ 150, 110, 110, 255 });
+        }
         if (!b.reclaim && b.price > 0) {
             char pc[24]; snprintf(pc, sizeof(pc), "%d", (int)b.price);
             DrawText(pc, (int)(btn.x + 4 * k), (int)(btn.y + 3 * k), px(15),
                      afford ? Color{ 240, 220, 90, 255 } : Color{ 160, 120, 120, 255 });
         }
+        // GameInterfaceRenderer:1606-1636 -- a queued unit's own buildProgress rides on
+        // the producing factory's button as a 3px blue bar.
+        if (b.info == 0 && !b.upgrade && !b.reclaim) {
+            for (auto* s : sel) {
+                if (!s->tpl || !s->tpl->isFactory || s->prodQueue.empty()) continue;
+                if (ToLower(s->prodQueue.front()) != ToLower(b.key)) continue;
+                float pr = std::max(0.0f, std::min(1.0f, s->prodProgress));
+                DrawRectangle(btn.x + 4 * k, btn.y + btn.height - 4 * k,
+                              (btn.width - 8 * k) * pr, 2 * k, Color{ 0, 90, 220, 255 });
+                break;
+            }
+        }
 
+        if (hover && b.selType && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            // SelectUnitTypeAction.onClicked:90-95 -- right click drops this type.
+            for (auto& u : g.units)
+                if (u.selected && u.tpl && ToLower(u.tpl->name) == ToLower(b.key)) u.selected = false;
+            continue;
+        }
+        // QueueUnitAction.isHighPriority():101-103 -> GIR:1787-1795 maps left click to
+        // 1 queue entry, Shift to 5, Ctrl to 10; right click sets stopCurrentAction
+        // (GIR:1753/1802-1804) which removes one queued hull and refunds its price.
+        bool queueBtn = b.info == 0 && !b.selType && !b.upgrade && !b.reclaim;
+        if (hover && queueBtn && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            for (auto* s : sel) {
+                if (!s->tpl || !s->tpl->isFactory || s->prodQueue.empty()) continue;
+                for (int qi = (int)s->prodQueue.size() - 1; qi >= 0; --qi) {
+                    if (ToLower(s->prodQueue[qi]) != ToLower(b.key)) continue;
+                    const UnitTemplate* u = g_templates.find(s->prodQueue[qi]);
+                    s->prodQueue.erase(s->prodQueue.begin() + qi);
+                    if (u) g.reward(s->team, u->price);
+                    break;
+                }
+            }
+            continue;
+        }
         if (hover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && afford) {
-            if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; }
+            if (b.info > 0) continue; // UnitInfo buttons only show a tooltip
+            if (b.selType) {
+                // :72-89 -- left click only means something on a mixed selection: it
+                // deselects every other type, leaving this one exclusively selected.
+                bool changed = false;
+                for (auto& u : g.units) {
+                    if (!u.selected || !u.tpl || ToLower(u.tpl->name) == ToLower(b.key)) continue;
+                    u.selected = false; changed = true;
+                }
+                if (!changed) continue;
+            }
+            else if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; }
             else if (b.upgrade) {
                 for (auto* u : sel) {
                     if (!u->tpl) continue;
@@ -956,10 +1629,42 @@ static void renderHUD(Game& g, Camera2D& cam) {
             } else if (g_templates.find(ToLower(b.key)) && g_templates.find(ToLower(b.key))->isBuilding) {
                 ui.placing = true; ui.placingName = b.key;
             } else {
-                for (auto* u : sel) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, b.key);
+                int reps = 1;
+                if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) reps = 5;
+                else if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) reps = 10;
+                for (int n = 0; n < reps; ++n)
+                    for (auto* u : sel) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, b.key);
             }
         }
     }
+
+    // UnitInfoAction.getDescription() is a hover tooltip (GameUI:4109-4193).
+    if (!ui.hudTip.empty()) {
+        int tfs = px(15), maxw = 0;
+        std::vector<std::string> lines;
+        size_t pos = 0;
+        while (true) {
+            size_t nl = ui.hudTip.find('\n', pos);
+            std::string ln = ui.hudTip.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            lines.push_back(ln);
+            maxw = std::max(maxw, MeasureText(ln.c_str(), tfs));
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+        float tw = std::min((float)(maxw + px(20)), (float)(SW - 20));
+        float th = (float)(lines.size() * px(20) + px(12));
+        Rectangle tip{ std::min(mouse.x + 16, (float)(SW - tw - 8)),
+                       std::min(mouse.y + 16, (float)(SH - th - 8)), tw, th };
+        DrawRectangleRec(tip, Color{ 18, 20, 22, 245 });
+        DrawRectangleLinesEx(tip, 1, Color{ 110, 130, 110, 255 });
+        for (size_t i = 0; i < lines.size(); ++i)
+            DrawText(lines[i].c_str(), (int)(tip.x + px(8)), (int)(tip.y + px(6) + i * px(20)),
+                     tfs, Color{ 160, 225, 160, 255 });
+    }
+
+    // PC (GameUI.bQ=true) skips the compact info text block at
+    // GameInterfaceRenderer:2030-2051; the selected-unit UI is the Name xN buttons
+    // prepended to the grid above.
 
     // Selection circles are already drawn by Renderer::drawUnit; no extra HUD box.
 
@@ -1051,12 +1756,16 @@ static void resetCamera(Camera2D& cam, Game& game, int SW, int SH) {
 int main(int argc, char** argv) {
     // Optional headless-ish screenshot: `rp.exe --shot out.png [N]` renders N frames
     // (default 3) then writes the screen buffer to PNG and exits. Normal play is untouched.
-    std::string shotPath, mapOverride, testUpgrade, testWeapon, testBuild, testDamage;
+    std::string shotPath, mapOverride, testUpgrade, testWeapon, testBuild, testDamage, testRepair, selectTpl, testMods;
     int shotFrame = 3;
-    bool startInGame = false, startInLevels = false;
+    bool startInGame = false, startInLevels = false, startInMods = false;
     bool checkMaps = false;
     bool checkBuiltins = false;
     bool unusedKeys = false;
+    bool listMods = false;
+    bool noFog = false;
+    bool testFog = false;
+    bool fogDemo = false;
     // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
     // exists for the screenshot harness and for testing smaller windows.
     int winW = 1920, winH = 1080;
@@ -1066,14 +1775,22 @@ int main(int argc, char** argv) {
         else if (a == "--frames" && i + 1 < argc) { shotFrame = atoi(argv[++i]); }
         else if (a == "--game") startInGame = true;
         else if (a == "--levels") startInLevels = true;
+        else if (a == "--mods") startInMods = true;
         else if (a == "--checkmaps") checkMaps = true;
         else if (a == "--checkbuiltins") checkBuiltins = true;
+        else if (a == "--listmods") listMods = true;
+        else if (a == "--nofog") noFog = true;
+        else if (a == "--testfog") testFog = true;
+        else if (a == "--fogdemo") fogDemo = true;
         else if (a == "--unusedkeys") unusedKeys = true;
         else if (a == "--testupgrade" && i + 1 < argc) { testUpgrade = argv[++i]; }
         else if (a == "--testbuild" && i + 1 < argc) { testBuild = argv[++i]; }
         else if (a == "--testdamage" && i + 1 < argc) { testDamage = argv[++i]; }
+        else if (a == "--testrepair" && i + 1 < argc) { testRepair = argv[++i]; }
+        else if (a == "--testmods" && i + 1 < argc) { testMods = argv[++i]; }
         else if (a == "--testweapon" && i + 1 < argc) { testWeapon = argv[++i]; }
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
+        else if (a == "--select" && i + 1 < argc) { selectTpl = argv[++i]; }
         else if (a == "--size" && i + 1 < argc) {
             // "--size 1920x1080" -- the surface RWX's HUD metrics are authored against
             const char* sz = argv[++i];
@@ -1128,6 +1845,72 @@ int main(int argc, char** argv) {
     g_iniUnusedKeyReport = unusedKeys;
     g_templates.loadAll(g_assetsRoot);
     TraceLog(LOG_INFO, TextFormat("Loaded %zu unit templates", g_templates.order.size()));
+
+    if (listMods) {
+        // `--listmods` prints what the ModRegistry found and what each root contributed. It is the
+        // machine gate for the mod layer: a mod that is enabled but contributes no template, or an
+        // entry whose .ini count is 0, shows up here instead of as an empty build menu in game.
+        for (const ModEntry& e : g_mods.all()) {
+            TraceLog(LOG_INFO, "MOD %-14s %-28s %-8s ini=%-3d %s",
+                     e.enabled ? "enabled" : "disabled", e.dirName.c_str(), e.kindLabel(), e.iniCount,
+                     e.error.empty() ? e.relPath.c_str() : e.error.c_str());
+        }
+        TraceLog(LOG_INFO, "listmods: %d of %d toggleable mod(s) enabled, core ini=%d, %zu templates, selection=%s",
+                 g_mods.enabledCount() - 1, g_mods.toggleableCount(),
+                 g_mods.all().empty() ? 0 : g_mods.all()[0].iniCount,
+                 g_templates.order.size(), g_mods.selectionPath().c_str());
+        CloseWindow();
+        return 0;
+    }
+
+    if (!testMods.empty()) {
+        // `--testmods <folder>` proves the whole mod loop end to end: force the entry off to get a
+        // baseline, toggle it on, persist the selection, reload every custom unit, confirm the store
+        // actually changed, then put the selection back the way it was. mega_builders is the shipped
+        // example and it overrides `builder` via overrideAndReplace, so both the template count and
+        // that hull's hp move. Every lookup re-finds the entry by name, because loadAll rescans.
+        auto findIdx = [&]() -> int {
+            for (size_t i = 0; i < g_mods.all().size(); ++i)
+                if (ToLower(g_mods.all()[i].dirName) == ToLower(testMods)) return (int)i;
+            return -1;
+        };
+        if (findIdx() < 0) {
+            TraceLog(LOG_WARNING, "testmods: no mod named '%s'", testMods.c_str());
+            CloseWindow();
+            return 1;
+        }
+        bool orig = g_mods.all()[findIdx()].enabled;
+        g_mods.setEnabled((size_t)findIdx(), false);
+        g_mods.saveSelection();
+        g_templates.loadAll(g_assetsRoot);
+        size_t baseN = g_templates.order.size();
+        const UnitTemplate* b0 = g_templates.find("builder");
+        int baseHp = b0 ? (int)b0->maxHp : -1;
+
+        g_mods.setEnabled((size_t)findIdx(), true);
+        g_mods.saveSelection();
+        g_templates.loadAll(g_assetsRoot);
+        size_t onN = g_templates.order.size();
+        const UnitTemplate* b1 = g_templates.find("builder");
+        int onHp = b1 ? (int)b1->maxHp : -1;
+        bool changed = (onN != baseN) || (onHp != baseHp);
+
+        g_mods.setEnabled((size_t)findIdx(), orig);
+        int ri = findIdx();
+        g_mods.saveSelection();
+        g_templates.loadAll(g_assetsRoot);
+        size_t backN = g_templates.order.size();
+        // The restored count has to match what the test started with, which is onN when the mod was
+        // already on before the run and baseN when it was off -- comparing against baseN alone made
+        // the gate fail whenever the selection file happened to have the mod enabled.
+        bool restored = (backN == (orig ? onN : baseN)) &&
+                        (ri >= 0 && g_mods.all()[ri].enabled == orig);
+        TraceLog(LOG_INFO, "testmods: %s off=%zu/%d on=%zu/%d restored=%zu(want %zu, orig=%d) changed=%d",
+                 testMods.c_str(), baseN, baseHp, onN, onHp, backN, orig ? onN : baseN, (int)orig,
+                 (int)changed);
+        CloseWindow();
+        return (changed && restored) ? 0 : 1;
+    }
 
     if (checkBuiltins) {
         // `--checkbuiltins` dumps the weapon wiring built from the hard-coded templates, after the ini
@@ -1243,6 +2026,62 @@ int main(int argc, char** argv) {
         TraceLog(LOG_INFO, TextFormat("Map: %dx%d, spawns=%zu, units=%zu",
                  game.map.w, game.map.h, game.map.spawns.size(), game.units.size()));
     }
+    if (noFog) game.fogEnabled = false;
+    if (fogDemo) {
+        // Screenshot aid for the fog layer: a fresh map only ever shows "in sight" and "never seen",
+        // so the player's hulls are shoved sideways first to leave an explored band behind them.
+        for (auto& u : game.units) if (u.team == game.playerTeam() && !u.dead) u.pos.x += TILE_SIZE * 12.0f;
+        for (int i = 0; i < 3; ++i) game.updateFog();
+    }
+
+    if (testFog) {
+        // `--testfog` walks the three fog states without depending on what the map happens to hold:
+        // a fresh grid is entirely unseen, a sight circle lights only its own tiles, leaving a patch
+        // dims it to "explored" instead of erasing it, and the visibility predicate hides an enemy
+        // hull until its own tile is lit (BaseUnit.d(PlayerTeam):1431-1444).
+        int bad = 0;
+        game.fogEnabled = true;
+        game.initFog();
+        uint8_t fresh = game.fogAt(0, 0);
+        if (fresh != Game::FOG_UNSEEN) { TraceLog(LOG_WARNING, "testfog: fresh grid is %d, want 10", fresh); ++bad; }
+
+        Vec2 c{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        game.revealFogAt(c, 6.0f, Game::FOG_VISIBLE);
+        uint8_t centre = game.fogAtWorld(c);
+        uint8_t outside = game.fogAtWorld(c + Vec2{ TILE_SIZE * 20.0f, 0.0f });
+        if (centre >= Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: circle centre is %d", centre); ++bad; }
+        if (outside < Game::FOG_UNSEEN) { TraceLog(LOG_WARNING, "testfog: outside circle is %d", outside); ++bad; }
+
+        Unit* mine = nullptr;
+        for (auto& u : game.units) if (u.team == game.playerTeam() && u.tpl && !u.dead) { mine = &u; break; }
+        if (!mine) { TraceLog(LOG_WARNING, "testfog: no player hull on this map"); ++bad; }
+        else {
+            mine->pos = c;
+            game.updateFog();
+            uint8_t lit = game.fogAtWorld(c);
+            float step = std::min(TILE_SIZE * 40.0f, game.map.worldW() * 0.4f);
+            mine->pos = Vec2{ std::min(c.x + step, game.map.worldW() - TILE_SIZE * 2.0f), c.y };
+            game.updateFog();
+            uint8_t left = game.fogAtWorld(c), arrived = game.fogAtWorld(mine->pos);
+            TraceLog(LOG_INFO, "testfog: lit=%d left=%d arrived=%d", lit, left, arrived);
+            if (lit >= Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: sighted tile not lit"); ++bad; }
+            if (left != Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: left tile is %d, want 5", left); ++bad; }
+            if (arrived >= Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: arrived tile is %d", arrived); ++bad; }
+        }
+
+        Unit probe;
+        probe.team = 1;
+        probe.pos = Vec2{ TILE_SIZE * 2.5f, TILE_SIZE * 2.5f };
+        bool hidden = !game.visibleToPlayer(probe);
+        game.revealFogAt(probe.pos, 3.0f, Game::FOG_VISIBLE);
+        bool shown = game.visibleToPlayer(probe);
+        TraceLog(LOG_INFO, "testfog: probe hidden=%d shown=%d", (int)hidden, (int)shown);
+        if (!hidden || !shown) ++bad;
+
+        TraceLog(LOG_INFO, "testfog: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+    }
 
     if (!testUpgrade.empty()) {
         // `--testupgrade <name>` is the functional gate for the tier-2 chain: spawn the hull, pay for its
@@ -1356,15 +2195,45 @@ int main(int argc, char** argv) {
             CloseWindow();
             return (offered && producedTick >= 0) ? 0 : 1;
         }
+        // The building path used to stop at "a foundation appeared": the nano gate could drop the
+        // order on the next tick and the site would sit at 0% forever. Tick the game afterwards and
+        // assert buildProgress actually advances, with the builder standing next to the site so the
+        // result isolates the nano gate from pathfinding.
+        int maxIdBefore = -1;
+        for (auto& u : game.units) maxIdBefore = std::max(maxIdBefore, u.id);
         int builtAtX = -1, builtAtY = -1;
         for (int y = 2; y < game.map.h - 2 && builtAtX < 0; ++y)
             for (int x = 2; x < game.map.w - 2 && builtAtX < 0; ++x)
                 if (game.orderBuild(bid, tt->name, x, y)) { builtAtX = x; builtAtY = y; }
+        int siteId = -1;
+        for (auto& u : game.units)
+            if (u.id > maxIdBefore && u.tpl && ToLower(u.tpl->name) == ToLower(tt->name)) { siteId = u.id; break; }
+        float prog1 = -1.0f, prog60 = -1.0f;
+        int nanoAt1 = -1, doneTick = -1;
+        if (siteId >= 0) {
+            Unit* b = game.get(bid);
+            if (b) b->pos = game.get(siteId)->pos + Vec2{ TILE_SIZE * 2.0f, 0 };
+            for (int i = 0; i < 3000; ++i) {
+                game.update();
+                Unit* s = game.get(siteId);
+                if (!s || s->dead) break;
+                if (i == 0) {
+                    prog1 = s->buildProgress;
+                    Unit* bb = game.get(bid);
+                    nanoAt1 = bb ? bb->nanoTargetId : -2;
+                }
+                if (i == 59) prog60 = s->buildProgress;
+                if (!s->underConstruction || s->buildProgress >= 1.0f) { doneTick = i; break; }
+            }
+        }
         TraceLog(LOG_INFO, "testbuild: %s -> %s offered=%d placed=%d at=(%d,%d) orderBuild=%d",
                  owner.c_str(), tt->name.c_str(), (int)offered, builtAtX >= 0 ? 1 : 0,
                  builtAtX, builtAtY, builtAtX >= 0 ? 1 : 0);
+        TraceLog(LOG_INFO, "testbuild progress: site=%d prog1=%.4f prog60=%.4f nanoAt1=%d doneTick=%d",
+                 siteId, prog1, prog60, nanoAt1, doneTick);
+        bool built = (doneTick >= 0) || (prog60 > prog1 && prog1 >= 0.0f);
         CloseWindow();
-        return (offered && builtAtX >= 0) ? 0 : 1;
+        return (offered && builtAtX >= 0 && built) ? 0 : 1;
     }
 
     if (!testDamage.empty()) {
@@ -1395,15 +2264,80 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (!testRepair.empty()) {
+        // `--testrepair <healer>,<target>` proves both halves of a RepairBay: an explicit repair
+        // order, and the AutoRepairCallback that fires after 40 idle ticks (RepairBay.java:175-184).
+        std::string healerName = testRepair, targetName = "tank";
+        size_t comma = testRepair.find(',');
+        if (comma != std::string::npos) {
+            healerName = testRepair.substr(0, comma);
+            targetName = testRepair.substr(comma + 1);
+        }
+        const UnitTemplate* ht = g_templates.find(ToLower(healerName));
+        const UnitTemplate* tt = g_templates.find(ToLower(targetName));
+        if (!ht || !tt) {
+            TraceLog(LOG_WARNING, "testrepair: unknown template (healer=%s target=%s)",
+                     healerName.c_str(), targetName.c_str());
+            CloseWindow();
+            return 1;
+        }
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int hid = game.spawnUnit(ht->name, 0, mid);
+        int tid = game.spawnUnit(tt->name, 0, mid + Vec2{ TILE_SIZE * 2.0f, 0 });
+        Unit* h = game.get(hid);
+        Unit* t = game.get(tid);
+        if (!h || !t) { CloseWindow(); return 1; }
+        game.damage(*t, t->maxHp * 0.5f, nullptr);
+        float hp0 = t->hp;
+        h->nanoTargetId = tid; h->nanoReclaim = false; h->nanoOrderAge = 0;
+        int explicitTick = -1;
+        for (int i = 0; i < 300; ++i) {
+            game.update();
+            t = game.get(tid);
+            if (!t || t->dead) break;
+            if (t->hp > hp0 + 1.0f) { explicitTick = i; break; }
+        }
+        int autoTick = -1;
+        if (t && !t->dead) {
+            t->hp = hp0;
+            h = game.get(hid);
+            if (h) h->nanoTargetId = -1;
+            for (int i = 0; i < 200; ++i) {
+                game.update();
+                t = game.get(tid);
+                if (!t || t->dead) break;
+                if (t->hp > hp0 + 1.0f) { autoTick = i; break; }
+            }
+        }
+        TraceLog(LOG_INFO, "testrepair: %s -> %s hp=%.1f explicitTick=%d autoTick=%d",
+                 ht->name.c_str(), tt->name.c_str(), hp0, explicitTick, autoTick);
+        CloseWindow();
+        return (explicitTick >= 0 && autoTick >= 0) ? 0 : 1;
+    }
+
     g_render.init();
+
+    // `--select <tplKey>` preselects every player hull of that template, so `--shot` can capture the
+    // right-hand command panel without a mouse. Debug harness only; normal play never sets it.
+    if (!selectTpl.empty()) {
+        int picked = 0;
+        for (auto& u : game.units) {
+            if (u.dead || !u.tpl || u.team != game.playerTeam()) continue;
+            if (ToLower(u.tpl->name) != ToLower(selectTpl) && ToLower(u.tplKey) != ToLower(selectTpl)) continue;
+            u.selected = true;
+            if (++picked >= 8) break;
+        }
+        TraceLog(LOG_INFO, "select: %d hull(s) of '%s'", picked, selectTpl.c_str());
+    }
 
     Camera2D cam{};
     resetCamera(cam, game, SW, SH);
 
     double acc = 0; double last = GetTime();
     int renderedFrames = 0;
-    enum class Screen { Menu, Levels, Game };
-    Screen screen = startInGame ? Screen::Game : (startInLevels ? Screen::Levels : Screen::Menu);
+    enum class Screen { Menu, Levels, Mods, Game };
+    Screen screen = startInGame ? Screen::Game
+                  : (startInLevels ? Screen::Levels : (startInMods ? Screen::Mods : Screen::Menu));
 
     while (!WindowShouldClose()) {
         // ---- main menu: RWX MainMenuSceneHost ----
@@ -1415,16 +2349,20 @@ int main(int argc, char** argv) {
             if (!shotPath.empty() && ++renderedFrames >= shotFrame) {
                 Image img = LoadImageFromScreen(); ExportImage(img, shotPath.c_str()); UnloadImage(img);
                 TraceLog(LOG_INFO, TextFormat("shot written: %s", shotPath.c_str()));
-                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_modScene.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             }
             if (act == MenuAction::SinglePlayer) {
                 screen = Screen::Levels;
                 TraceLog(LOG_INFO, "Main menu: opening level select");
+            } else if (act == MenuAction::Mods) {
+                g_modScene.init();
+                screen = Screen::Mods;
+                TraceLog(LOG_INFO, "Main menu: opening mods");
             } else if (act == MenuAction::Continue) {
                 screen = Screen::Game;
                 TraceLog(LOG_INFO, "Main menu: entering game");
             } else if (act == MenuAction::Exit) {
-                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_modScene.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             } else if (act != MenuAction::None) {
                 g_menu.showToast("Not available in this build");
             }
@@ -1440,7 +2378,7 @@ int main(int argc, char** argv) {
             if (!shotPath.empty() && ++renderedFrames >= shotFrame) {
                 Image img = LoadImageFromScreen(); ExportImage(img, shotPath.c_str()); UnloadImage(img);
                 TraceLog(LOG_INFO, TextFormat("shot written: %s", shotPath.c_str()));
-                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_modScene.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             }
             if (res.back) {
                 screen = Screen::Menu;
@@ -1455,6 +2393,44 @@ int main(int argc, char** argv) {
                 } else {
                     g_levels.showToast("Map could not be loaded");
                 }
+            }
+            continue;
+        }
+
+        // ---- mods: RWX ModsSceneHost ----
+        if (screen == Screen::Mods) {
+            BeginDrawing();
+            ClearBackground(Color{ 10, 12, 16, 255 });
+            ModUI::ModScene::Result res = g_modScene.drawAndInput();
+            EndDrawing();
+            if (!shotPath.empty() && ++renderedFrames >= shotFrame) {
+                Image img = LoadImageFromScreen(); ExportImage(img, shotPath.c_str()); UnloadImage(img);
+                TraceLog(LOG_INFO, TextFormat("shot written: %s", shotPath.c_str()));
+                g_menu.close(); g_levels.close(); g_modScene.close(); g_hudArt.close(); g_render.close();
+                CloseWindow(); return 0;
+            }
+            if (res.applied) {
+                // ModManager.applyAndSaveMods():510-520 -- the selection is already on disk, now
+                // rebuild every custom unit. The world is rebuilt too, because the units standing on
+                // the map hold raw UnitTemplate pointers into the store loadAll is about to replace.
+                g_modScene.close();
+                g_templates.loadAll(g_assetsRoot);
+                if (!loadMap(game, currentMapRel)) buildFallback(game);
+                resetCamera(cam, game, SW, SH);
+                ui = UI{};
+                g_modScene.init();
+                g_modScene.showToast("Mods applied");
+                screen = Screen::Menu;
+                TraceLog(LOG_INFO, TextFormat("Mods applied: %zu templates", g_templates.order.size()));
+            } else if (res.back || IsKeyPressed(KEY_ESCAPE)) {
+                // Leaving without Apply throws the pending toggles away, so the screen always shows
+                // what the game is actually running.
+                if (g_modScene.dirty) {
+                    g_mods.loadSelection();
+                    g_modScene.dirty = false;
+                    g_modScene.rebuild();
+                }
+                screen = Screen::Menu;
             }
             continue;
         }
@@ -1616,6 +2592,12 @@ int main(int argc, char** argv) {
             for (auto& u : game.units) u.selected = false;
             game.gameOver = false;
         }
+        // Fog of war toggle. RWX exposes it as a room setting (TileMap.fogEnabled); RP has no settings
+        // screen yet, so it is a key plus `--nofog`.
+        if (IsKeyPressed(KEY_F)) {
+            game.fogEnabled = !game.fogEnabled;
+            TraceLog(LOG_INFO, "fog of war: %s", game.fogEnabled ? "on" : "off");
+        }
         } // !spawnOpen: game hotkeys yield to the picker's text input
 
         // ---- render ----
@@ -1648,6 +2630,7 @@ int main(int argc, char** argv) {
 
     g_menu.close();
     g_levels.close();
+    g_modScene.close();
     g_hudArt.close(); g_render.close();
     CloseWindow();
     return 0;

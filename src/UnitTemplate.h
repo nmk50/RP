@@ -8,6 +8,14 @@
 #include "TeamColoring.h"
 
 enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF, OVER_CLIFF_WATER };
+// [attack] attackMovement (CustomUnitConfigParser.java:2017-2027): normal / strafing / bomber.
+// RWX has no runtime reader for strafing (the real lateral motion is moveIgnoringBody), so only
+// bomber changes behaviour in RP as well.
+enum class AttackMovement { Normal, Strafing, Bomber };
+
+// UnitSize.java:5-13 -- the enum OrderableUnit.a(UnitSize,boolean):4834-4888 switches on to choose the
+// death explosion. Unknown means "the ini said nothing", which keeps RP's radius-based default.
+enum class UnitSize { Unknown, VerySmall, Small, Normal, Large, LargeUnit, Building, BuildingNoShockwaveOrSmoke, VeryLargeBuilding };
 
 // [core] transportUnitsCanUnloadUnits is a LogicBoolean (CustomUnitConfigParser.java:1837-1842), and the
 // shipped ini files only ever spell out a handful of forms of it: the bare `false` (nautilus, whose cargo
@@ -200,6 +208,19 @@ struct TurretTpl {
     // RWX [turret_N]: idle rest angle relative to the hull, and whether the turret returns to it
     float idleDir = 0;
     bool shouldResetTurret = true;
+    // TurretConfig.java:397-405 / CustomUnit.java:2668 -- after a fast turn the rest angle flips
+    // by idleDirReversing instead of returning to idleDir. When the ini never writes the key RWX
+    // fills it in itself: 0 for a barrel attached to another, idleDir + 180 otherwise. hasIdleDirReversing
+    // records whether the section (or the copyFrom source it inherited) actually spelled it out.
+    float idleDirReversing = 0;
+    bool hasIdleDirReversing = false;
+    // TurretConfig.java:365-367 / CustomUnit.java:2724-2727 -- a charging barrel loses
+    // warmupShootDelayTransfer * speed / warmup of its charge time while the hull is moving.
+    float warmupShootDelayTransfer = 0;
+    // TurretConfig.java:438 / CustomUnit.java:1287 -- a LogicBoolean gate on acquiring/firing.
+    UnloadCond canAttackCond;
+    // TurretConfig.java:544-546 -- the barrel flagged as the builder's nano/default turret.
+    bool mainNanoTurret = false;
     // [turret_N] idleSpin (TurretConfig.java:219,517, a plain float default 0) -- with no target the barrel
     // turns continuously at idleSpin deg/tick instead of holding a rest angle: CustomUnit.b(i,f):4030-4041
     // adds idleSpin*f to targetX and wraps it into (-180,180], returning false so the outer rest-reset is
@@ -276,6 +297,9 @@ struct TurretTpl {
 };
 
 struct ProjectileTpl {
+    // CustomProjectileTemplate.java:73-74 -- fog flags. RP has no fog-of-war yet, so these
+    // are parsed and stored for the future reveal/visibility rules but have no runtime effect.
+    bool shouldRevealFog = false, alwaysVisibleInFog = false;
     float directDamage = 0, areaDamage = 0, areaRadius = 0;
     float speed = 6;
     int life = 60;
@@ -731,7 +755,13 @@ struct UnitTemplate {
         return { tx * (float)TILE_SIZE + buildingToFootprintOffsetX,
                  ty * (float)TILE_SIZE + buildingToFootprintOffsetY };
     }
-    float fogSight = 0;
+    // [core] fogOfWarSightRange in TILES, not pixels: CustomUnitConfigParser.java:1713 defaults it to
+    // 15 and OrderableUnit.s():4926-4928 answers the same 15 for the hard-coded hulls, while
+    // TileMap.updateFogVisibilityForTeamCircle:1519-1533 compares the value against tile indices.
+    float fogSight = 15;
+    // CustomUnitConfigParser.java:1714 -- -1 means "use fogSight", which is what an unfinished
+    // building falls back to (CustomUnit.c(boolean):3967-3970).
+    float fogSightWhileNotBuilt = -1;
     // RWX [core] explodeOnDeath (default true) / hideScorchMark: an exploding unit leaves a
     // permanent ground mark (ScorchMark.java) unless it is hidden or died over water.
     bool explodeOnDeath = true;
@@ -792,6 +822,10 @@ struct UnitTemplate {
     // getEngagementRange:4482, which adds the two hull radii to maxAttackRange for melee and nothing else.
     bool isMelee = false;
     float meleeRange = 0;
+    AttackMovement attackMovement = AttackMovement::Normal;
+    // [attack] dieOnAttack (CustomUnitConfigParser.java:2279): the hull dies immediately after
+    // it fires (CustomUnit.java:1605-1607), distinct from removeOnAttack which leaves no effect.
+    bool dieOnAttack = false;
 
     MoveType moveType = MoveType::NONE;
     float moveSpeed = 1, accel = 1, decel = 1, maxTurnSpeed = 1, turnAccel = 1;
@@ -802,6 +836,12 @@ struct UnitTemplate {
     // velocity with a 1.41x steering rate and no throttle ramp (:893-918, :3009-3010) -- glide, not
     // strafing. Both default false.
     bool moveIgnoringBody = false, moveSlidingMode = false;
+    // [movement] ignoreMoveOrders (:1962-1973) makes canExecuteMovementCommands() return false:
+    // the hull still fires but refuses move / patrol / attack-move orders (CustomUnit.java:607-616).
+    bool ignoreMoveOrders = false;
+    // [movement] joinsGroupFormations (:2013, default true): a false hull is excluded from
+    // FormationGroup and therefore gets no golden-angle slot offset (FormationGroup.java:65).
+    bool joinsGroupFormations = true;
     // [movement] moveSlidingDir (:2012, getLogicBooleanUnit is really a plain parseInt, default -1).
     // RWX parses and stores it (CustomUnitConfig.dZ:483) but never reads it back anywhere -- the actual
     // glide drift comes from moveSlidingMode above and the velocity vector, not this angle. The mod-api
@@ -888,6 +928,19 @@ struct UnitTemplate {
     // Every [effect_NAME] section of this unit's ini, in file order -- the pool a shoot_flame (or any other
     // spawn list) name is looked up in by CustomUnitConfig.resolveEffect:1189-1196.
     std::vector<EffectTpl> effects;
+    // [core] death spawn lists. A non-empty string means the key was written; "NONE" is a
+    // valid written value that suppresses the default death fx, hence the separate has flags.
+    std::vector<FlameSpec> effectOnDeath, effectOnDeathIfUnbuilt, effectOnDeathGroundCollision;
+    bool hasEffectOnDeath = false, hasEffectOnDeathIfUnbuilt = false, hasEffectOnDeathGroundCollision = false;
+    // [core] explodeTypeOnDeath (CustomUnitConfigParser.java:1797) is a UnitSize, not a free string:
+    // CustomUnit.e():923-937 hands it to OrderableUnit.a(UnitSize,boolean):4834-4888, which picks the
+    // shockwave / smoke / sound set by size. RP has one puff effect, so the size is folded down to
+    // big + a scale (see deathExplosionSize in Game.cpp). explodeTypeOnDeath keeps the raw lowercased
+    // token for --unusedkeys and for the unknown-size fallback.
+    std::string explodeTypeOnDeath;
+    UnitSize explodeSizeOnDeath = UnitSize::Unknown;
+    bool isBio = false;
+    int mainNanoTurret = -1;
     std::vector<BuildOption> canBuild;
     std::vector<BuildOption> builtFrom;
     std::vector<UnitAction> actions;

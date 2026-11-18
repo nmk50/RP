@@ -113,8 +113,9 @@ static float idleSweep(TurretState& s, const TurretTpl& tur, const Unit& u, cons
     if (tur.idleSpin != 0.0f) centre = s.angle;
     else if (!tur.shouldResetTurret) centre = s.lastAim;
     else {
-        centre = u.facing + tur.idleDir * 0.0174533f;
-        if (u.isRotating && tpl.reverseSpeed > 0.95f) centre += 3.14159265f;
+        // CustomUnit.C(i):2667-2671 -- a fast turn swaps idleDir for idleDirReversing outright, it does
+        // not add the two: the default idleDirReversing is already idleDir + 180.
+        centre = u.facing + (u.isRotating && tpl.reverseSpeed > 0.95f ? tur.idleDirReversing : tur.idleDir) * 0.0174533f;
     }
     s.sweepTimer += 1.0f;
     float residual = 0.0f;
@@ -234,6 +235,10 @@ static bool turretSees(const Game& g, const Unit& u, int i, const Unit& t) {
     if (tur.range > 0 && d > tur.range) return false;
     if (tur.minRange > 0 && d < tur.minRange) return false;
     if (!limitingAngleOk(u, i, t)) return false;
+    // CustomUnit.a(TurretConfig,...):1287-1289 -- [turret_N] canAttackCondition is a LogicBoolean read
+    // against the SHOOTER (read(this)), checked after the angle cone and before the tag tests. It gates
+    // acquisition and, because the fire gate re-runs this whole predicate, the shot itself.
+    if (!condTestsOk(g, u, tur.canAttackCond)) return false;
     return true;
 }
 
@@ -332,7 +337,81 @@ bool Game::init(const std::string& mapPath, std::string* err) {
             if (placed) break;
         }
     }
+    initFog();
+    updateFog();   // light the starting positions right away instead of on the first tick
     return true;
+}
+
+// ---- fog of war (Game.h carries the RWX sources for the three tile states) ----
+
+void Game::initFog() {
+    // TileMap:1056-1058 -- a fresh map starts at 10 everywhere, so nothing is drawn until a hull
+    // with a sight range lights it up.
+    fog.assign((size_t)map.w * map.h, FOG_UNSEEN);
+}
+
+void Game::revealFogAt(Vec2 world, float tiles, uint8_t value) {
+    if (fog.empty() || tiles <= 0.0f) return;
+    // RWX works in tile units here: updateFogVisibilityForTeamCircle:1519-1533 compares the sight
+    // range against tile indices (f7 = f * tileScaleX), not against world pixels.
+    float cx = world.x / TILE_SIZE, cy = world.y / TILE_SIZE;
+    int r = (int)std::ceil(tiles);
+    int x0 = std::max(0, (int)std::floor(cx) - r), x1 = std::min(map.w - 1, (int)std::floor(cx) + r);
+    int y0 = std::max(0, (int)std::floor(cy) - r), y1 = std::min(map.h - 1, (int)std::floor(cy) + r);
+    float r2 = tiles * tiles;
+    // :1521-1523 -- the rim is a ramp, not a hard edge: (dist - (i-3)) * 10 / (i^2 - (i-3)^2), i.e.
+    // the outer two tiles fade from 0 to 10. RP stops the ramp at 4 so a hull standing on the rim
+    // still counts as seen (the >= 5 cut is what hides it) and only the shading fades out.
+    float inner = std::max(0.0f, tiles - 2.0f), inner2 = inner * inner;
+    for (int y = y0; y <= y1; ++y) {
+        uint8_t* row = &fog[(size_t)y * map.w];
+        for (int x = x0; x <= x1; ++x) {
+            float dx = (float)x - cx, dy = (float)y - cy;
+            float d2 = dx * dx + dy * dy;
+            if (d2 > r2) continue;
+            uint8_t v = value;
+            if (value == FOG_VISIBLE) {
+                if (d2 <= inner2) v = FOG_VISIBLE;
+                else v = (uint8_t)std::min(4.0f, 1.0f + 3.0f * (std::sqrt(d2) - inner) / 2.0f);
+            }
+            // Only ever brightens, so a tile two hulls can see stays at the brighter value.
+            if (row[x] > v) row[x] = v;
+        }
+    }
+}
+
+uint8_t Game::fogAt(int tx, int ty) const {
+    if (fog.empty() || tx < 0 || ty < 0 || tx >= map.w || ty >= map.h) return FOG_VISIBLE;
+    return fog[(size_t)ty * map.w + tx];
+}
+
+uint8_t Game::fogAtWorld(Vec2 p) const {
+    return fogAt((int)std::floor(p.x / TILE_SIZE), (int)std::floor(p.y / TILE_SIZE));
+}
+
+bool Game::visibleToPlayer(const Unit& u) const {
+    if (!fogEnabled || fog.empty()) return true;
+    if (u.team == playerTeam()) return true;   // BaseUnit.d(PlayerTeam):1433 short-circuits on own team
+    return fogAtWorld(u.pos) < FOG_EXPLORED;
+}
+
+void Game::updateFog() {
+    if (!fogEnabled || fog.empty()) return;
+    // Everything lit last tick becomes "explored". RWX does the same in bulk on a 260 s maintenance
+    // sweep (TileMap:1634-1645) because it has fog atlases to invalidate; RP has none, so it runs
+    // every tick and a hull leaving a patch dims it immediately. The rim ramp (1..4) is included:
+    // any shade that is not "explored" yet has to fall back to it.
+    for (uint8_t& v : fog) if (v < FOG_EXPLORED) v = FOG_EXPLORED;
+    // CustomUnit.c(boolean):3961-3974 -- only the local player's hulls feed this layer, a sight range
+    // of 0 contributes nothing, and an unfinished building uses fogOfWarSightRangeWhileNotBuilt
+    // (parsed as -1 when the ini says nothing, which means "no override").
+    for (const Unit& u : units) {
+        if (u.dead || !u.tpl || u.team != playerTeam()) continue;
+        float sight = u.tpl->fogSight;
+        if (u.underConstruction && u.tpl->fogSightWhileNotBuilt >= 0.0f) sight = u.tpl->fogSightWhileNotBuilt;
+        if (sight <= 0.0f) continue;
+        revealFogAt(u.pos, sight, FOG_VISIBLE);
+    }
 }
 
 Unit* Game::get(int id) { for (auto& u : units) if (u.id == id) return &u; return nullptr; }
@@ -450,14 +529,20 @@ void Game::orderMove(std::vector<int> ids, Vec2 target) {
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic()) continue;
         u->orderTargetId = -1; u->attackMove = false; u->nanoTargetId = -1;
+        // RWX CustomUnit.canExecuteMovementCommands():607-616 -- a hull with
+        // ignoreMoveOrders advances its waypoint immediately, i.e. the order is accepted
+        // and dropped on the same tick; it may still fire at whatever it acquires.
+        if (u->tpl->ignoreMoveOrders) { u->path.clear(); u->hasGoal = false; continue; }
         Vec2 t = target;
-        if (k > 0) { // RW formation scatter: golden-angle offsets around the click point
+        // FormationGroup.java:65 -- a hull that opts out of group formations gets no
+        // golden-angle slot and therefore must not consume a slot index either.
+        if (k > 0 && u->tpl->joinsGroupFormations) {
             float ang = (float)k * 2.39996f;
             float rad = 6.0f + u->tpl->radius * 1.5f * std::sqrt((float)k);
             t = target + Vec2{ std::cos(ang) * rad, std::sin(ang) * rad };
         }
         computePath(*this, *u, t);
-        k++;
+        if (u->tpl->joinsGroupFormations) ++k;
     }
 }
 
@@ -899,6 +984,9 @@ void Game::update() {
     effects.erase(std::remove_if(effects.begin(), effects.end(), [](const Effect& e) { return e.dead; }), effects.end());
     fx.erase(std::remove_if(fx.begin(), fx.end(), [](const Fx& f) { return f.dead; }), fx.end());
     particles.erase(std::remove_if(particles.begin(), particles.end(), [](const Particle& p) { return p.dead; }), particles.end());
+    // After the movement pass, so a hull lights the tiles it actually ended the tick on
+    // (CustomUnit.c(boolean) runs from the unit's own update, i.e. after its move).
+    updateFog();
     if (tick % 30 == 0) runAI();
     checkWinLoss();
 }
@@ -1544,7 +1632,12 @@ void Game::updateUnit(Unit& u) {
             u.orderTargetId = -1;
             // OrderableUnit.getTargetSearchRange:3498 -- the passive sweep looks as far as the weapon
             // reaches plus the hull's own bonus, which is 250px for a melee unit and nothing else.
-            std::vector<Unit*> foes = queryNearestEnemy(u.team, u.pos, tpl.attackRange + tpl.meleeRange, &tpl);
+            // OrderableUnit.getTargetSearchRange(true):3498-3505 -- a bomber adds 200px to
+            // its passive search, which is how it finds a target to fly over before it is
+            // inside weapon range.
+            float search = tpl.attackRange + tpl.meleeRange +
+                           (tpl.attackMovement == AttackMovement::Bomber ? 200.0f : 0.0f);
+            std::vector<Unit*> foes = queryNearestEnemy(u.team, u.pos, search, &tpl);
             Unit* best = nullptr; float bd = 1e18f;
             for (auto* f : foes) { float d = u.pos.dist(f->pos); if (d < bd) { bd = d; best = f; } }
             if (best) combatTarget = best->id;
@@ -1747,6 +1840,13 @@ void Game::updateUnit(Unit& u) {
     // the other three cases are the out-of-range / guard-area / aggressive attack modes (:3470-3472) and
     // those are per-player orders RP has no UI for; an ordered hull chasing its order target is RP's
     // stand-in for the same code path.
+    // OrderableUnit.updateAttackTargeting:1936/1954-1956 -- a bomber does not stop at the
+    // inner engagement ring: it navigates straight onto the target and keeps its search
+    // alive while overflying it. Other hulls keep the chase/stop rule below.
+    if (tpl.attackMovement == AttackMovement::Bomber && tgt && u.path.empty() &&
+        !u.isStatic() && u.parentId < 0 && u.repathTimer <= 0 && !u.riding())
+        computePath(*this, u, tgt->pos);
+
     if (tgt && u.path.empty() && !u.isStatic() && u.parentId < 0 && u.repathTimer <= 0 && (tpl.isMelee || u.orderTargetId >= 0) &&
         u.pos.dist(tgt->pos) > engagementRangeOf(u, *tgt)) {
         // the same engagement stop as the order: a melee hull is chased onto the target, pathTargetRadius 0
@@ -2048,7 +2148,11 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
         // RWX getTargetSearchRange() is 0 for a unit that cannot attack, so a builder's or
         // harvester's barrels never acquire a target and just rest along the hull.
         Unit* t = nullptr;
-        if (tpl.canAttack) {
+        // OrderableUnit.updateAttackTargeting:3174 -- the barrel flagged [turret_N] isMainNanoTurret is
+        // excluded from the attack aim loop (`i2 != defaultTurretIndex`), which is what makes it a
+        // dedicated nano head: it keeps whatever lock it was handed but never aims or fires at it, so
+        // it falls through to its rest/idle angle below and stays inactive.
+        if (tpl.canAttack && i != tpl.mainNanoTurret) {
             // OrderableUnit.syncAttackTargetToMovementLevels:3081-3098 -- the unit's own order target
             // goes to every barrel that can engage it, in preference to a target that barrel had
             // picked for itself; only a barrel that cannot hit the order target keeps its own lock, and
@@ -2099,9 +2203,10 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
                 s.angle = wrapAngle(s.angle + tur.idleSpin * 0.0174533f);
                 residual = 0.0f;
             } else if (tur.shouldResetTurret) {
-                // no target at all: walk back to C(i) = hull angle + idleDir (:846-857)
-                float rest = u.facing + tur.idleDir * 0.0174533f;
-                if (u.isRotating && tpl.reverseSpeed > 0.95f) rest += 3.14159265f;
+                // no target at all: walk back to C(i) = hull angle + idleDir (:846-857), or + idleDirReversing
+                // after a fast turn -- CustomUnit.C:2667-2671 replaces idleDir rather than adding to it.
+                float restDir = (u.isRotating && tpl.reverseSpeed > 0.95f) ? tur.idleDirReversing : tur.idleDir;
+                float rest = u.facing + restDir * 0.0174533f;
                 residual = rotateTurret(s, tur, rest);
             } else {
                 residual = 0.0f;                               // shouldResetTurret:false parks it here
@@ -2163,7 +2268,14 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
             ready = true;
         }
         if (!ready) continue;
-        s.cooldown = tur.shootDelay;
+        // OrderableUnit:3274 sets rotation = b(i) + t(i), and CustomUnit.t(i):2722-2728 makes that a
+        // -(warmupShootDelayTransfer * movementLevels[i].speed / warmup) -- the reload starts short by
+        // that much. `speed` is this barrel's charge counter, which has just reached warmup, and RWX
+        // returns 0 outright unless both keys are non-zero.
+        float transfer = 0.0f;
+        if (tur.warmupShootDelayTransfer != 0.0f && tur.warmup != 0.0f)
+            transfer = -(tur.warmupShootDelayTransfer * std::min(s.warm, tur.warmup) / tur.warmup);
+        s.cooldown = tur.shootDelay + transfer;
         if (!tur.warmNoReset) s.warm = 0;
         fire(u, t, i);
         // :3279 -- the barrel gets a fresh aim point once the shot has taken the old one with it. M(i)
@@ -2471,6 +2583,7 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
             // tick, and an attached effectOnCreate entry has to find it before the compaction drops it.
             p.dead = true;
             projectiles.push_back(p);
+            if (tpl.dieOnAttack && !u.dead) killUnit(u);
             return nullptr;
         }
     }
@@ -2487,11 +2600,13 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
             *c = p;
             c->id = keepId;
             if (pt.instantReuseLastKeepAreaDamageList) c->splashHits = std::move(keepHits);
+            if (tpl.dieOnAttack && !u.dead) killUnit(u);
             return c;
         }
     }
     projectiles.push_back(p);
     if (pt.instantReuseLast && ti >= 0) s.beamProjId = projectiles.back().id;
+    if (tpl.dieOnAttack && !u.dead) killUnit(u);
     return &projectiles.back();
 }
 
@@ -2797,6 +2912,12 @@ static Unit* retargetShot(Game& g, Projectile& p) {
 // (update:857-866,975).
 void Game::updateProjectile(Projectile& p) {
     if (p.dead) return;
+    // [projectile_N] shouldRevealFog (CustomProjectileTemplate.java:73) -- the round lights the tiles it
+    // flies over, which is how a shot fired into the dark shows you what it lands on. Kept to the
+    // player's own shots: an enemy round is not a scout.
+    if (fogEnabled && !fog.empty() && p.team == playerTeam() && p.from && p.fromProj >= 0 &&
+        p.fromProj < (int)p.from->projectiles.size() && p.from->projectiles[p.fromProj].shouldRevealFog)
+        revealFogAt(p.pos, 2.0f, FOG_VISIBLE);
     // RWX update:673-675 -- aS, the mark a laser defence leaves on a round it has shot down, is read at the
     // very top and answered with remove(): the round leaves the live list, is never drawn or chased again,
     // and gets no ring. RP runs the beam in the unit pass and this pass right after it, so the round is
@@ -3471,9 +3592,49 @@ void Game::removeUnit(Unit& u) {
     releaseAttachments(u);
 }
 
+// OrderableUnit.a(UnitSize,boolean):4834-4888 -- the death blast is chosen by size, not by radius:
+// verysmall is one small pop, large/building/verylargeBuilding add the shockwave + smoke pass, and the
+// rest sit in between. RP only has one puff emitter, so the size is folded into its two knobs.
+static void deathExplosionSize(const UnitTemplate* t, bool& big, float& scale) {
+    if (!t || t->explodeSizeOnDeath == UnitSize::Unknown) return;   // no key -> keep the radius default
+    switch (t->explodeSizeOnDeath) {
+        case UnitSize::VerySmall: big = false; scale = 0.5f; break;
+        case UnitSize::Small:
+        case UnitSize::Normal:
+        case UnitSize::LargeUnit: big = false; scale = 1.0f; break;
+        default: big = true; scale = 1.0f; break;   // large / building / buildingNoShockwaveOrSmoke / verylargeBuilding
+    }
+}
+
 void Game::killUnit(Unit& u) {
     if (u.dead) return;
-    bool big = u.tpl && u.tpl->radius > 20;
+    const UnitTemplate* tp = u.tpl;
+    bool big = tp && tp->radius > 20;
+    // CustomUnit.e():830-841 -- a hull that dies before buildProgress reaches 1 never explodes. It plays
+    // effectOnDeathIfUnbuilt if the ini has one, else its ordinary effectOnDeath, else nothing but a
+    // verysmall pop, and leaves no wreck, no scorch and no nuke behind. RP clears underConstruction on
+    // the tick progress reaches 1 (updateUnit:1206), so this is the same `buildProgress < 1` test.
+    if (tp && u.underConstruction) {
+        const std::vector<FlameSpec>& list =
+            !tp->effectOnDeathIfUnbuilt.empty() ? tp->effectOnDeathIfUnbuilt : tp->effectOnDeath;
+        bool played = !list.empty();
+        if (played) {
+            FxOwner owner;
+            owner.unitId = u.id; owner.pos = u.pos; owner.posZ = u.posZ;
+            for (const FlameSpec& fs : list)
+                spawnFxEntry(fs, tp, u.pos, u.posZ, u.facing * 57.29578f, &owner);
+        }
+        removeUnit(u);
+        if (!played) explode(Vec2{ u.pos.x, u.pos.y - u.posZ }, false, 0.5f);   // a(UnitSize.verysmall)
+        return;
+    }
+    // CustomUnit.e():845-847 -- a built hull's effectOnDeath goes off at the hull, along its heading.
+    if (tp && !tp->effectOnDeath.empty()) {
+        FxOwner owner;
+        owner.unitId = u.id; owner.pos = u.pos; owner.posZ = u.posZ;
+        for (const FlameSpec& fs : tp->effectOnDeath)
+            spawnFxEntry(fs, tp, u.pos, u.posZ, u.facing * 57.29578f, &owner);
+    }
     // CustomUnit.e():943-952 answers whether the death is allowed to keep the object: yes for
     // slowDeathFall, yes for an image_wreak hull (which shows the wreck sprite from then on), no for
     // anything else -- and the fall itself is driven purely by height, since update:1673 only asks for
@@ -3483,7 +3644,9 @@ void Game::killUnit(Unit& u) {
     removeUnit(u);
     u.deathFalling = hangs;
     u.corpseWreck = hangs && !u.tpl->slowDeathFall;
-    explode(Vec2{ u.pos.x, u.pos.y - u.posZ }, big);
+    float eScale = 1.0f;
+    deathExplosionSize(tp, big, eScale);
+    explode(Vec2{ u.pos.x, u.pos.y - u.posZ }, big, eScale);
     // :922-929 -- only a grounded wreck scorches the ground, and only explodeOnDeath asks for the mark.
     if (u.tpl && u.tpl->explodeOnDeath && !u.tpl->hideScorchMark && !hangs && !overWater(*this, u.pos))
         addScorch(u.pos);
@@ -3565,7 +3728,16 @@ void Game::updateDeathFall(Unit& u) {
     if (!tpl.imageWreak.empty()) wrecks.push_back(Wreck{ u.pos, u.facing, u.tpl });
     // :1734-1748 a corpse that had picked up real speed detonates where it landed.
     if (u.fallVel > 0.5f && tpl.explodeOnDeathGroundCollision) {
-        explode(u.pos, false);
+        // CustomUnit:1735-1737 -- [core] effectOnDeathGroundCollision is a spawn list read at the
+        // touchdown point (posZ is already 0 here), before the small/verysmall blast.
+        if (!tpl.effectOnDeathGroundCollision.empty()) {
+            FxOwner owner;
+            owner.unitId = u.id; owner.pos = u.pos; owner.posZ = u.posZ;
+            for (const FlameSpec& fs : tpl.effectOnDeathGroundCollision)
+                spawnFxEntry(fs, u.tpl, u.pos, u.posZ, u.facing * 57.29578f, &owner);
+        }
+        // :1739-1747 -- over liquid the pop is verysmall, on the ground it is small.
+        explode(u.pos, false, overWater(*this, u.pos) ? 0.5f : 1.0f);
         if (!overWater(*this, u.pos) && !tpl.hideScorchMark) addScorch(u.pos);
     }
     u.fallVel = 0;
