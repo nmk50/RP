@@ -141,6 +141,14 @@ struct TurretTpl {
     // RWX TurretConfig.projectileId: index into the unit's projectiles, chosen by the
     // [projectile_<name>] section a turret names with `projectile: <name>`
     int projectile = 0;
+    // RWX's built-in hulls fire one barrel with two different rounds and pick between them on the
+    // target rather than on the turret: HeavyTankUnit.java:164-160 sends a shell at the ground and a
+    // homing missile at anything flying, MegaTankUnit.java:96-132 does the same, and MissileShip.java:122
+    // / AttackSubmarine.java:350 swap their missile for a short-range round at a submerged hull. The
+    // tests are isFlying (BaseUnit.i()) and isSubmerged (Q(): posZ < -1), which is exactly RP's
+    // Unit::airborne()/submerged(). -1 = no alternate, keep `projectile`.
+    int projectileAir = -1;
+    int projectileUnderwater = -1;
     // [turret_N] image, empty = the unit's [graphics] image_turret (CustomUnit.d(i):691)
     std::string image;
     // [turret_N] chargeEffectImage (TurretConfig.java:179,563-566, copied by copyFrom at :276) -- while

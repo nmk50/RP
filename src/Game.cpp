@@ -2397,7 +2397,15 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
     // b(TurretConfig):1357-1359 -- the per-shot resourceUsage is paid right after the energy, unconditionally
     // (the affordability gate already ran in updateTurrets), then the pools are clamped.
     if (tur.resourceUsage.any()) payResourceCost(*this, u, tur.resourceUsage);
-    int pi = (tur.projectile >= 0 && tur.projectile < (int)tpl.projectiles.size()) ? tur.projectile : -1;
+    // A built-in barrel can carry a second round for one target domain (HeavyTank/MegaTank fire a
+    // homing missile at aircraft, MissileShip/AttackSubmarine a short-range round at a submerged hull).
+    // The pick happens per shot on the target's height, exactly like the Java fireWeapon branches.
+    int pi = tur.projectile;
+    if (target) {
+        if (target->airborne() && tur.projectileAir >= 0) pi = tur.projectileAir;
+        else if (target->submerged() && tur.projectileUnderwater >= 0) pi = tur.projectileUnderwater;
+    }
+    if (pi < 0 || pi >= (int)tpl.projectiles.size()) pi = -1;
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
     if (pi < 0) pt.directDamage = 10;   // RWX's stand-in [projectile_1] for a unit with none at all
     Projectile p;

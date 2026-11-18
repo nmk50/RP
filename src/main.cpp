@@ -1050,10 +1050,11 @@ static void resetCamera(Camera2D& cam, Game& game, int SW, int SH) {
 int main(int argc, char** argv) {
     // Optional headless-ish screenshot: `rp.exe --shot out.png [N]` renders N frames
     // (default 3) then writes the screen buffer to PNG and exits. Normal play is untouched.
-    std::string shotPath, mapOverride;
+    std::string shotPath, mapOverride, testUpgrade, testWeapon;
     int shotFrame = 3;
     bool startInGame = false, startInLevels = false;
     bool checkMaps = false;
+    bool checkBuiltins = false;
     // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
     // exists for the screenshot harness and for testing smaller windows.
     int winW = 1920, winH = 1080;
@@ -1064,6 +1065,9 @@ int main(int argc, char** argv) {
         else if (a == "--game") startInGame = true;
         else if (a == "--levels") startInLevels = true;
         else if (a == "--checkmaps") checkMaps = true;
+        else if (a == "--checkbuiltins") checkBuiltins = true;
+        else if (a == "--testupgrade" && i + 1 < argc) { testUpgrade = argv[++i]; }
+        else if (a == "--testweapon" && i + 1 < argc) { testWeapon = argv[++i]; }
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
         else if (a == "--size" && i + 1 < argc) {
             // "--size 1920x1080" -- the surface RWX's HUD metrics are authored against
@@ -1119,12 +1123,131 @@ int main(int argc, char** argv) {
     g_templates.loadAll(g_assetsRoot);
     TraceLog(LOG_INFO, TextFormat("Loaded %zu unit templates", g_templates.order.size()));
 
+    if (checkBuiltins) {
+        // `--checkbuiltins` dumps the weapon wiring built from the hard-coded templates, after the ini
+        // scan has had its say: which projectile each barrel fires, the two target-domain alternates,
+        // and the tier-2 upgrade rows. An index that does not resolve, or an upgrade that converts to a
+        // template nobody registered, counts as a failure -- that is the machine gate for a port batch.
+        int bad = 0, rows = 0;
+        for (const std::string& key : g_templates.order) {
+            auto it = g_templates.byName.find(key);
+            if (it == g_templates.byName.end()) continue;
+            const UnitTemplate& t = it->second;
+            const bool tier2 = key.size() > 2 && key.compare(key.size() - 2, 2, "t2") == 0;
+            if (t.projectiles.size() <= 1 && t.actions.empty() && !tier2) continue;
+            ++rows;
+            TraceLog(LOG_INFO, "BUILTIN %-18s proj=%zu turr=%zu fly=%d sea=%d acts=%zu img=%s",
+                     key.c_str(), t.projectiles.size(), t.turrets.size(), (int)t.canAttackFlying,
+                     (int)t.canAttackUnderwater, t.actions.size(), t.image.c_str());
+            for (size_t i = 0; i < t.projectiles.size(); ++i) {
+                const ProjectileTpl& p = t.projectiles[i];
+                TraceLog(LOG_INFO, "  proj[%zu] dmg=%.0f speed=%.2f tgt=%.2f life=%d frame=%d draw=%d size=%.0f color=%08X turn=%.2f",
+                         i, p.directDamage, p.speed, p.targetSpeed, p.life, p.frame, p.drawType,
+                         p.drawSize, p.color, p.turnSpeed);
+            }
+            for (size_t i = 0; i < t.turrets.size(); ++i) {
+                const TurretTpl& tt = t.turrets[i];
+                TraceLog(LOG_INFO, "  tur[%zu] proj=%d air=%d sea=%d range=%.0f delay=%.0f laserUse=%.3f shoot=%d",
+                         i, tt.projectile, tt.projectileAir, tt.projectileUnderwater, tt.range,
+                         tt.shootDelay, tt.laserDefenceEnergyUse, (int)tt.canShoot);
+                for (int idx : { tt.projectile, tt.projectileAir, tt.projectileUnderwater })
+                    if (idx >= (int)t.projectiles.size()) {
+                        TraceLog(LOG_WARNING, "BADREF %s tur[%zu] idx=%d proj=%zu", key.c_str(), i, idx,
+                                 t.projectiles.size());
+                        ++bad;
+                    }
+            }
+            for (size_t i = 0; i < t.actions.size(); ++i) {
+                const UnitAction& a = t.actions[i];
+                TraceLog(LOG_INFO, "  act[%zu] %s -> %s price=%.0f speed=%.6f",
+                         i, a.name.c_str(), a.convertTo.c_str(), a.price, a.buildSpeed);
+                if (!a.convertTo.empty() && !g_templates.find(ToLower(a.convertTo))) {
+                    TraceLog(LOG_WARNING, "BADACT %s -> %s", key.c_str(), a.convertTo.c_str());
+                    ++bad;
+                }
+            }
+        }
+        TraceLog(LOG_INFO, "checkbuiltins: %d row(s), %d bad reference(s)", rows, bad);
+        CloseWindow();
+        return 0;
+    }
+
     Game game;
     if (!loadMap(game, currentMapRel)) {
         TraceLog(LOG_WARNING, "Using fallback terrain");
         buildFallback(game);
         TraceLog(LOG_INFO, TextFormat("Map: %dx%d, spawns=%zu, units=%zu",
                  game.map.w, game.map.h, game.map.spawns.size(), game.units.size()));
+    }
+
+    if (!testUpgrade.empty()) {
+        // `--testupgrade <name>` is the functional gate for the tier-2 chain: spawn the hull, pay for its
+        // convertTo action, run the build speed out tick by tick, and report what it turned into.
+        // `--checkbuiltins` only proves the rows exist; this proves the conversion actually runs.
+        const UnitTemplate* t0 = g_templates.find(ToLower(testUpgrade));
+        if (!t0) {
+            TraceLog(LOG_WARNING, "testupgrade: no template %s", testUpgrade.c_str());
+            CloseWindow();
+            return 1;
+        }
+        int act = -1;
+        for (size_t i = 0; i < t0->actions.size(); ++i)
+            if (!t0->actions[i].convertTo.empty()) { act = (int)i; break; }
+        if (act < 0) {
+            TraceLog(LOG_WARNING, "testupgrade: %s carries no upgrade action", testUpgrade.c_str());
+            CloseWindow();
+            return 1;
+        }
+        game.reward(0, 100000.0f);
+        int id = game.spawnUnit(t0->name, 0, Vec2{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f });
+        Unit* u = game.get(id);
+        bool ok = u && game.orderUpgrade(id, act);
+        int ticks = 0;
+        while (ok && u && u->upgradeIdx >= 0 && ticks < 200000) { game.update(); ++ticks; }
+        const UnitTemplate* t1 = u ? u->tpl : nullptr;
+        TraceLog(LOG_INFO, "testupgrade: %s -> %s img=%s hp=%.0f/%.0f ticks=%d ok=%d",
+                 testUpgrade.c_str(), t1 ? t1->name.c_str() : "?", t1 ? t1->image.c_str() : "-",
+                 u ? u->hp : 0.0f, u ? u->maxHp : 0.0f, ticks, (int)ok);
+        CloseWindow();
+        return (ok && t1 && t1 != t0) ? 0 : 1;
+    }
+
+    if (!testWeapon.empty()) {
+        // `--testweapon <shooter>,<target>` fires one real shot and reports the round that came out. A
+        // per-turret alternate (projectileAir / projectileUnderwater) must show up here as fromProj 1;
+        // the plain ground round stays at 0. This is the runtime proof the domain switch really fires.
+        std::string shooter = testWeapon, targetName = "gunShip";
+        size_t comma = testWeapon.find(',');
+        if (comma != std::string::npos) { shooter = testWeapon.substr(0, comma); targetName = testWeapon.substr(comma + 1); }
+        const UnitTemplate* ts = g_templates.find(ToLower(shooter));
+        const UnitTemplate* tt = g_templates.find(ToLower(targetName));
+        if (!ts || !tt) {
+            TraceLog(LOG_WARNING, "testweapon: unknown template (shooter=%s target=%s)",
+                     shooter.c_str(), targetName.c_str());
+            CloseWindow();
+            return 1;
+        }
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int sid = game.spawnUnit(ts->name, 0, mid);
+        int tid = game.spawnUnit(tt->name, 1, mid + Vec2{ 70, 0 });
+        Unit* su = game.get(sid);
+        Unit* tu = game.get(tid);
+        if (su && ts->moveType == MoveType::AIR) su->posZ = 40.0f;
+        if (tu) {
+            if (tt->moveType == MoveType::AIR) tu->posZ = 40.0f;        // airborne() needs posZ >= 4
+            else if (targetName == "attackSubmarine") tu->posZ = -8.0f; // submerged() needs posZ <= -1
+        }
+        int fromProj = -1, atTick = -1;
+        float dmg = -1, spd = -1;
+        for (int i = 0; i < 1200 && atTick < 0; ++i) {
+            game.update();
+            for (const Projectile& p : game.projectiles)
+                if (p.sourceId == sid) { fromProj = p.fromProj; dmg = p.damage; spd = p.speed; atTick = i; break; }
+        }
+        TraceLog(LOG_INFO, "testweapon: %s vs %s dmg=%.0f speed=%.2f fromProj=%d tick=%d",
+                 shooter.c_str(), targetName.c_str(), dmg, spd, fromProj, atTick);
+        CloseWindow();
+        return atTick >= 0 ? 0 : 1;
     }
 
     g_render.init();

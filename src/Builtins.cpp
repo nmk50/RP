@@ -33,6 +33,38 @@ UnitTemplate& add(TemplateStore& st, const char* name, const char* text) {
     return st.byName[key];
 }
 
+// A tier-2 building is the tier-1 hull with different art and, for the laser defence, better stats.
+// RWX keeps one class and flips a level flag on upgrade (LandFactory.isUpgraded, AirFactory.factoryLevel,
+// SeaFactory.buildingAnimationState, SupplyDepot.depotLevel, LaserDefense.isUpgraded); RP's upgrade
+// action swaps the template instead, so tier 2 is registered as a copy of tier 1.
+UnitTemplate& addCopy(TemplateStore& st, const char* name, const char* text, const UnitTemplate& from) {
+    UnitTemplate t = from;
+    t.name = name;
+    t.displayText = text;
+    std::string key = name;
+    for (char& c : key) c = (char)std::tolower((unsigned char)c);
+    st.byName[key] = t;
+    st.order.push_back(key);
+    return st.byName[key];
+}
+
+// RWX queues an upgrade as an action that converts the hull: LandFactoryUpgradeAction.java:37-47,
+// AirFactoryUpgradeT2.java:37-42, SeaFactoryT2Upgrade.java:37-42, SupplyDepot.java:51-77 and
+// LaserDefense.java:83-92 all answer getCostAmount() with UnitTypeEnum.X.getUpgradeCost(2) and
+// K() with the build speed (4.0E-4, or 3.0E-4 for the laser defence). RP's [action_*] convertTo is
+// exactly that shape and the HUD already renders any convertTo action as an upgrade button
+// (main.cpp:868-874), so the built-ins only have to push the action.
+void upgradeTo(UnitTemplate& t, const char* to, float price, float buildSpeed) {
+    UnitAction a;
+    a.name = std::string("upgrade_") + to;
+    a.convertTo = to;
+    a.text = "Upgrade T2";
+    a.price = price;
+    a.buildSpeed = buildSpeed;
+    a.supported = true;
+    t.actions.push_back(a);
+}
+
 // A barrel that has no art of its own (RWX `d(int)` returning null): it still aims and fires, it just
 // draws nothing. GunBoat.java:87-89 is the canonical case.
 TurretTpl& invisibleTurret(UnitTemplate& t, float x, float y, float size) {
@@ -174,11 +206,20 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
         waterMovement(t, 1.2f, 0.05f, 0.1f, 1.9f, 0.2f);
         t.canAttack = true; t.attackRange = 200; t.shootDelay = 170; t.turretSize = 14;
-        invisibleTurret(t, 0, 0, 14);
+        TurretTpl& tur = invisibleTurret(t, 0, 0, 14);
         // MissileShip.java:127-134 primary missile U=62, t=2, h=190, ar=a(255,230,230,50) yellow.
         // aH=true (:132) homing missile: RP draws it with the standard missile sprite
         // (drawType 2 / frame 4, same as heavy_missile_ship.ini) instead of a plain dot.
         shot(t, {62, 2, 190, 0, 0, 4, 2, 1, argbToRp(255, 230, 230, 50)});
+        // :140-150 -- against a submerged hull the ship swaps to a second round: U=42, t=1.9, h=220,
+        // x=1, ar=a(255,0,0,150) = (R,G,B,A)=(0,0,150,255), a dark blue hull-piercing round, and aH is
+        // NOT set, so it flies straight instead of homing.
+        // :215-217 canAttackSubmergedUnits()=true, so the hull also sweeps for submarines.
+        ProjectileTpl& depth = shot(t, {42, 1.9f, 220, 0, 0, -1, 0, 1, argbToRp(255, 0, 0, 150)});
+        depth.turnSpeed = 0;               // straight round (no aH)
+        tur.projectileUnderwater = 1;
+        tur.canAttackUnderwater = true;
+        t.canAttackUnderwater = true;
         st.byName["missileship"] = t;   // UnitTypeEnum.missileShip is the same class
     }
     {
@@ -194,10 +235,19 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.targetHeight = -8.0f; t.targetHeightDrift = 0.4f;
         // AttackSubmarine.java:236 m()=250 surfaced / 180 submerged; :243 b()=170 reload.
         t.canAttack = true; t.attackRange = 250; t.shootDelay = 170; t.turretSize = 14;
-        invisibleTurret(t, 0, 0, 14);
+        TurretTpl& tur = invisibleTurret(t, 0, 0, 14);
         // AttackSubmarine.java:356-363 primary torpedo U=42, t=2, h=190, ar=a(255,230,230,50) yellow.
         // aH=true (:361) homing torpedo -> RP missile sprite (drawType 2 / frame 4), not a plain dot.
         shot(t, {42, 2, 190, 0, 0, 4, 2, 1, argbToRp(255, 230, 230, 50)});
+        // :369-383 -- against a submerged hull: U=42, t=1.3, h=250, x=1, ar=a(255,30,30,150) =
+        // (R,G,B,A)=(30,30,150,255), a dark blue round, and aH=false, so it runs straight.
+        // :318-321 canAttackSubmergedUnits() answers true only while this hull is itself dived (Q());
+        // RP has one flag per template, so it is always on here.
+        ProjectileTpl& depth = shot(t, {42, 1.3f, 250, 0, 0, -1, 0, 1, argbToRp(255, 30, 30, 150)});
+        depth.turnSpeed = 0;
+        tur.projectileUnderwater = 1;
+        tur.canAttackUnderwater = true;
+        t.canAttackUnderwater = true;
     }
     // ------------------------------------------------------------------ air
     {
@@ -326,20 +376,20 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.buildSpeed = 0.001f;
         buildingCommon(t, -1, -1, 1, 3, 18);  // :94 buildingVelocityRect (-1,-1,1,3)
         t.isFactory = true;
+        // LandFactory.java:172-186 -- level 1 builds builder 1, tank 2, hoverTank 3, artillery 4; the
+        // hovercraft/heavyTank/heavyHoverTank/laserTank row only appears once the factory is upgraded.
         canBuild(t, "builder", 1);
         canBuild(t, "tank", 2);
         canBuild(t, "hoverTank", 3);
         canBuild(t, "artillery", 4);
-        canBuild(t, "hovercraft", 5);
-        canBuild(t, "heavyTank", 6);
-        canBuild(t, "heavyHoverTank", 7);
-        canBuild(t, "laserTank", 8);
+        // :175 LandFactoryUpgradeAction -> UnitTypeEnum.landFactory.getUpgradeCost(2)=2000, K()=4.0E-4
+        upgradeTo(t, "landFactoryT2", 2000, 0.0004f);
     }
     {
         // AirFactory.java:186-191 -- a level-1 air factory builds nothing at all; dropship 3.2,
-        // gunShip 4 and amphibiousJet 5 only appear once it is upgraded. RP has no upgrade level, so
-        // the list is always offered. Constructor: T(40)/U(61) (air_factory.png is 200x63, five
-        // frames), radius 30, displayRadius 30, hp 1000, target rect (-1,-1,1,1).
+        // gunShip 4 and amphibiousJet 5 only appear once it is upgraded, so those three live on the
+        // tier-2 template. Constructor: T(40)/U(61) (air_factory.png is 200x63, five frames),
+        // radius 30, displayRadius 30, hp 1000, target rect (-1,-1,1,1).
         UnitTemplate& t = add(st, "airFactory", "Air Factory");
         t.price = 1000; t.maxHp = 1000; t.mass = 3000;
         t.radius = 30; t.displayRadius = 30;
@@ -349,9 +399,8 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.buildSpeed = 0.001f;
         buildingCommon(t, -1, -1, 1, 2, 18);  // :93 buildingVelocityRect(-1,-1,1,2) = footprint
         t.isFactory = true;
-        canBuild(t, "dropship", 3.2f);
-        canBuild(t, "gunShip", 4);
-        canBuild(t, "amphibiousJet", 5);
+        // :183 AirFactoryUpgradeT2 -> UnitTypeEnum.airFactory.getUpgradeCost(2)=1500, K()=4.0E-4
+        upgradeTo(t, "airFactoryT2", 1500, 0.0004f);
     }
     {
         // SeaFactory.java:145-155 -- builderShip 1, gunBoat 2, missileShip 3, hovercraft 4,
@@ -372,6 +421,9 @@ void registerBuiltinUnits(TemplateStore& st) {
         canBuild(t, "hovercraft", 4);
         canBuild(t, "battleShip", 5);
         canBuild(t, "attackSubmarine", 6);
+        // SeaFactory.java:145-155 -- the whole list is level-1; the tier-2 upgrade only swaps the art
+        // (:46 sea_factory_t2). :136 SeaFactoryT2Upgrade -> getUpgradeCost(2)=2000, K()=4.0E-4
+        upgradeTo(t, "seaFactoryT2", 2000, 0.0004f);
     }
     // ------------------------------------------------------------------ builder / tanks
     {
@@ -425,9 +477,17 @@ void registerBuiltinUnits(TemplateStore& st) {
         TurretTpl& tur = visibleTurret(t, 0, 0, 21, "");
         tur.turnSpeed = 3.0f; tur.turnAccel = 1.0f;
         tur.recoil = -2; tur.recoilOut = 4; tur.recoilReturn = 6;
-        // HeavyTankUnit.java:158-182 main gun U=q()=50, t=4, h=60, x=2,
-        // ar=a(235,150,230,40) (Terrrestrial=235 alpha, blue=230). Secondary missile on upgrade omitted.
+        // HeavyTankUnit.java:164-184 -- the same barrel fires two rounds. Ground target (!i()):
+        // U=q()=50, t=4, h=60, x=2, ar=a(235,150,230,40) (Terrrestrial=235 alpha, blue=230), no P.
         shot(t, {50, 4, 60, 0, 0, -1, 0, 2, argbToRp(235, 150, 230, 40)});
+        // Airborne target (i()): U=q()=50, t=0.5 ramping to r=5, h=190, ar=a(255,230,230,50) yellow,
+        // aH=true homing with aI=10/aJ=15 arc. Drawn with RP's missile sprite (drawType 2 / frame 4,
+        // the convention heavy_missile_ship.ini set) instead of the dot RWX falls back to.
+        // :276 canAttackFlyingUnits()=true, so the hull sweeps for aircraft too.
+        ProjectileTpl& aa = shot(t, {50, 0.5f, 190, 5, 0, 4, 2, 2, argbToRp(255, 230, 230, 50)});
+        aa.turnSpeed = -1;                 // aH: re-aim every tick (Game.cpp:2852)
+        tur.projectileAir = 1;             // index of the round above
+        t.canAttackFlying = true;
     }
     // ------------------------------------------------------------------ remaining UnitTypeEnum hulls
     {
@@ -516,6 +576,11 @@ void registerBuiltinUnits(TemplateStore& st) {
         TurretTpl& pd = invisibleTurret(t, 0, 0, 1);
         pd.canShoot = false; pd.laserDefence = true; pd.laserDefenceEnergyUse = 0.11f;
         pd.range = 160.0f;
+        pd.projectile = -1;               // an interceptor round, not a projectile row (never fires a gun)
+        // LaserDefense.java:83-92 -- tier-2 costs UnitTypeEnum.laserDefence.getUpgradeCost(2)=2000 at
+        // K()=3.0E-4; :427-433 the upgrade also adds 900 hp, :336-341 extends the reach to 210 and
+        // :244-249 cheapens each intercept to 0.05 while :233-236 regen rises by 2.0E-4.
+        upgradeTo(t, "laserDefenceT2", 2000, 0.0003f);
     }
     {
         // MegaTankUnit.java:64-67 sprite 20x25, radius 12, displayRadius radius+1, hp 550; :51 mass 7000;
@@ -528,10 +593,16 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.imageShadow = "AUTO"; t.shadowOffX = 1; t.shadowOffY = 1;
         landMovement(t, 0.8f, 0.05f, 0.1f, 1.2f, 0.2f);
         t.canAttack = true; t.attackRange = 140; t.shootDelay = 70; t.turretSize = 18;
-        visibleTurret(t, 0, 0, 18, "");
-        // MegaTankUnit.java:101-112 main gun U=50 (literal), t=3, h=60, x=2, ar=a(255,150,230,40).
-        // Secondary missile (:114-125 U=40) on upgrade omitted.
+        TurretTpl& tur = visibleTurret(t, 0, 0, 18, "");
+        // MegaTankUnit.java:96-134 -- one barrel, two rounds. Ground: U=50 (literal), t=3, h=60, x=2,
+        // ar=a(255,150,230,40), no P.
         shot(t, {50, 3, 60, 0, 0, -1, 0, 2, argbToRp(255, 150, 230, 40)});
+        // Airborne: U=40, t=4, h=190, ar=a(255,230,230,50) yellow, aH=true homing (aI=10/aJ=15 arc).
+        // :184 canAttackFlyingUnits()=true.
+        ProjectileTpl& aa = shot(t, {40, 4, 190, 0, 0, 4, 2, 2, argbToRp(255, 230, 230, 50)});
+        aa.turnSpeed = -1;
+        tur.projectileAir = 1;
+        t.canAttackFlying = true;
     }
     {
         // TankDestroyer.java sprite 16x30, radius 11, displayRadius radius+2, hp 350; range 150,
@@ -567,6 +638,9 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.imageShadow = "NONE";
         buildingCommon(t, -1, -1, 1, 1, 14);
         t.canAttack = false;
+        // SupplyDepot.java:51-77 -- the depot upgrade costs a flat 1000 at K()=4.0E-4; tier 2 only
+        // swaps the sprite (:134 supply_depot_t2), no stat change.
+        upgradeTo(t, "supplyDepotT2", 1000, 0.0004f);
     }
     {
         // FogRevealer.java: price 1000, no art, DummyUnit (no own radius/hp -- these are placeholders).
@@ -589,6 +663,57 @@ void registerBuiltinUnits(TemplateStore& st) {
         t.image = "trees.png";
         t.unselectable = true; t.untargetable = true; t.cannotBeAttacked = true;
         t.teamColoringMode = kTCModeDisabled;
+    }
+
+    // ------------------------------------------------------------------ tier 2 upgrade targets
+    // RWX upgrades a building in place by flipping a level flag, and the new art / extra menu rows hang
+    // off that flag. RP swaps the template instead (Game::runAction convertTo), so every tier 2 is a
+    // copy of its tier 1 carrying the shipped _t2 art and whatever the level changes.
+    {
+        // LandFactory.java:70-74 level2Texture = land_factory_front_t2; :180-186 the level-2 row.
+        UnitTemplate& t2 = addCopy(st, "landFactoryT2", "Land Factory T2", st.byName["landfactory"]);
+        t2.image = "land_factory_front_t2.png";
+        t2.actions.clear();                 // these hulls have no tier 3
+        canBuild(t2, "hovercraft", 5);
+        canBuild(t2, "heavyTank", 6);
+        canBuild(t2, "heavyHoverTank", 7);
+        canBuild(t2, "laserTank", 8);       // only resolves when a mod supplies the laser tank
+    }
+    {
+        // AirFactory.java:69-72 level2Texture = air_factory_t2; :186-191 levels above 1 build aircraft.
+        UnitTemplate& t2 = addCopy(st, "airFactoryT2", "Air Factory T2", st.byName["airfactory"]);
+        t2.image = "air_factory_t2.png";
+        t2.actions.clear();
+        canBuild(t2, "dropship", 3.2f);
+        canBuild(t2, "gunShip", 4);
+        canBuild(t2, "amphibiousJet", 5);
+    }
+    {
+        // SeaFactory.java:46 tier2FactoryTexture = sea_factory_t2; the hull is already buildable at
+        // level 1 (:150-155), so the upgrade only changes the art.
+        UnitTemplate& t2 = addCopy(st, "seaFactoryT2", "Sea Factory T2", st.byName["seafactory"]);
+        t2.image = "sea_factory_t2.png";
+        t2.actions.clear();
+    }
+    {
+        // SupplyDepot.java:134 tier2Texture = supply_depot_t2; the upgrade changes nothing but the art.
+        UnitTemplate& t2 = addCopy(st, "supplyDepotT2", "Supply Depot T2", st.byName["supplydepot"]);
+        t2.image = "supply_depot_t2.png";
+        t2.actions.clear();
+    }
+    {
+        // LaserDefense.java:168 laser_defence_t2; :427-433 the upgrade adds 900 hp (500 -> 1400);
+        // :336-341 reach 160 -> 210; :244-249 each intercept costs 0.05 instead of 0.11;
+        // :233-236 regen gains 2.0E-4 on top of the base 4.0E-4.
+        UnitTemplate& t2 = addCopy(st, "laserDefenceT2", "Laser Defence T2", st.byName["laserdefence"]);
+        t2.image = "laser_defence_t2.png";
+        t2.actions.clear();
+        t2.maxHp = 1400;                    // RWX also heals the 900 in; RP's convert only raises the cap
+        t2.energyRegen = 0.0006f;
+        if (!t2.turrets.empty()) {
+            t2.turrets[0].range = 210.0f;
+            t2.turrets[0].laserDefenceEnergyUse = 0.05f;
+        }
     }
 
     // UnitTypeEnum.D() is each hull's build speed. Set explicitly from source for every built-in so
