@@ -258,10 +258,21 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
     // A tileset cell that carries a `unit` property is a spawn marker, not scenery: the editor paints
     // the red "?" of tilesets/bitmaps/misc.png on it. RWX creates the unit from it and draws no tile,
     // so collect the global ids here and let the terrain renderer skip them.
+    //
+    // The catch is that a map assigns `firstgid` from the tilecount the map was authored against, and the
+    // shipped .tsx can be larger than that. `units.tsx` now has 279 cells while the maps give it only 261
+    // slots, so ids 371+ of it would shadow the tileset that legitimately starts at 371. A cell therefore
+    // only counts if no later tileset claims its gid -- the same "highest firstgid wins" rule drawMap uses.
     unitMarkerGids.clear();
-    for (const auto& s : sets)
-        for (const auto& kv : s.props)
-            if (kv.second.count("unit")) unitMarkerGids.insert((uint32_t)(s.firstgid + kv.first));
+    for (size_t i = 0; i < sets.size(); ++i) {
+        const TileSetInfo& s = sets[i];
+        uint32_t limit = (i + 1 < sets.size()) ? (uint32_t)sets[i + 1].firstgid : 0xFFFFFFFFu;
+        for (const auto& kv : s.props) {
+            if (!kv.second.count("unit")) continue;
+            uint32_t g = (uint32_t)(s.firstgid + kv.first);
+            if (g < limit) unitMarkerGids.insert(g);
+        }
+    }
 
     auto processLayer = [&](XMLElement* layer) {
         std::string L = ToLower(layer->Attribute("name") ? layer->Attribute("name") : "");
