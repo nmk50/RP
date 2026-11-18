@@ -1133,23 +1133,43 @@ int main(int argc, char** argv) {
             auto it = g_templates.byName.find(key);
             if (it == g_templates.byName.end()) continue;
             const UnitTemplate& t = it->second;
-            const bool tier2 = key.size() > 2 && key.compare(key.size() - 2, 2, "t2") == 0;
-            if (t.projectiles.size() <= 1 && t.actions.empty() && !tier2) continue;
             ++rows;
-            TraceLog(LOG_INFO, "BUILTIN %-18s proj=%zu turr=%zu fly=%d sea=%d acts=%zu img=%s",
-                     key.c_str(), t.projectiles.size(), t.turrets.size(), (int)t.canAttackFlying,
-                     (int)t.canAttackUnderwater, t.actions.size(), t.image.c_str());
+            std::string cbList;
+            for (const BuildOption& b : t.canBuild) {
+                if (!cbList.empty()) cbList += ',';
+                cbList += b.unitName + ":" + std::to_string((int)b.pos);
+            }
+            // One canonical line per template: everything the ini loader and the built-in registration
+            // both have to agree on. Diffing this before/after a loader change is the equivalence gate.
+            TraceLog(LOG_INFO, "CORE %s|%d|%.1f|%.1f|%.2f|%.2f|%d|%.3f|%.3f|%.3f|%.3f|%.3f|%d%d%d%d|%.1f|%.1f|%.1f|%.6f|%d|%d|%d|%d,%d,%d,%d|%.1f|%.4f|%.4f|%d|%.3f|%.1f|%.5f|%d|%d|%d|%d%d%d|%d|%d|%.1f|%s|%s|%s|%s|%s|%d|%.1f|%d%d%d|%.1f|%.1f|%s",
+                     key.c_str(), (int)t.price, t.maxHp, t.mass, t.radius, t.displayRadius,
+                     (int)t.moveType, t.moveSpeed, t.accel, t.decel, t.maxTurnSpeed, t.turnAccel,
+                     (int)t.canAttack, (int)t.canAttackFlying, (int)t.canAttackLand, (int)t.canAttackUnderwater,
+                     t.attackRange, t.shootDelay, t.turretSize, t.buildSpeed, t.techLevel,
+                     (int)t.isBuilding, (int)t.placeOnlyOnWater, t.footL, t.footU, t.footR, t.footD,
+                     t.fogSight, t.resourceRate, t.creditIncomeRate, t.maxShield, t.shieldRegen,
+                     t.maxEnergy, t.energyRegen, (int)t.showEnergyBar, t.maxTransportingUnits,
+                     t.transportSlotsNeeded, (int)t.unselectable, (int)t.untargetable,
+                     (int)t.cannotBeAttacked, (int)t.isBuilder, (int)t.isFactory, t.meleeRange,
+                     t.image.c_str(), t.imageWreak.c_str(), t.imageTurret.c_str(), t.imageShadow.c_str(),
+                     t.imageShield.c_str(), t.totalFrames, t.shieldRenderRadius,
+                     (int)t.isMelee, (int)t.isBuilder, (int)t.isFixedFiring, t.targetHeight, t.targetHeightDrift,
+                     cbList.c_str());
             for (size_t i = 0; i < t.projectiles.size(); ++i) {
                 const ProjectileTpl& p = t.projectiles[i];
-                TraceLog(LOG_INFO, "  proj[%zu] dmg=%.0f speed=%.2f tgt=%.2f life=%d frame=%d draw=%d size=%.0f color=%08X turn=%.2f",
-                         i, p.directDamage, p.speed, p.targetSpeed, p.life, p.frame, p.drawType,
-                         p.drawSize, p.color, p.turnSpeed);
+                TraceLog(LOG_INFO, "  proj[%zu] dmg=%.0f speed=%.2f tgt=%.2f acc=%.2f life=%d frame=%d draw=%d size=%.0f color=%08X turn=%.2f area=%.0f/%.0f flags=%d%d%d reuse=%d mwp=%d",
+                         i, p.directDamage, p.speed, p.targetSpeed, p.targetSpeedAccel, p.life, p.frame,
+                         p.drawType, p.drawSize, p.color, p.turnSpeed, p.areaDamage, p.areaRadius,
+                         (int)p.instant, (int)p.laserEffect, (int)p.trail,
+                         (int)p.instantReuseLast, (int)p.moveWithParent);
             }
             for (size_t i = 0; i < t.turrets.size(); ++i) {
                 const TurretTpl& tt = t.turrets[i];
-                TraceLog(LOG_INFO, "  tur[%zu] proj=%d air=%d sea=%d range=%.0f delay=%.0f laserUse=%.3f shoot=%d",
+                TraceLog(LOG_INFO, "  tur[%zu] proj=%d air=%d sea=%d range=%.0f delay=%.0f laserUse=%.3f shoot=%d x=%.1f y=%.1f by=%.1f turn=%.2f inv=%d img=%s cf=%d cl=%d cu=%d",
                          i, tt.projectile, tt.projectileAir, tt.projectileUnderwater, tt.range,
-                         tt.shootDelay, tt.laserDefenceEnergyUse, (int)tt.canShoot);
+                         tt.shootDelay, tt.laserDefenceEnergyUse, (int)tt.canShoot,
+                         tt.x, tt.y, tt.barrelY, tt.turnSpeed, (int)tt.invisible, tt.image.c_str(),
+                         (int)tt.canAttackFlying, (int)tt.canAttackLand, (int)tt.canAttackUnderwater);
                 for (int idx : { tt.projectile, tt.projectileAir, tt.projectileUnderwater })
                     if (idx >= (int)t.projectiles.size()) {
                         TraceLog(LOG_WARNING, "BADREF %s tur[%zu] idx=%d proj=%zu", key.c_str(), i, idx,

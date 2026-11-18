@@ -1513,8 +1513,23 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (s.has("image_drawoffsetx")) tt.drawOffsetX = (float)s.getNum("image_drawoffsetx", 0);
             if (s.has("image_drawoffsety")) tt.drawOffsetY = (float)s.getNum("image_drawoffsety", 0);
             if (s.has("projectile")) {
-                auto it = projIdx.find(ToLower(Trim(s.get("projectile"))));
-                if (it != projIdx.end()) tt.projectile = it->second;
+                std::string pv = ToLower(Trim(s.get("projectile")));
+                if (pv == "none" || pv == "-1") tt.projectile = -1;   // a barrel that never fires a round
+                else {
+                    auto it = projIdx.find(pv);
+                    if (it != projIdx.end()) tt.projectile = it->second;
+                }
+            }
+            // The two domain alternates a built-in barrel carries (heavy/mega tank AA missile, the
+            // missile ship / attack sub round against a submerged hull). Same name lookup as `projectile`;
+            // Game::fire picks between them on the target's height.
+            if (s.has("projectileair")) {
+                auto it = projIdx.find(ToLower(Trim(s.get("projectileair"))));
+                if (it != projIdx.end()) tt.projectileAir = it->second;
+            }
+            if (s.has("projectileunderwater")) {
+                auto it = projIdx.find(ToLower(Trim(s.get("projectileunderwater"))));
+                if (it != projIdx.end()) tt.projectileUnderwater = it->second;
             }
             if (s.has("invisible")) tt.invisible = s.getBool("invisible", false);
             if (s.has("canshoot")) tt.canShoot = s.getBool("canshoot", true);
@@ -1673,10 +1688,9 @@ void TemplateStore::loadAll(const std::string& assetsRoot) {
     // builtin_mods are optional mods, disabled by default in RWX (builtin_mods_enabled) - not loaded
     const char* roots[] = { "units" };
     std::vector<std::pair<std::string, std::string>> aliases; // aliasKey -> realKey
-    // RWX's hard-coded units have no .ini, so they go in first; every ini below can then override one by
-    // name or through `overrideAndReplace`, which is exactly how the shipped extractor/tank/turret inis
-    // take over their built-in counterparts.
-    registerBuiltinUnits(*this);
+    // RWX's hard-coded units ship as ini here too (assets/units/builtin), so there is one loader path:
+    // every hull below goes through the same parser, which is what applies the turret/delay/projectile
+    // fallbacks the C++ registration used to have to replicate by hand.
     for (const char* sub : roots) {
         std::string base = assetsRoot + "/" + sub;
         FilePathList fl = LoadDirectoryFilesEx(base.c_str(), nullptr, true);

@@ -935,7 +935,6 @@ extern TemplateStore g_templates;
 
 // RWX's hard-coded units (UnitTypeEnum.java), which ship no .ini. Called by TemplateStore::loadAll
 // before the ini scan so a custom unit of the same name -- or an `overrideAndReplace` -- still wins.
-void registerBuiltinUnits(TemplateStore& store);
 
 // UnitSpawnList.b():26-113, the grammar of a spawnProjectilesOn* value: "name, name*3(key = value, ...)".
 // Exposed for the harness in out/sim_main.cpp, which cannot feed it through an ini file.
