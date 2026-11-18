@@ -67,12 +67,22 @@ static void applyTile(TileMap& map, int x, int y, const TileSetInfo& ts, uint32_
     t.color = colorFromName(ln);
     if (t.color == TC_WATER || t.color == TC_DEEP || t.color == TC_SHALLOW) t.water = true;
     if (t.color == TC_LAVA) t.lava = true;
+    // RWX MapTile.createTile:209-249 -- exactly these property names decide passability. The ridge
+    // tilesets (the cliff edges a tank must not climb) tag their cells `large-cliff` / `cliff-soft` /
+    // `lava-cliff`, so missing them is what let land units drive straight over a cliff.
     if (hasProp("water")) t.water = true;
-    if (hasProp("lava")) { t.lava = true; t.water = false; }
-    if (hasProp("cliff") || hasProp("large-rock") || hasProp("largerock")) t.blocked = true;
+    if (hasProp("water-bridge")) t.waterBridge = true;
+    if (hasProp("lava") || hasProp("lava-cliff")) { t.lava = true; t.water = false; }
+    if (hasProp("cliff") || hasProp("cliff-soft") || hasProp("lava-cliff")) t.cliff = true;
+    if (hasProp("large-cliff") || hasProp("trees")) t.largeObject = true;
     if (hasProp("small-rock") || hasProp("smallrock")) t.cost = true;
+    if (hasProp("large-rock") || hasProp("largerock") || hasProp("block-land")) t.blocked = true;
+    if (hasProp("block-buildings")) t.noBuild = true;
     if (hasProp("res_pool") || hasProp("resource") || hasProp("respool")) { t.resource = true; }
     if (hasProp("tree")) t.tree = true;
+    // PathCostMap.b:329-343 -- for LAND movement z/z2/z3 are all false, so water, cliff, large object
+    // and lava each close the tile outright. `blocked` folds that into the one flag walkableLand reads.
+    if (t.cliff || t.largeObject || t.lava) t.blocked = true;
 
     auto unitIt = pm.find("unit");
     if (unitIt != pm.end() && !unitIt->second.empty()) {
@@ -94,9 +104,13 @@ static void applyTile(TileMap& map, int x, int y, const TileSetInfo& ts, uint32_
         MapTile& d = map.at(x, y);
         if (d.color == TC_VOID) d.color = t.color;
         d.water = d.water || t.water;
+        d.waterBridge = d.waterBridge || t.waterBridge;
         d.lava = d.lava || t.lava;
+        d.cliff = d.cliff || t.cliff;
+        d.largeObject = d.largeObject || t.largeObject;
         d.blocked = d.blocked || t.blocked;
         d.cost = d.cost || t.cost;
+        d.noBuild = d.noBuild || t.noBuild;
         d.resource = d.resource || t.resource;
         d.tree = d.tree || t.tree;
     }

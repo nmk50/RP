@@ -10,11 +10,18 @@ enum TileColor { TC_LAND, TC_GRASS, TC_DIRT, TC_SAND, TC_SNOW, TC_ICE, TC_MOUNTA
 
 struct MapTile {
     uint8_t color = TC_VOID;
-    bool water = false;    // blocks land movement
-    bool lava = false;     // blocks all ground
-    bool blocked = false;  // cliff / large rock: blocks land
-    bool cost = false;     // small rock: passable, higher cost
-    bool resource = false; // res_pool: extractor can be placed
+    // Mirrors RWX MapTile's flags (MapTile.createTile:209-249). `blocked` is the derived "a LAND unit
+    // cannot enter" answer used by the walkability helpers; the individual flags are kept because the
+    // other movement types read them separately (PathCostMap.b:320-343).
+    bool water = false;       // isWater
+    bool waterBridge = false; // isWaterBridge: crossable by ships, not a bridge for tanks
+    bool lava = false;        // isLava
+    bool cliff = false;       // isCliff -- cliff / cliff-soft / lava-cliff
+    bool largeObject = false; // hasLargeObject -- large-cliff / trees
+    bool blocked = false;     // movementBlockLevel -1, or cliff / large object / lava
+    bool cost = false;        // movementBlockLevel 40 (small-rock): passable but slow
+    bool noBuild = false;     // blocksBuildingPlacement
+    bool resource = false;    // res_pool: extractor can be placed
     bool tree = false;
     bool hasUnit = false;  // occupied by static object (from Units layer handled separately)
 };
@@ -96,18 +103,19 @@ public:
     }
     bool walkableWater(int x, int y) const {
         if (!inBounds(x, y)) return false;
-        return tiles[y * w + x].water;
+        const MapTile& t = tiles[y * w + x];
+        return t.water || t.waterBridge;
     }
     bool canPlaceBuilding(int x, int y) const {
         if (!inBounds(x, y)) return false;
         const MapTile& t = tiles[y * w + x];
-        return !(t.water || t.lava || t.blocked) && !occupied(x, y);
+        return !(t.water || t.lava || t.blocked || t.noBuild) && !occupied(x, y);
     }
     // RWX BaseBuilding: seaFactory / water-movement buildings must sit on water
     bool canPlaceWaterBuilding(int x, int y) const {
         if (!inBounds(x, y)) return false;
         const MapTile& t = tiles[y * w + x];
-        return t.water && !t.lava && !occupied(x, y);
+        return (t.water || t.waterBridge) && !t.lava && !t.noBuild && !occupied(x, y);
     }
 
     bool loadTmx(const std::string& path, std::string* err = nullptr);

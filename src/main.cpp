@@ -1099,8 +1099,14 @@ int main(int argc, char** argv) {
                 std::string bmp = g_assetsRoot + "/tilesets/bitmaps/" + ts.imageKey;
                 if (ts.imageKey.empty() || !FileExists(bmp.c_str())) ++noArt;
             }
-            TraceLog(LOG_INFO, "MAP %-58s %3dx%-3d sets=%2zu noart=%d spawns=%zu",
-                     rel.c_str(), m.w, m.h, m.tilesets.size(), noArt, m.spawns.size());
+            int blocked = 0, cliff = 0, water = 0;
+            for (auto& t : m.tiles) {
+                if (t.blocked) ++blocked;
+                if (t.cliff) ++cliff;
+                if (t.water) ++water;
+            }
+            TraceLog(LOG_INFO, "MAP %-58s %3dx%-3d sets=%2zu noart=%d spawns=%zu blocked=%d(cliff=%d) water=%d",
+                     rel.c_str(), m.w, m.h, m.tilesets.size(), noArt, m.spawns.size(), blocked, cliff, water);
             if (noArt) ++bad;
         }
         UnloadDirectoryFiles(fl);
