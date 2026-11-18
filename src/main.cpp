@@ -714,122 +714,327 @@ static void selectBox(Game& g, Vector2 a, Vector2 b) {
     (void)firstMatch;
 }
 
+// HUD artwork. RWX loads these once in GameUI.initializeUIResources():629;
+// the icons live in assets/drawable, the action glyphs in assets/units/shared.
+struct HudArt {
+    Texture2D metal{}, crystal{}, power{}, unitLand{}, pause{}, fast{}, replayPause{}, leaderboard{};
+    Texture2D darkBox{}, lock{}, upgrade{}, buildIcon{};
+    bool loaded = false;
+    void load() {
+        if (loaded) return;
+        auto tex = [](const std::string& rel) {
+            return LoadTexture((g_assetsRoot + "/" + rel).c_str());
+        };
+        metal       = tex("drawable/metal_dark.png");
+        crystal     = tex("drawable/crystal.png");
+        power       = tex("drawable/power.png");
+        unitLand    = tex("drawable/unit_icon_land.png");
+        pause       = tex("drawable/pause.png");
+        fast        = tex("drawable/fast.png");
+        replayPause = tex("drawable/replay_pause.png");
+        leaderboard = tex("drawable/replay_leaderboard.png");
+        darkBox     = tex("drawable/rounded_dark_box.png");
+        lock        = tex("drawable/lock_icon_menu.png");
+        upgrade     = tex("units/shared/icon_upgrade.png");
+        buildIcon   = tex("units/shared/icon_build.png");
+        loaded = true;
+    }
+    void close() {
+        if (!loaded) return;
+        Texture2D all[] = { metal, crystal, power, unitLand, pause, fast, replayPause,
+                            leaderboard, darkBox, lock, upgrade, buildIcon };
+        for (Texture2D& t : all) if (t.id) UnloadTexture(t);
+        loaded = false;
+    }
+    // RWX uses 9-slices for its panels (GameUI.java:663-673). raylib draws them
+    // with DrawTextureNPatch; fall back to a flat rect when the art is missing.
+    void panel(Rectangle r, Color tint, int border = 24) const {
+        if (!metal.id) { DrawRectangleRec(r, tint); return; }
+        NPatchInfo np{ Rectangle{ 0, 0, (float)metal.width, (float)metal.height },
+                       border, border, border, border, NPATCH_NINE_PATCH };
+        DrawTextureNPatch(metal, np, r, Vector2{ 0, 0 }, 0, tint);
+    }
+};
+static HudArt g_hudArt;
+
+static void drawHudIcon(Texture2D t, Rectangle box, Color tint = WHITE) {
+    if (!t.id || box.width <= 0 || box.height <= 0) return;
+    float s = std::min(box.width / t.width, box.height / t.height);
+    DrawTextureEx(t, Vector2{ box.x + (box.width - t.width * s) / 2,
+                              box.y + (box.height - t.height * s) / 2 }, 0, s, tint);
+}
+
+// Gameplay HUD, following RWX's GameUI / GameInterfaceRenderer / Minimap:
+//   - right sidebar, width = clamp(screenHeight/2.5, 60, min(250, screenWidth/3))
+//   - square minimap pinned to the sidebar top
+//   - resource readout + selected-unit card below it
+//   - bottom command bar with per-action buttons (icon, price, cooldown, queue)
+//   - pause / speed / leaderboard icons on the top strip, group slots bottom-right
 static void renderHUD(Game& g, Camera2D& cam) {
+    g_hudArt.load();
     int SW = GetScreenWidth(), SH = GetScreenHeight();
+    Vector2 mouse = GetMousePosition();
     ui.overPanel = false; ui.overMinimap = false;
 
-    // ---- top-left resources ----
-    Team* me = nullptr; for (auto& t : g.teams) if (t.id == g.playerTeam()) me = &t;
-    std::string credits = "Credits: " + (me ? std::to_string((int)me->credits) : "0");
-    DrawRectangle(6, 6, 200, 30, Color{ 0, 0, 0, 130 });
-    DrawText(credits.c_str(), 14, 12, 20, Color{ 240, 220, 90, 255 });
-    char buf[64]; snprintf(buf, 64, "Units: %zu  FPS: %d", g.units.size(), (int)GetFPS());
-    DrawText(buf, 14, 40, 14, LIGHTGRAY);
-    // RP has no command bar for the unload order, so the hold reads out here instead
-    for (auto* u : g.selectedUnits()) {
-        if (!u->tpl || !u->tpl->canTransportUnits()) continue;
-        std::string s = "Transport " + std::to_string(g.transportSlotsUsed(*u)) + "/" +
-            std::to_string(u->tpl->maxTransportingUnits) + (u->unloading ? "  unloading" : "") +
-            "   [U]unload  [I]load up";
-        DrawText(s.c_str(), 14, 60, 14, Color{ 150, 200, 255, 255 });
-        break;
-    }
-    if (g.gameOver) DrawText(("*** " + g.gameOverText + " ***  (R to restart)").c_str(), 220, 10, 26, g.gameOverText == "VICTORY" ? GREEN : RED);
+    // GameLogic.updateCameraSystem():2036-2049 -- sidebarWidth is derived from
+    // screen height, capped by a third of the screen and by 250 * screenScale.
+    float side = std::min(250.0f, (float)SH / 2.5f);
+    side = std::min(side, (float)SW / 3.0f);
+    side = std::max(60.0f, side);
+    float sideX = (float)SW - side;
 
-    // ---- minimap (top-right) ----
-    float mmW = 180, mmH = 160;
-    Rectangle mm{ SW - mmW - 8, 8, mmW, mmH };
-    DrawRectangleRec(mm, Color{ 10, 14, 18, 220 });
-    DrawRectangleLinesEx(mm, 1.5f, LIGHTGRAY);
-    if (CheckCollisionPointRec(GetMousePosition(), mm)) ui.overMinimap = true;
-    float sx = g.map.worldW() > 0 ? mmW / g.map.worldW() : 1;
-    float sy = g.map.worldH() > 0 ? mmH / g.map.worldH() : 1;
-    // terrain downsample
-    for (int y = 0; y < g.map.h; y += 2) for (int x = 0; x < g.map.w; x += 2) {
+    Team* me = nullptr;
+    for (auto& t : g.teams) if (t.id == g.playerTeam()) me = &t;
+
+    // ---- right sidebar surface (GameUI.processTouchInput:1327-1343) ----
+    Rectangle sidebar{ sideX, 0, side, (float)SH };
+    g_hudArt.panel(sidebar, Color{ 255, 255, 255, 150 }, 32);
+    DrawRectangleLinesEx(sidebar, 1, Color{ 0, 0, 0, 255 });
+
+    // ---- minimap (Minimap.updateDimensions/updateMinimapPosition) ----
+    Rectangle mm{ sideX, 0, side, side };
+    DrawRectangleRec(mm, Color{ 10, 14, 18, 235 });
+    if (CheckCollisionPointRec(mouse, mm)) ui.overMinimap = true;
+    // Two scales: tile-grid coordinates for terrain cells, world pixels for unit/viewport positions.
+    float tsx = g.map.w > 0 ? mm.width / (float)g.map.w : 1;
+    float tsy = g.map.h > 0 ? mm.height / (float)g.map.h : 1;
+    float sx = g.map.worldW() > 0 ? mm.width / g.map.worldW() : 1;
+    float sy = g.map.worldH() > 0 ? mm.height / g.map.worldH() : 1;
+    for (int y = 0; y < g.map.h; ++y) for (int x = 0; x < g.map.w; ++x) {
         const MapTile& t = g.map.at(x, y);
-        Color c = t.water ? Color{ 40, 96, 160, 255 } : (t.blocked ? Color{ 80, 80, 80, 255 } : Color{ 110, 120, 80, 255 });
-        DrawRectangle(mm.x + x * sx, mm.y + y * sy, 2 * sx, 2 * sy, c);
+        Color c = t.water ? Color{ 40, 96, 160, 255 }
+                : (t.blocked ? Color{ 86, 86, 92, 255 }
+                : (t.resource ? Color{ 150, 140, 80, 255 } : Color{ 76, 124, 62, 255 }));
+        DrawRectangle(mm.x + x * tsx, mm.y + y * tsy, tsx + 0.5f, tsy + 0.5f, c);
     }
-    for (auto& u : g.units) if (u.tpl && !u.riding()) DrawRectangle(mm.x + u.pos.x * sx - 1, mm.y + u.pos.y * sy - 1, 3, 3, TC(u.team));
-    // view rect
+    // Minimap.drawUnitsAndBuildings:575-588 -- own green, ally yellow, enemy red.
+    for (auto& u : g.units) {
+        if (!u.tpl || u.riding()) continue;
+        Color c = u.team == g.playerTeam() ? Color{ 0, 255, 0, 255 } : Color{ 255, 0, 0, 255 };
+        float sz = u.tpl->isBuilding ? 3 : 2;
+        DrawRectangle(mm.x + u.pos.x * sx - sz / 2, mm.y + u.pos.y * sy - sz / 2, sz, sz, c);
+    }
+    // Minimap.draw:921-940 -- white 1px camera viewport rectangle.
     Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam), br = GetScreenToWorld2D({ (float)SW, (float)SH }, cam);
-    DrawRectangleLines(mm.x + tl.x * sx, mm.y + tl.y * sy, (br.x - tl.x) * sx, (br.y - tl.y) * sy, WHITE);
+    Rectangle view{ mm.x + tl.x * sx, mm.y + tl.y * sy, (br.x - tl.x) * sx, (br.y - tl.y) * sy };
+    view.x = std::max(mm.x, view.x); view.y = std::max(mm.y, view.y);
+    view.width = std::min(view.width, mm.x + mm.width - view.x);
+    view.height = std::min(view.height, mm.y + mm.height - view.y);
+    DrawRectangleLinesEx(view, 1, WHITE);
+    DrawRectangleLinesEx(mm, 1, Color{ 100, 100, 100, 255 });
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && ui.overMinimap) {
         Vector2 m = GetMousePosition();
         cam.target = { (m.x - mm.x) / sx, (m.y - mm.y) / sy };
     }
 
-    // ---- build / produce / upgrade panel (bottom) ----
+    // ---- resource readout in the sidebar (GameUI.highlightRect:1440-1544) ----
+    float ry = mm.height + 8;
+    if (g_hudArt.crystal.id) {
+        drawHudIcon(g_hudArt.crystal, Rectangle{ sideX + 6, ry, 20, 28 });
+        DrawText("Credits", sideX + 32, ry + 2, 12, Color{ 200, 200, 200, 255 });
+    }
+    std::string credits = me ? std::to_string((int)me->credits) : "0";
+    DrawText(credits.c_str(), sideX + 32, ry + 16, 18, Color{ 240, 220, 90, 255 });
+    ry += 38;
+    drawHudIcon(g_hudArt.unitLand, Rectangle{ sideX + 6, ry, 22, 22 });
+    char ubuf[48];
+    snprintf(ubuf, sizeof(ubuf), "Units  %zu", g.units.size());
+    DrawText(ubuf, sideX + 34, ry + 4, 14, WHITE);
+    snprintf(ubuf, sizeof(ubuf), "FPS  %d", (int)GetFPS());
+    DrawText(ubuf, sideX + 34, ry + 20, 12, Color{ 170, 175, 180, 255 });
+    ry += 46;
+
+    // ---- selected unit card (GameInterfaceRenderer.a(float,int):1969-2045) ----
+    auto sel = g.selectedUnits();
+    if (sel.empty() && ry + 80 < (float)SH) {
+        DrawText("No units selected", sideX + 10, ry + 6, 13, Color{ 160, 165, 170, 255 });
+    } else if (!sel.empty()) {
+        const Unit* u = sel.front();
+        if (sel.size() > 1) {
+            char s[96];
+            snprintf(s, sizeof(s), "%zux %s", sel.size(), u->tpl ? u->tpl->displayText.c_str() : "Units");
+            DrawText(s, sideX + 10, ry + 4, 15, WHITE);
+        } else if (u->tpl) {
+            Texture2D icon{};
+            if (g_render.unitTexture(u->tpl->name, 0, icon))
+                drawHudIcon(icon, Rectangle{ sideX + 8, ry + 2, 36, 36 });
+            DrawText(u->tpl->displayText.c_str(), sideX + 50, ry + 2, 15, WHITE);
+            // HP / shield bars: same colours as RWX's unitHealthBar / unitShieldBar paints.
+            Rectangle bar{ sideX + 10, ry + 42, side - 20, 8 };
+            DrawRectangleRec(bar, Color{ 60, 20, 20, 255 });
+            if (u->maxHp > 0)
+                DrawRectangle(bar.x, bar.y, bar.width * std::max(0.0f, u->hp / u->maxHp), bar.height,
+                              Color{ 0, 200, 0, 255 });
+            if (u->shieldMax > 0) {
+                Rectangle sb{ bar.x, bar.y + 10, bar.width, 6 };
+                DrawRectangleRec(sb, Color{ 20, 30, 60, 255 });
+                DrawRectangle(sb.x, sb.y, sb.width * std::min(1.0f, u->shield / u->shieldMax), sb.height,
+                              Color{ 80, 180, 255, 255 });
+            }
+            char hbuf[96];
+            snprintf(hbuf, sizeof(hbuf), "HP %d/%d", (int)std::ceil(u->hp), (int)std::ceil(u->maxHp));
+            DrawText(hbuf, sideX + 10, ry + 58, 12, WHITE);
+        }
+        // Transport readout (RP has no separate unload button in the command bar).
+        for (auto* t : sel) {
+            if (!t->tpl || !t->tpl->canTransportUnits()) continue;
+            char tb[96];
+            snprintf(tb, sizeof(tb), "Transport %d/%d [U]unload [I]load",
+                     g.transportSlotsUsed(*t), t->tpl->maxTransportingUnits);
+            DrawText(tb, sideX + 10, ry + 76, 11, Color{ 150, 200, 255, 255 });
+            break;
+        }
+    }
+
+    // ---- top strip: pause / speed / leaderboard (GameInterfaceRenderer.a(float,boolean):2347-2491) ----
+    float iconSize = 34;
+    Rectangle pauseBtn{ 8, 8, iconSize, iconSize };
+    drawHudIcon(g_hudArt.pause, pauseBtn);
+    if (CheckCollisionPointRec(mouse, pauseBtn) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        g_debug.paused = !g_debug.paused;
+    float speedW = MeasureText(TextFormat("%.1fx", g_debug.speed), 14);
+    DrawText(TextFormat("%.1fx", g_debug.speed), 8, pauseBtn.y + iconSize + 4, 14,
+             Color{ 230, 230, 230, 255 });
+    drawHudIcon(g_hudArt.fast, Rectangle{ 12 + speedW, pauseBtn.y + iconSize + 2, 24, 16 });
+    drawHudIcon(g_hudArt.leaderboard, Rectangle{ sideX - 42, 10, 32, 32 });
+
+    // ---- group slots (GameInterfaceRenderer.e(float):2550-2645) ----
+    float groupY = (float)SH - 38;
+    float groupW = (side - 28) / 3.0f;
+    for (int i = 0; i < 3; ++i) {
+        Rectangle gr{ sideX + 8 + i * (groupW + 6), groupY, groupW, 30 };
+        g_hudArt.panel(gr, Color{ 255, 255, 255, 170 }, 12);
+        DrawText(TextFormat("(%d)", i + 1), gr.x + gr.width / 2 - 8, gr.y + 8, 13,
+                 Color{ 190, 195, 200, 255 });
+    }
+
+    if (g.gameOver) {
+        const char* msg = g.gameOverText == "VICTORY" ? "VICTORY  (R to restart)" : "DEFEAT  (R to restart)";
+        int tw = MeasureText(msg, 30);
+        DrawText(msg, (SW - tw) / 2, 30, 30, g.gameOverText == "VICTORY" ? GREEN : RED);
+    }
+
+    // ---- bottom command bar (GameInterfaceRenderer.d(float):1187-1963) ----
     struct PBtn { bool upgrade; bool reclaim = false; std::string label; float price; std::string key; };
     std::vector<PBtn> btns;
     for (auto* it : buildableOptions(g)) btns.push_back({ false, false, it->displayText, it->price, it->name });
     bool anyReclaimer = false;
-    for (auto* u : g.selectedUnits()) {
-        if (u->team != g.playerTeam() || !u->tpl) continue;
-        if (u->tpl->canReclaimResources) anyReclaimer = true;
-        for (auto& a : u->tpl->actions) {
+    for (auto* s : sel) {
+        if (s->team != g.playerTeam() || !s->tpl) continue;
+        if (s->tpl->canReclaimResources) anyReclaimer = true;
+        for (auto& a : s->tpl->actions) {
             bool dup = false;
             for (auto& o : btns) if (o.upgrade && o.key == a.convertTo) dup = true;
             if (!dup) btns.push_back({ true, false, a.text, a.price, a.convertTo });
         }
     }
-    // BuilderUnit.java:62 bolts ReclaimTargetAction onto every builder's action list; the shipped ini never
-    // writes customActions, so the vanilla engineers always show it.
+    // BuilderUnit.java:62 bolts ReclaimTargetAction onto every builder's action list.
     if (anyReclaimer) btns.push_back({ false, true, "Reclaim", 0, "" });
+
     if (!btns.empty()) {
-        Rectangle panel{ 8, SH - ui.panelH - 8, SW - 16 - mmW, ui.panelH };
-        DrawRectangleRec(panel, Color{ 12, 16, 20, 210 });
-        DrawRectangleLinesEx(panel, 1, GRAY);
-        if (CheckCollisionPointRec(GetMousePosition(), panel)) ui.overPanel = true;
-        float bw = 96, gap = 8;
-        int cols = (int)((panel.width - 16) / (bw + gap));
+        float cellH = 52, cellW = 52, gap = 2;
+        int cols = std::max(1, (int)((sideX - 16) / (cellW + gap)));
+        int rows = (int)((btns.size() + cols - 1) / cols);
+        rows = std::min(rows, 2);
+        float barH = rows * (cellH + gap) + 8;
+        Rectangle panel{ 4, (float)SH - barH - 4, sideX - 12, barH };
+        g_hudArt.panel(panel, Color{ 255, 255, 255, 210 }, 16);
+        if (CheckCollisionPointRec(mouse, panel)) ui.overPanel = true;
+
         for (size_t i = 0; i < btns.size(); ++i) {
+            int col = (int)i % cols, row = (int)i / cols;
+            if (row >= rows) break;
             PBtn& b = btns[i];
-            int cx = (int)i % cols, cy = (int)i / cols;
-            Rectangle btn{ panel.x + 12 + cx * (bw + gap), panel.y + 34 + cy * 46, bw, 42 };
-            bool hover = CheckCollisionPointRec(GetMousePosition(), btn) && !ui.overMinimap;
+            Rectangle btn{ panel.x + 6 + col * (cellW + gap), panel.y + 4 + row * (cellH + gap),
+                           cellW, cellH };
+            bool hover = CheckCollisionPointRec(mouse, btn);
             bool afford = me && me->credits >= b.price;
-            Color base = b.upgrade ? Color{ 19, 101, 94, 255 } : Color{ 40, 60, 85, 255 };
-            Color hot = b.upgrade ? Color{ 39, 202, 189, 255 } : Color{ 60, 90, 120, 255 };
-            DrawRectangleRec(btn, afford ? (hover ? hot : base) : Color{ 50, 40, 40, 255 });
-            DrawRectangleLinesEx(btn, 1, afford ? LIGHTGRAY : DARKGRAY);
-            std::string label = b.label.size() > 12 ? b.label.substr(0, 11) + "." : b.label;
-            DrawText(label.c_str(), btn.x + 4, btn.y + 3, 14, afford ? WHITE : GRAY);
-            // ReclaimTargetAction.getCostAmount():38-40 -- the action is free, so it shows no price.
-            if (!b.reclaim)
-                DrawText((std::to_string((int)b.price) + "$").c_str(), btn.x + 4, btn.y + 24, 14, afford ? Color{ 240, 220, 90, 255 } : GRAY);
+            // GameInterfaceRenderer:1445-1465 -- red base, brighter when affordable,
+            // teal for upgrades (RP keeps the teal used by its existing upgrade actions).
+            Color base = b.upgrade ? Color{ 19, 101, 94, 255 } : Color{ 100, 45, 45, 255 };
+            Color hot  = b.upgrade ? Color{ 39, 202, 189, 255 } : Color{ 160, 70, 70, 255 };
+            if (!afford) base = Color{ 70, 70, 70, 255 };
+            DrawRectangleRec(btn, hover ? hot : base);
+            DrawRectangleLinesEx(btn, 1, afford ? Color{ 220, 220, 220, 255 } : DARKGRAY);
+
+            // Unit avatar, or the shared action glyph for upgrades / reclaim.
+            Texture2D icon{};
+            bool drewIcon = false;
+            if (!b.upgrade && !b.reclaim) {
+                const UnitTemplate* t = g_templates.find(ToLower(b.key));
+                if (t && g_render.unitTexture(t->name, 0, icon)) {
+                    drawHudIcon(icon, Rectangle{ btn.x + 4, btn.y + 2, btn.width - 8, btn.height - 18 });
+                    drewIcon = true;
+                }
+            }
+            if (!drewIcon) {
+                drawHudIcon(b.reclaim ? g_hudArt.buildIcon : g_hudArt.upgrade,
+                            Rectangle{ btn.x + 8, btn.y + 6, btn.width - 16, btn.height - 24 });
+            }
+            // Hotkey number, left top (GameInterfaceRenderer:1528-1535).
+            if (i < 9) DrawText(TextFormat("%d", (int)i + 1), btn.x + 3, btn.y + 2, 10,
+                                Color{ 255, 255, 255, 220 });
+            // Price / name, bottom (RWX colours at :1677-1699).
+            if (!b.reclaim) {
+                char pc[32]; snprintf(pc, sizeof(pc), "%d", (int)b.price);
+                int pw = MeasureText(pc, 12);
+                drawHudIcon(g_hudArt.crystal, Rectangle{ btn.x + 3, btn.y + btn.height - 18, 12, 16 });
+                DrawText(pc, btn.x + 15, btn.y + btn.height - 15, 12,
+                         afford ? Color{ 235, 240, 30, 255 } : Color{ 160, 160, 160, 255 });
+                (void)pw;
+            }
+            std::string label = b.label.size() > 8 ? b.label.substr(0, 7) + "." : b.label;
+            DrawText(label.c_str(), btn.x + 3, btn.y + btn.height - 30, 10, WHITE);
+
+            // Queue/build progress bar (GameInterfaceRenderer:1603-1628).
+            if (!sel.empty() && sel.front()->tpl && sel.front()->tpl->isFactory &&
+                ToLower(b.key) == ToLower(sel.front()->prodQueue.empty() ? "" : sel.front()->prodQueue.front())) {
+                Rectangle pb{ btn.x + 4, btn.y + btn.height - 5, btn.width - 8, 3 };
+                DrawRectangleRec(pb, Color{ 0, 0, 150, 120 });
+                DrawRectangle(pb.x, pb.y, pb.width * sel.front()->prodProgress, pb.height,
+                              Color{ 0, 0, 230, 200 });
+            }
+
             if (hover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && afford) {
                 if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; }
                 else if (b.upgrade) {
-                    for (auto* u : g.selectedUnits()) {
+                    for (auto* u : sel) {
                         if (!u->tpl) continue;
                         for (size_t k = 0; k < u->tpl->actions.size(); ++k)
-                            if (ToLower(u->tpl->actions[k].convertTo) == ToLower(b.key)) { g.orderUpgrade(u->id, (int)k); break; }
+                            if (ToLower(u->tpl->actions[k].convertTo) == ToLower(b.key)) {
+                                g.orderUpgrade(u->id, (int)k); break;
+                            }
                     }
                 } else if (g_templates.find(ToLower(b.key)) && g_templates.find(ToLower(b.key))->isBuilding) {
                     ui.placing = true; ui.placingName = b.key;
                 } else {
-                    for (auto* u : g.selectedUnits()) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, b.key);
+                    for (auto* u : sel) if (u->tpl && u->tpl->isFactory) g.orderProduce(u->id, b.key);
                 }
             }
         }
-        DrawText("Build / Production", panel.x + 8, panel.y + 8, 18, LIGHTGRAY);
-        // production queue readout (RWX shows queued units with progress)
-        for (auto* u : g.selectedUnits()) {
+
+        // Queue readout (RWX shows queued units with progress).
+        for (auto* u : sel) {
             if (!u->tpl || !u->tpl->isFactory || u->prodQueue.empty()) continue;
             std::string q = "Queue:";
             int shown = 0;
             for (auto& name : u->prodQueue) {
-                if (shown >= 4) { q += " +"; q += std::to_string((int)u->prodQueue.size() - shown); break; }
+                if (shown >= 4) { q += " +" + std::to_string((int)u->prodQueue.size() - shown); break; }
                 const UnitTemplate* it = g_templates.find(name);
-                q += " ";
-                q += it ? it->displayText : name;
+                q += " " + (it ? it->displayText : name);
                 if (shown == 0) q += " " + std::to_string((int)(u->prodProgress * 100)) + "%";
-                shown++;
+                ++shown;
             }
-            DrawText(q.c_str(), panel.x + 200, panel.y + 8, 18, Color{ 250, 190, 40, 255 });
+            DrawText(q.c_str(), panel.x + 8, panel.y - 20, 14, Color{ 250, 190, 40, 255 });
             break;
         }
+    }
+
+    // Selected unit outlines (RWX unitSelectionBorderPaint).
+    for (auto* u : sel) if (u->tpl) {
+        Vector2 p = GetWorldToScreen2D({ u->pos.x, u->pos.y }, cam);
+        float r = u->tpl->radius * cam.zoom + 4;
+        DrawRectangleLines(p.x - r, p.y - r, r * 2, r * 2, Color{ 0, 255, 0, 255 });
     }
 }
 
@@ -966,7 +1171,7 @@ int main(int argc, char** argv) {
             if (!shotPath.empty() && ++renderedFrames >= shotFrame) {
                 Image img = LoadImageFromScreen(); ExportImage(img, shotPath.c_str()); UnloadImage(img);
                 TraceLog(LOG_INFO, TextFormat("shot written: %s", shotPath.c_str()));
-                g_menu.close(); g_levels.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             }
             if (act == MenuAction::SinglePlayer) {
                 screen = Screen::Levels;
@@ -975,7 +1180,7 @@ int main(int argc, char** argv) {
                 screen = Screen::Game;
                 TraceLog(LOG_INFO, "Main menu: entering game");
             } else if (act == MenuAction::Exit) {
-                g_menu.close(); g_levels.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             } else if (act != MenuAction::None) {
                 g_menu.showToast("Not available in this build");
             }
@@ -991,7 +1196,7 @@ int main(int argc, char** argv) {
             if (!shotPath.empty() && ++renderedFrames >= shotFrame) {
                 Image img = LoadImageFromScreen(); ExportImage(img, shotPath.c_str()); UnloadImage(img);
                 TraceLog(LOG_INFO, TextFormat("shot written: %s", shotPath.c_str()));
-                g_menu.close(); g_levels.close(); g_render.close(); CloseWindow(); return 0;
+                g_menu.close(); g_levels.close(); g_hudArt.close(); g_render.close(); CloseWindow(); return 0;
             }
             if (res.back) {
                 screen = Screen::Menu;
@@ -1199,7 +1404,7 @@ int main(int argc, char** argv) {
 
     g_menu.close();
     g_levels.close();
-    g_render.close();
+    g_hudArt.close(); g_render.close();
     CloseWindow();
     return 0;
 }
