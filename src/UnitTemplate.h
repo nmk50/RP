@@ -7,7 +7,7 @@
 #include "Common.h"
 #include "TeamColoring.h"
 
-enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF };
+enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF, OVER_CLIFF_WATER };
 
 // [core] transportUnitsCanUnloadUnits is a LogicBoolean (CustomUnitConfigParser.java:1837-1842), and the
 // shipped ini files only ever spell out a handful of forms of it: the bare `false` (nautilus, whose cargo
@@ -16,7 +16,7 @@ enum class MoveType { NONE, LAND, AIR, WATER, HOVER, OVER_CLIFF };
 // `if not self.isOverLiquid() and not self.isMoving()` (logic_notOverLiquidAndNotMoving,
 // CustomUnitConfig.java:754). RP reads those atoms into a test list instead of carrying a logic-boolean
 // VM; a predicate it does not know is kept as always-true, since RWX would have rejected the ini outright.
-enum class CondPred { overLiquid, moving };
+enum class CondPred { overLiquid, overWater, moving };
 struct UnloadCond {
     bool never = false;
     std::vector<std::pair<CondPred, bool>> tests;   // predicate, negated -- all of them must hold
@@ -113,6 +113,24 @@ int fxStripIndex(const std::string& key);
 // liveAfterAttachedDies is never assigned, they die with the hull.
 EffectTpl muzzleEffect(int kind);
 
+// RWX UnitPrice (game/units/custom/price/UnitPrice.java) as [turret_N] resourceUsage uses it: a per-shot
+// cost paid out of the hull's pools. Parse b():165-233 splits on comma/pipe, a bare number is credits, and
+// each key is credits/energy/hp/shield/ammo/hasFlag/hasMissingFlag/setFlag/unsetFlag or a named resource.
+// canPay b(unit):285-305 only ever tests a *positive* requirement (a negative cost is a refund paid without
+// a gate), and the flag masks are built by a():134-155 as 1<<id over an optional lo-hi range. pay a(unit):
+// 378-389 subtracts unconditionally then clamps d():315-334 (energy/shield into [0,max], hp<=max, ammo>=0).
+// RWX stores ammo in BaseUnit.unitLevel; RP keeps it in the named-resource pool u.resources["ammo"], the
+// same store addResources/generation_resources ammo:N fills, so a silo spends what it produces.
+struct ResourceCost {
+    float credits = 0, energy = 0, hp = 0, shield = 0, ammo = 0;
+    uint64_t setFlag = 0, unsetFlag = 0, hasFlag = 0, hasMissingFlag = 0;
+    std::vector<std::pair<std::string, float>> custom;
+    bool any() const {
+        return credits != 0 || energy != 0 || hp != 0 || shield != 0 || ammo != 0
+            || setFlag || unsetFlag || hasFlag || hasMissingFlag || !custom.empty();
+    }
+};
+
 struct TurretTpl {
     float x = 0, y = 0;
     // RWX [turret_N]: size/barrelY = muzzle distance along the aim (defaults to [attack] turretSize),
@@ -125,6 +143,11 @@ struct TurretTpl {
     int projectile = 0;
     // [turret_N] image, empty = the unit's [graphics] image_turret (CustomUnit.d(i):691)
     std::string image;
+    // [turret_N] chargeEffectImage (TurretConfig.java:179,563-566, copied by copyFrom at :276) -- while
+    // the barrel charges its warmup, this sprite is drawn centred on the muzzle D(i), scaled by
+    // speed/warmup on both axes, unrotated and with a null paint: no team dye, no construction tint
+    // (CustomUnit:2482-2489 -> GameViewUtils.a(unit,texture,f,i):163-173). Empty = nothing is drawn.
+    std::string chargeEffectImage;
     std::string shootAnimation;
     // [turret_N] image_applyTeamColors (TurretConfig.java:551-554) -- a tri-state, since RWX reads the key as
     // a nullable Boolean and only falls back to [graphics] teamColorsOnTurret when it is absent.
@@ -151,9 +174,31 @@ struct TurretTpl {
     float recoil = 0, recoilOut = 0, recoilReturn = 0;
     // attachedTo / linkDelayWithTurret, resolved to turret indexes (-1 = none)
     int attached = -1, linkDelay = -1;
+    // [turret_N] slave (TurretConfig.java:426-432): a slave must also be attachedTo a parent, and sets
+    // childTurret=parentTurret, which CustomUnitConfigParser:2130-2132 turns into the `x` field that
+    // getLinkedTurretIndex (CustomUnit:2853-2855) returns. Only a slave has x != -1, and only a slave gets
+    // the HARD angle copy at OrderableUnit.advanceMovementLevelTowardTarget:3242-3243 (targetX = master's
+    // targetX); a plain attached barrel instead rides the parent's per-tick turn delta. slaveMaster holds
+    // that master index (-1 = not a slave). The slave fires on the master's isActive and target.
+    int slaveMaster = -1;
+    // [turret_N] limitingAngle (TurretConfig.java:213,485-490, default -1 = off): a firing cone measured
+    // from the parent's aim (when attached) or the hull facing, plus idleDir. CustomUnit.a():1277-1285
+    // rejects a target whose bearing from the hull centre lies more than limitingAngle degrees off that
+    // reference. Checked both at acquisition and again at the fire gate (:3259), which is what lets an
+    // attached slave that never acquires on its own still refuse a shot outside its arc.
+    float limitingAngle = -1;
+    // [turret_N] resourceUsage (TurretConfig.java:50,377-380): a per-shot UnitPrice gate+pay, see ResourceCost.
+    ResourceCost resourceUsage;
     // RWX [turret_N]: idle rest angle relative to the hull, and whether the turret returns to it
     float idleDir = 0;
     bool shouldResetTurret = true;
+    // [turret_N] idleSpin (TurretConfig.java:219,517, a plain float default 0) -- with no target the barrel
+    // turns continuously at idleSpin deg/tick instead of holding a rest angle: CustomUnit.b(i,f):4030-4041
+    // adds idleSpin*f to targetX and wraps it into (-180,180], returning false so the outer rest-reset is
+    // skipped. It runs only when the idle sweep above did not (idleSweepAngle 0 or its condition failed),
+    // and C(i):2672-2674 answers 999 for a spinning barrel so nothing tries to rest it. Like the sweep it
+    // waits for velocityY to decay (:848), so a spinning turret also holds its last aim ~70 ticks after combat.
+    float idleSpin = 0;
     // [turret_N] idleSweepAngle (TurretConfig.java:220-222,518-536) -- with no target the barrel rocks
     // about its rest angle instead of holding it: CustomUnit.b(i,f):3996-4029 walks it out to +angle,
     // parks, then after idleSweepDelay(+random) ticks flips to -angle and back. idleSweepSpeed is not a
@@ -253,6 +298,34 @@ struct ProjectileTpl {
     float targetSpeed = -1, targetSpeedAccel = 0.1f, speedSpread = 0;
     // instant: the shot never moves and lands on the firing tick (Projectile.update:841,979)
     bool instant = false;
+    // [projectile_N] beam family (CustomProjectileTemplate.java:89-113,179-189). beamImage turns the shot
+    // into a tiled beam (X flag) drawn from muzzle to the target's live position; laserEffect/lightingEffect
+    // are the line/lighning variants. A custom beam deals its directDamage ONCE on hit (the continuous look
+    // comes from instant + instantReuseLast re-hitting each shot), and stays visible until `life` runs out
+    // rather than vanishing on impact (Projectile.update:1038,1411). laser/lighting must aim at a unit, not
+    // targetGround (:184-189); RP keeps loading a bad mod rather than throwing.
+    std::string beamImage, beamImageStart, beamImageEnd;
+    bool beamImageStartRotated = false, beamImageEndRotated = false;
+    float beamImageOffsetRate = 0;          // texture scroll along the beam, px/tick (:89)
+    bool laserEffect = false, lightingEffect = false;
+    bool lightCastOnGround = false;         // attached light drawn at posY instead of posY-posZ (:171)
+    // [projectile_N] nukeWeapon (:72 -> ProjectileTemplate.p, default false): the D flag. Its one gameplay
+    // reader is the anti-nuke lock (AntiNukeLauncher:271 hunts D==true); the rest is the nuke blast visual,
+    // fog exemption and minimap alert. Damage/radius still come from areaDamage/areaRadius.
+    bool nukeWeapon = false;
+    // [projectile_N] teleportSource (:249): on hit the SOURCE unit is moved to the impact point
+    // (Projectile.update:1102-1103 -> BaseUnit.f:2512), not the target. The blink weapons use it.
+    bool teleportSource = false;
+    // [projectile_N] instantReuseLast (:121-137): keep one cached round per turret and reset it on each shot
+    // instead of spawning a new one, so an instant beam persists as a single instance. alsoChangeTurretAim
+    // folds the beam's sweep offset into the barrel aim; acrossTurrets reuses a same-template round from
+    // another barrel; keepAreaDamageList stops the reuse clearing the splash's already-hit list.
+    bool instantReuseLast = false, instantReuseLastAlsoChangeTurretAim = false;
+    bool instantReuseLastAcrossTurrets = false, instantReuseLastKeepAreaDamageList = false;
+    // [projectile_N] moveWithParent (:138): the round rides the firing turret's world position, adding the
+    // parent's per-tick muzzle delta to its own pos (Projectile.update:816-840), so a beam's muzzle end
+    // stays glued to a moving hull.
+    bool moveWithParent = false;
     // [projectile_N] deflectionPower (CustomProjectileTemplate.java:71 into ProjectileTemplate.java:77, whose
     // default is 1.0) is how many times a laser defence beam has to hit this round before it goes down:
     // CustomUnit.java:1401-1404 reads it one way only -- below 0.5 the round is immune outright, otherwise the
@@ -450,6 +523,7 @@ struct UnitAction {
     float parentShield = 0;
     int checkRate = 1;
     bool hidden = false, supported = true, cannotMove = false, highPriority = false;
+    UnloadCond autoCond;   // parsed autoTrigger gate (empty tests = always true)
 };
 
 struct LegTpl {
@@ -714,6 +788,12 @@ struct UnitTemplate {
     // velocity with a 1.41x steering rate and no throttle ramp (:893-918, :3009-3010) -- glide, not
     // strafing. Both default false.
     bool moveIgnoringBody = false, moveSlidingMode = false;
+    // [movement] moveSlidingDir (:2012, getLogicBooleanUnit is really a plain parseInt, default -1).
+    // RWX parses and stores it (CustomUnitConfig.dZ:483) but never reads it back anywhere -- the actual
+    // glide drift comes from moveSlidingMode above and the velocity vector, not this angle. The mod-api
+    // MovementSpec.kt:75 even notes "not found handling logic in RW". Kept as a dead field for parity so
+    // an ini that sets it parses cleanly; the 181/50/etc. values have no runtime effect, exactly as in RWX.
+    int moveSlidingDir = -1;
     // [movement] landOnGround (:1982-1991) takes true / false / onlyIdle, and only an AIR hull reads it:
     // CustomUnit.update:2003-2007 lets one settle down to posZ 2 once it has stood still for more than
     // three ticks off open water, with onlyIdle adding "and no waypoint left" (:2005). That is not just

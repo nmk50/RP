@@ -106,6 +106,25 @@ static const TileSetInfo* findTileset(const std::vector<TileSetInfo>& sets, uint
     return best;
 }
 
+// RWX Tileset.markAllDescriptorsUnused: imageKey = basename of <image source>; stride = tile + spacing.
+static void fillRender(TilesetRender& tr, XMLElement* root, int firstgid) {
+    tr.firstgid = firstgid;
+    if (XMLElement* img = root->FirstChildElement("image")) {
+        const char* src = img->Attribute("source");
+        if (src) {
+            std::string s = src;
+            size_t p = s.find_last_of("/\\");
+            tr.imageKey = (p == std::string::npos) ? s : s.substr(p + 1);
+        }
+    }
+    int tw = 20, th = 20, spacing = 0;
+    root->QueryIntAttribute("tilewidth", &tw);
+    root->QueryIntAttribute("tileheight", &th);
+    root->QueryIntAttribute("spacing", &spacing);
+    tr.tileWidth = tw; tr.tileHeight = th;
+    tr.strideX = tw + spacing; tr.strideY = th + spacing;
+}
+
 static std::vector<uint32_t> decodeData(XMLElement* data, int w, int h) {
     std::vector<uint32_t> out((size_t)w * h, 0);
     if (!data) return out;
@@ -154,11 +173,15 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
 
     std::string base = dirName(path);
     std::vector<TileSetInfo> sets;
+    tilesets.clear();
+    renderLayers.clear();
     for (XMLElement* tsE = map->FirstChildElement("tileset"); tsE; tsE = tsE->NextSiblingElement("tileset")) {
         TileSetInfo ts;
         tsE->QueryIntAttribute("firstgid", &ts.firstgid);
         const char* src = tsE->Attribute("source");
         const char* nm = tsE->Attribute("name");
+        TilesetRender tr;
+        tr.firstgid = ts.firstgid;
         if (src) {
             std::string lp = src;
             // resolve relative to map dir, else to assets/tilesets
@@ -173,30 +196,53 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
                     const char* tn = troot->Attribute("name");
                     ts.name = nm ? nm : (tn ? tn : "unknown");
                     collectTiles(troot, ts);
+                    // Fill the render descriptor from the tsx now, while tdoc is
+                    // still alive; keeping an XMLElement* past this scope dangles.
+                    fillRender(tr, troot, ts.firstgid);
                 }
             } else if (nm) ts.name = nm;
         } else {
             ts.name = nm ? nm : "unknown";
             collectTiles(tsE, ts);
+            fillRender(tr, tsE, ts.firstgid);
         }
         sets.push_back(ts);
+        if (tr.imageKey.empty() && nm) tr.imageKey = nm;
+        tilesets.push_back(tr);
     }
     std::sort(sets.begin(), sets.end(), [](const TileSetInfo& a, const TileSetInfo& b) { return a.firstgid < b.firstgid; });
+    std::sort(tilesets.begin(), tilesets.end(), [](const TilesetRender& a, const TilesetRender& b) { return a.firstgid < b.firstgid; });
 
     auto processLayer = [&](XMLElement* layer) {
         std::string L = ToLower(layer->Attribute("name") ? layer->Attribute("name") : "");
         bool replace = (L == "ground");
+        // `set`/`set-disabled` are editor-only overlays: neither drawn nor allowed
+        // to alter the gameplay terrain classification.
+        bool overlay = (L == "set" || L == "set-disabled");
         XMLElement* data = layer->FirstChildElement("data");
         int lw = w, lh = h;
         layer->QueryIntAttribute("width", &lw); layer->QueryIntAttribute("height", &lh);
         std::vector<uint32_t> gids = decodeData(data, lw, lh);
-        for (int y = 0; y < lh && y < h; ++y) for (int x = 0; x < lw && x < w; ++x) {
+        if (!overlay) for (int y = 0; y < lh && y < h; ++y) for (int x = 0; x < lw && x < w; ++x) {
             uint32_t gid = gids[(size_t)y * lw + x];
             if (gid == 0) continue;
             const TileSetInfo* ts = findTileset(sets, gid);
             if (!ts) continue;
             applyTile(*this, x, y, *ts, gid, replace);
         }
+        // Keep raw ids for terrain rendering (RWX MapLayer.tileIds). Layer dims may differ from the map;
+        // copy into a map-sized buffer so indexing matches tiles.
+        MapRenderLayer rl;
+        rl.name = layer->Attribute("name") ? layer->Attribute("name") : "";
+        rl.ground = (L == "ground");
+        // RWX skips the Units layer (spawns, handled separately) and the `set` /
+        // `set-disabled` overlays (editor-only markers), never drawing them as terrain.
+        rl.skip = (L == "units" || L == "set" || L == "set-disabled");
+        float op = 1.0f; layer->QueryFloatAttribute("opacity", &op); rl.opacity = op;
+        rl.gids.assign((size_t)w * h, 0);
+        for (int y = 0; y < lh && y < h; ++y) for (int x = 0; x < lw && x < w; ++x)
+            rl.gids[(size_t)y * w + x] = gids[(size_t)y * lw + x];
+        renderLayers.push_back(std::move(rl));
     };
 
     for (XMLElement* layer = map->FirstChildElement("layer"); layer; layer = layer->NextSiblingElement("layer"))

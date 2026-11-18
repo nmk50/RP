@@ -39,6 +39,26 @@ static bool overWater(const Game& g, Vec2 p) {
     return g.map.inBounds(x, y) && g.map.at(x, y).water;
 }
 
+// RWX BaseUnit.isOverLiquid -> GameViewUtils.d:265-280: water OR lava tile (the pathfinding fallback
+// collapses to the same water flag on shipped maps).
+static bool overLiquid(const Game& g, Vec2 p) {
+    int x = (int)(p.x / TILE_SIZE), y = (int)(p.y / TILE_SIZE);
+    return g.map.inBounds(x, y) && (g.map.at(x, y).water || g.map.at(x, y).lava);
+}
+
+// Shared predicate-list evaluator for unload / idleSweep / autoTrigger conditions. An unknown atom was
+// dropped at parse time, so it cannot fail here either.
+static bool condTestsOk(const Game& g, const Unit& u, const UnloadCond& c) {
+    if (c.never) return false;
+    for (auto& pr : c.tests) {
+        bool v = pr.first == CondPred::overLiquid ? overLiquid(g, u.pos)
+               : pr.first == CondPred::overWater ? overWater(g, u.pos)
+               : u.driven;
+        if (pr.second ? v : !v) return false;
+    }
+    return true;
+}
+
 // RWX Utility.distanceSq(current, target, maxDelta): ramp a scalar toward a target by at most a step.
 static float moveTowards(float v, float to, float step) {
     float d = to - v;
@@ -87,9 +107,15 @@ static float rotateTurret(TurretState& s, const TurretTpl& tur, float want, floa
 // handed idleSweepSpeed as its tick scale (:4011-4013), so the whole turn dynamics run that fraction as
 // fast. Returns the angle still to cover, like rotateTurret.
 static float idleSweep(TurretState& s, const TurretTpl& tur, const Unit& u, const UnitTemplate& tpl) {
-    float centre = u.facing + tur.idleDir * 0.0174533f;
-    if (u.isRotating && tpl.reverseSpeed > 0.95f) centre += 3.14159265f;
-    if (!tur.shouldResetTurret) centre = s.lastAim;
+    // :4003-4006 centre precedence: a spinning barrel sweeps about its own current angle (targetX),
+    // then a shouldResetTurret:false one about its last aim (targetY), else C(i).
+    float centre;
+    if (tur.idleSpin != 0.0f) centre = s.angle;
+    else if (!tur.shouldResetTurret) centre = s.lastAim;
+    else {
+        centre = u.facing + tur.idleDir * 0.0174533f;
+        if (u.isRotating && tpl.reverseSpeed > 0.95f) centre += 3.14159265f;
+    }
     s.sweepTimer += 1.0f;
     float residual = 0.0f;
     if (s.sweepOffset > 0.0f) {
@@ -144,6 +170,54 @@ static Vec2 tileSpawnPos(const UnitTemplate* tpl, int tx, int ty) {
     return { (tx + 0.5f) * TILE_SIZE, (ty + 0.5f) * TILE_SIZE };
 }
 
+// RWX CustomUnit.a(TurretConfig,...):1277-1285 -- the limitingAngle firing cone. The reference direction is
+// the attached parent's aim (movementLevels[linkedTurretIndex].targetX, which RP stores as TurretState.angle)
+// or the hull facing when unattached, plus idleDir; the target's bearing from the hull centre must lie within
+// limitingAngle degrees of it. -1 (the default) disables the test entirely.
+static bool limitingAngleOk(const Unit& u, int i, const Unit& t) {
+    const TurretTpl& tur = u.tpl->turrets[i];
+    if (tur.limitingAngle < 0) return true;
+    float ref = (tur.attached >= 0 ? u.tur[tur.attached].angle : u.facing) + tur.idleDir * 0.0174533f;
+    float bearing = std::atan2(t.pos.y - u.pos.y, t.pos.x - u.pos.x);
+    return std::fabs(angleDiff(ref, bearing)) * 57.29578f <= tur.limitingAngle;
+}
+
+// UnitPrice.b(unit):285-305 -- canPay. Only a positive requirement gates; flags use the masks built at parse
+// time (hasFlag needs every bit set, hasMissingFlag needs none of them). ammo lives in u.resources["ammo"].
+static bool canPayResourceCost(const Game& g, const Unit& u, const ResourceCost& rc) {
+    if (rc.credits > 0) { const Team* tm = nullptr; for (auto& t : g.teams) if (t.id == u.team) { tm = &t; break; } if (!tm || tm->credits < rc.credits) return false; }
+    if (rc.energy > 0 && u.energy < rc.energy) return false;
+    if (rc.hp > 0 && u.hp < rc.hp) return false;
+    if (rc.shield > 0 && u.shield < rc.shield) return false;
+    if (rc.ammo > 0) { auto it = u.resources.find("ammo"); if (it == u.resources.end() || it->second < rc.ammo) return false; }
+    if (rc.hasFlag && (u.flags & rc.hasFlag) != rc.hasFlag) return false;
+    if (rc.hasMissingFlag && (u.flags & rc.hasMissingFlag) != 0) return false;
+    for (auto& kv : rc.custom) {
+        if (kv.second <= 0) continue;
+        auto it = u.resources.find(kv.first);
+        if (it == u.resources.end() || it->second < kv.second) return false;
+    }
+    return true;
+}
+
+// UnitPrice.a(unit):378-389 then d():315-334 -- pay unconditionally (no precheck) and clamp the pools.
+static void payResourceCost(Game& g, Unit& u, const ResourceCost& rc) {
+    if (rc.credits != 0) g.reward(u.team, -rc.credits);
+    u.energy -= rc.energy;
+    u.hp -= rc.hp;
+    u.shield -= rc.shield;
+    if (rc.ammo != 0) u.resources["ammo"] -= rc.ammo;
+    if (rc.unsetFlag) u.flags &= ~rc.unsetFlag;
+    if (rc.setFlag) u.flags |= rc.setFlag;
+    for (auto& kv : rc.custom) u.resources[kv.first] -= kv.second;
+    if (u.energy < 0) u.energy = 0;
+    if (u.shield < 0) u.shield = 0;
+    if (u.shield > u.shieldMax) u.shield = u.shieldMax;
+    if (u.hp > u.maxHp) u.hp = u.maxHp;
+    auto ammo = u.resources.find("ammo");
+    if (ammo != u.resources.end() && ammo->second < 0) ammo->second = 0;
+}
+
 static bool turretSees(const Game& g, const Unit& u, int i, const Unit& t) {
     if (!t.tpl || t.dead || t.riding() || !t.operational() || !g.isEnemy(u.team, t.team)) return false;
     const TurretTpl& tur = u.tpl->turrets[i];
@@ -159,6 +233,7 @@ static bool turretSees(const Game& g, const Unit& u, int i, const Unit& t) {
     if (d > engagementRangeOf(u, t)) return false;
     if (tur.range > 0 && d > tur.range) return false;
     if (tur.minRange > 0 && d < tur.minRange) return false;
+    if (!limitingAngleOk(u, i, t)) return false;
     return true;
 }
 
@@ -321,6 +396,7 @@ static bool passableAt(Game& g, Vec2 p, MoveType mt) {
     switch (mt) {
         case MoveType::AIR: case MoveType::HOVER: return g.map.inBounds(x, y);
         case MoveType::WATER: return g.map.walkableWater(x, y);
+        case MoveType::OVER_CLIFF_WATER: return g.map.walkableAmphibious(x, y);
         default: return g.map.walkableLand(x, y);
     }
 }
@@ -685,28 +761,16 @@ void Game::releaseCargo(Unit& t, bool kill) {
 }
 
 // CustomUnit.update:1966 -- transportUnitsCanUnloadUnits.read(this), the logic boolean that gates the
-// countdown. isOverLiquid is RP's overWater() and isMoving is `driven`, the order-driven flag the movement
-// pass raises (OrderableUnit.java:2841-2850).
+// countdown. isOverLiquid / overWater are the tile predicates and isMoving is `driven`, the order-driven
+// flag the movement pass raises (OrderableUnit.java:2841-2850).
 bool Game::unloadCondOk(const Unit& t) const {
-    const UnloadCond& c = t.tpl->transportCanUnload;
-    if (c.never) return false;
-    for (auto& pr : c.tests) {
-        bool v = (pr.first == CondPred::overLiquid) ? overWater(*this, t.pos) : t.driven;
-        if (pr.second ? v : !v) return false;
-    }
-    return true;
+    return condTestsOk(*this, t, t.tpl->transportCanUnload);
 }
 
 // CustomUnit.b(i,f):3998 -- the same predicate list, but an absent idleSweepCondition is null (always
 // true) rather than the unload default, so an empty test list passes outright.
 bool Game::sweepCondOk(const Unit& u, const TurretTpl& tur) const {
-    const UnloadCond& c = tur.idleSweepCond;
-    if (c.never) return false;
-    for (auto& pr : c.tests) {
-        bool v = (pr.first == CondPred::overLiquid) ? overWater(*this, u.pos) : u.driven;
-        if (pr.second ? v : !v) return false;
-    }
-    return true;
+    return condTestsOk(*this, u, tur.idleSweepCond);
 }
 
 // GameUI.canSelectedUnitsLoadInto:3856-3869 + issueLoadIntoCommand:3588-3592, arriving at
@@ -2020,6 +2084,11 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
                 residual = 0.0f;
             } else if (tur.idleSweepAngle != 0.0f && sweepCondOk(u, tur)) {
                 residual = idleSweep(s, tur, u, tpl);          // CustomUnit.b(i,f):3996-4029
+            } else if (tur.idleSpin != 0.0f) {
+                // :4030-4041 -- targetX is the drawn barrel angle itself, so the spin adds straight to
+                // it at idleSpin deg/tick, no turnSpeed chase, and returns false to skip the rest reset.
+                s.angle = wrapAngle(s.angle + tur.idleSpin * 0.0174533f);
+                residual = 0.0f;
             } else if (tur.shouldResetTurret) {
                 // no target at all: walk back to C(i) = hull angle + idleDir (:846-857)
                 float rest = u.facing + tur.idleDir * 0.0174533f;
@@ -2046,18 +2115,37 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
         int pvt = tur.attached;
         if (pvt >= 0 && pvt < n) {
             // RWX CustomUnit.a(i, f):1341-1350 - the parent's turn this tick is added to the child,
-            // so a barrel bolted to another aims and recoils with it instead of lagging behind.
-            s.angle = wrapAngle(s.angle + turn[pvt]);
+            // so a barrel bolted to another aims and recoils with it instead of lagging behind. A slave
+            // (x != -1) instead HARD-copies the master's aim at advanceMovementLevelTowardTarget:3242-3243
+            // (targetX = movementLevels[master].targetX), pointing exactly where the master points.
+            if (tur.slaveMaster >= 0) s.angle = u.tur[pvt].angle;
+            else s.angle = wrapAngle(s.angle + turn[pvt]);
             s.angVel = u.tur[pvt].angVel;
             s.active = u.tur[pvt].active;
             t = target[pvt];
             s.targetId = t ? t->id : -1;
         }
-        if (!s.active || !t || s.cooldown != 0.0f || !tur.canShoot) continue;
-        anyReady = true;
+        // u(i) = isActive && a(TurretConfig) (CustomUnit:2748 -> :1340-1348, OrderableUnit:4597).
+        // The energy gate sits here, before any charging: a barrel the pool cannot cover never has
+        // advance called for it (OrderableUnit:3210), so it neither charges nor holds off the leak.
+        if (!s.active || !t) continue;
+        if (tur.energyUsage > 0.0f && (tur.energyUsage > u.energy || u.energyRecharging)) continue;
+        // a(TurretConfig):1344 -- resourceUsage is a second affordability gate beside energy.
+        if (tur.resourceUsage.any() && !canPayResourceCost(*this, u, tur.resourceUsage)) continue;
+        // :3259 re-runs canAttack at the fire moment, which is the only limitingAngle test an attached
+        // slave ever gets (it never acquires a target on its own in pass 1).
+        if (!limitingAngleOk(u, i, *t)) continue;
+        // z: any barrel aimed and off cooldown suppresses the charge leak (OrderableUnit:3207).
+        // r(i)/canShoot is not part of this test -- only the fire branch below checks it (:3258).
+        if (s.cooldown == 0.0f) anyReady = true;
+        // warmupNoReset charges on every aimed tick, cooldown or not; only the fire itself waits for
+        // rotation == 0 (OrderableUnit:3247-3257). This is what holds a flame turret's glow full
+        // between shots instead of bleeding it down to the fire tick alone.
+        if (tur.warmNoReset)
+            s.warm = std::min(s.warm + 1.0f, tur.warmup);
+        if (s.cooldown != 0.0f || !tur.canShoot) continue;
         bool ready;
         if (tur.warmNoReset) {
-            s.warm = std::min(s.warm + 1.0f, tur.warmup);
             ready = true;
         } else if (s.warm < tur.warmup) {
             s.warm += 1.0f;
@@ -2066,10 +2154,6 @@ void Game::updateTurrets(Unit& u, Unit* unitTarget) {
             ready = true;
         }
         if (!ready) continue;
-        // CustomUnit.a(TurretConfig):1340-1347 is the barrel's "may I shoot" test: a cost the pool
-        // cannot cover, or the recharge-to-full latch, keeps it silent -- the warm-up is left charged
-        // so it fires the tick the energy arrives.
-        if (tur.energyUsage > 0.0f && (tur.energyUsage > u.energy || u.energyRecharging)) continue;
         s.cooldown = tur.shootDelay;
         if (!tur.warmNoReset) s.warm = 0;
         fire(u, t, i);
@@ -2139,6 +2223,26 @@ Vec2 turretPivot(const Unit& u, int i) {
     return base + Vec2{ cs * tur.y - sn * tur.x, sn * tur.y + cs * tur.x };
 }
 
+// RWX CustomUnit.D(i):4465-4480 -- the muzzle point: pivot F(i) plus barrelY along the muzzle direction
+// and barrelX across it. The direction is `E() ? rotationSpeed : targetX` (:4474): with [attack]
+// isFixedFiring the mouth swings with the HULL while the turret sprite and the flame's own angle still
+// ride movementLevels[i].targetX (GameViewUtils:191 and CustomUnit:1594). barrelY defaults to [attack]
+// turretSize, barrelOffsetX_onOddShots jumps sideways on every other shot, and no offset in the chain
+// is multiplied by imageScale. The chargeEffectImage is drawn centred on this same point.
+Vec2 muzzlePoint(const Unit& u, int i) {
+    const UnitTemplate& tpl = *u.tpl;
+    if (i < 0 || i >= (int)tpl.turrets.size() || i >= (int)u.tur.size()) return u.pos;
+    const TurretTpl& tur = tpl.turrets[i];
+    const TurretState& s = u.tur[i];
+    float muzzleAng = tpl.isFixedFiring ? u.facing : s.angle;
+    Vec2 aim{ std::cos(muzzleAng), std::sin(muzzleAng) };
+    Vec2 right{ -aim.y, aim.x };
+    float barrelY = tur.barrelY >= 0 ? tur.barrelY : tpl.turretSize;
+    float bx = tur.barrelX;
+    if (tur.barrelXOdd != 0.0f && s.flip) bx += tur.barrelXOdd;
+    return turretPivot(u, i) + (aim * barrelY + right * bx);
+}
+
 // RWX CustomUnit.a(i, false):2891-2902 - the barrel slides along its own aim by recoilOffset over
 // recoilOutTime ticks and back over recoilReturnTime, timed from the shot that started it.
 float turretRecoil(const Unit& u, int i) {
@@ -2206,6 +2310,19 @@ static void applyTemplate(Projectile& p, const ProjectileTpl& pt) {
     p.instant = pt.instant;
     p.beamImmune = pt.deflectionPower < 0.5f;
     p.deflectHp = pt.deflectionPower;
+    // CustomUnit.a:1398,1462-1464 -- the beam/nuke/teleport flags travel onto the shot.
+    p.nuke = pt.nukeWeapon;
+    p.teleportSource = pt.teleportSource;
+    p.laserEffect = pt.laserEffect;
+    p.lightingEffect = pt.lightingEffect;
+    p.beamImage = pt.beamImage; p.beamImageStart = pt.beamImageStart; p.beamImageEnd = pt.beamImageEnd;
+    p.beamStartRotated = pt.beamImageStartRotated; p.beamEndRotated = pt.beamImageEndRotated;
+    p.beamImageOffsetRate = pt.beamImageOffsetRate;
+    p.lightCastOnGround = pt.lightCastOnGround;
+    p.isBeam = !pt.beamImage.empty() || pt.laserEffect || pt.lightingEffect;
+    p.reuseLast = pt.instantReuseLast;
+    p.reuseKeepAreaList = pt.instantReuseLastKeepAreaDamageList;
+    p.moveWithParent = pt.moveWithParent;
     p.interceptLifeOnly = pt.interceptRemoveTargetLifeOnly;
     p.damage = pt.directDamage; p.areaDamage = pt.areaDamage; p.areaRadius = pt.areaRadius;
     p.speed = pt.speed; p.life = pt.life;
@@ -2268,23 +2385,14 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
         u.energy -= tur.energyUsage;
         if (u.energy < tur.energyUsage && tpl.energyNeedsToRechargeToFull) u.energyRecharging = true;
     }
+    // b(TurretConfig):1357-1359 -- the per-shot resourceUsage is paid right after the energy, unconditionally
+    // (the affordability gate already ran in updateTurrets), then the pools are clamped.
+    if (tur.resourceUsage.any()) payResourceCost(*this, u, tur.resourceUsage);
     int pi = (tur.projectile >= 0 && tur.projectile < (int)tpl.projectiles.size()) ? tur.projectile : -1;
     ProjectileTpl pt = pi >= 0 ? tpl.projectiles[pi] : ProjectileTpl{};
     if (pi < 0) pt.directDamage = 10;   // RWX's stand-in [projectile_1] for a unit with none at all
     Projectile p;
-    // RWX CustomUnit.D(i):4474 takes the muzzle *direction* from `E() ? rotationSpeed : targetX` -- with
-    // [attack] isFixedFiring the barrel mouth swings with the HULL, while the turret sprite and the flame's
-    // own angle still ride movementLevels[i].targetX (GameViewUtils:191 and CustomUnit:1594). Those two
-    // only come apart when [attack] turretRotateWithBody is off, which is exactly combat_engineer.
-    float muzzleAng = tpl.isFixedFiring ? u.facing : s.angle;
-    Vec2 aim{ std::cos(muzzleAng), std::sin(muzzleAng) };
-    Vec2 right{ -aim.y, aim.x };
-    // muzzle = pivot + aim*barrelY + right*barrelX, all in world px; barrelY defaults to
-    // [attack] turretSize and neither offset is multiplied by imageScale.
-    float barrelY = tur.barrelY >= 0 ? tur.barrelY : tpl.turretSize;
-    float bx = tur.barrelX;
-    if (tur.barrelXOdd != 0.0f && s.flip) bx += tur.barrelXOdd;    // barrelOffsetX_onOddShots
-    p.pos = turretPivot(u, ti) + (aim * barrelY + right * bx);
+    p.pos = muzzlePoint(u, ti);
     // RWX Projectile.posZ (:889-900 chases the aim height from the muzzle) starts at the shooter's own
     // height, and aimZ is the chased unit's live posZ (:754-761). No shipped turret sets [turret]
     // height, so the muzzle adds nothing on top of that.
@@ -2312,6 +2420,12 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
     // built with turret index -1 and take RWX's constructor defaults instead.
     p.atkFly = tur.canAttackFlying; p.atkLand = tur.canAttackLand; p.atkSea = tur.canAttackUnderwater;
     applyTemplate(p, pt);
+    // CustomUnit.java:1412-1425 -- moveWithParent caches the firing turret's muzzle world position so the
+    // round can add the parent's per-tick muzzle delta to its own pos (Projectile.update:816-840).
+    if (pt.moveWithParent) {
+        p.parentUnitId = u.id; p.parentTurret = ti;
+        p.lastMuzzle = p.pos; p.lastMuzzleZ = p.posZ;
+    }
     if (pt.targetGround && target)
         aimAtGroundPoint(p, &u, *target, pt, pt.targetSpeed != -1.0f ? pt.targetSpeed : p.speed);
     if (tur.shootFlame) {
@@ -2333,7 +2447,9 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
         // the height gate, and its burst height aX becomes the target's own posZ (:1026-1036).
         p.impactZ = target->posZ;
         impact(p, target, { target->pos.x + p.aimOff.x, target->pos.y + p.aimOff.y });
-        if (p.expandTotal <= 0) {
+        // RWX Projectile.java:1038-1040 -- a beam (beamImage/laserEffect/lightingEffect) keeps shouldDraw
+        // after landing and is only removed once its life runs out (:1411), so it is not dropped here.
+        if (p.expandTotal <= 0 && !p.isBeam) {
             // Nothing is left to animate, so no caller gets a handle -- but the round still existed this
             // tick, and an attached effectOnCreate entry has to find it before the compaction drops it.
             p.dead = true;
@@ -2341,7 +2457,24 @@ Projectile* Game::fire(Unit& u, Unit* target, int ti, Vec2 groundAt) {
             return nullptr;
         }
     }
+    // CustomUnit.G[i] / instantReuseLast (CustomUnit.java:1556-1582): a turret keeps one cached round and
+    // resets it on each shot instead of spawning a new one. RP copies the freshly-built state into the
+    // cached instance, keeping its stable id (and, optionally, its area-hit list) so attached effects and
+    // interceptors that hold the handle keep seeing the same beam.
+    if (pt.instantReuseLast && ti >= 0) {
+        Projectile* c = s.beamProjId >= 0 ? findProjectile(s.beamProjId) : nullptr;
+        if (c && !c->dead && c->from == &tpl && c->fromProj == pi) {
+            int keepId = c->id;
+            std::vector<int> keepHits;
+            if (pt.instantReuseLastKeepAreaDamageList) keepHits = c->splashHits;
+            *c = p;
+            c->id = keepId;
+            if (pt.instantReuseLastKeepAreaDamageList) c->splashHits = std::move(keepHits);
+            return c;
+        }
+    }
     projectiles.push_back(p);
+    if (pt.instantReuseLast && ti >= 0) s.beamProjId = projectiles.back().id;
     return &projectiles.back();
 }
 
@@ -2509,11 +2642,14 @@ static Projectile* pickQuarry(Game& g, const Unit& u, const TurretTpl& tur) {
     auto distSq = [](Vec2 a, Vec2 b) { float dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; };
     for (auto& p : g.projectiles) {
         if (p.dead) continue;
-        if (p.tags.empty()) continue;                       // aE == null is never chased
+        if (p.tags.empty() && !p.nuke) continue;             // aE == null is never chased (unless a nuke)
         if (p.posZ <= tur.interceptOverHeight) continue;    // ..._andOverHeight
         bool tagged = false;
         for (auto& want : tur.interceptTags)
             for (auto& have : p.tags) if (want == have) tagged = true;
+        // AntiNukeLauncher:271 locks onto Projectile.D (nukeWeapon) directly, so a nuke-flagged round is a
+        // quarry for a barrel hunting `nuke` even when it carries no explicit tag of its own.
+        if (p.nuke) for (auto& want : tur.interceptTags) if (want == "nuke") tagged = true;
         if (!tagged) continue;                              // AnimationTag.a():105-118, any name in common
         if (distSq(u.pos, p.pos) >= tur.interceptUnder * tur.interceptUnder) continue;
         // ..._andTargetingGroundUnderDistance measures the shot's own ground aim point, RWX's n/o, so an
@@ -2600,9 +2736,10 @@ void Game::updateInterceptors(Unit& u) {
         // hull with a beam and a hunt on two barrels pays for the beam first.
         if (tur.laserDefence) updateLaserDefence(u, tur, i);
         if (tur.interceptTags.empty()) continue;
-        // RP has no [turret] resourceUsage, and RWX's ammo pool is the other half of this test: an
-        // anti-nuke with no nuke stock left would sit out the next attack in the real game.
+        // ProjectileInterceptorHook.b():22 gates on a(TurretConfig):1340-1347 -- energy AND resourceUsage.
+        // An anti-nuke whose ammo pool is empty (antiNukeLauncherC resourceUsage ammo=1) sits out the attack.
         if (tur.energyUsage > 0.0f && (tur.energyUsage > u.energy || u.energyRecharging)) continue;
+        if (tur.resourceUsage.any() && !canPayResourceCost(*this, u, tur.resourceUsage)) continue;
         Projectile* q = pickQuarry(*this, u, tur);
         if (!q) continue;
         // :57-64 -- b(TurretConfig):1350-1359 pays for the round (fire() takes the energy half of that),
@@ -2649,7 +2786,32 @@ void Game::updateProjectile(Projectile& p) {
     // dropped here instead of taking the one last step RWX would still let it finish -- a step that almost
     // never lands, since being inside the bubble is not the same as being at the target.
     if (p.deflected) { p.dead = true; return; }
+    // Projectile.update:816-840 -- moveWithParent runs every tick, hit or not: the round adds the firing
+    // turret's muzzle delta since last tick to its own position so a beam's muzzle end rides a moving hull.
+    if (p.moveWithParent && p.parentUnitId >= 0) {
+        Unit* par = get(p.parentUnitId);
+        if (par && !par->dead && par->tpl) {
+            int ti = p.parentTurret;
+            if (ti < 0 || ti >= (int)par->tpl->turrets.size()) ti = 0;
+            Vec2 m = muzzlePoint(*par, ti);
+            float mz = par->posZ;
+            p.pos = p.pos + (m - p.lastMuzzle);
+            p.posZ += mz - p.lastMuzzleZ;
+            p.lastMuzzle = m; p.lastMuzzleZ = mz;
+        }
+    }
     if (p.hit) {
+        if (p.isBeam) {
+            // RWX :1397-1416 -- the blast ring still grows, but a beam is not removed when the ring finishes
+            // (:1405 guards remove on !B && !M && !X); it stays drawn until life runs out, which :696 spends
+            // every tick and :1411 answers with remove(). The directDamage already landed once at impact.
+            if (p.expandTotal > 0 && p.expandT > 0) {
+                p.expandT -= 1.0f;
+                splash(p, 1.0f - p.expandT / p.expandTotal);
+            }
+            if (--p.life <= 0) p.dead = true;
+            return;
+        }
         // The shot has landed: only the blast ring keeps growing, and it is no longer drawn.
         p.expandT -= 1.0f;
         splash(p, 1.0f - p.expandT / p.expandTotal);
@@ -2784,7 +2946,7 @@ void Game::updateProjectile(Projectile& p) {
             p.dead = true;
             return;
         }
-        if (p.expandTotal <= 0) p.dead = true;
+        if (p.expandTotal <= 0 && !p.isBeam) p.dead = true;
         return;
     }
     // RWX update:1411-1415: a shot that runs out of life just vanishes; only explodeOnEndOfLife makes it
@@ -2831,6 +2993,13 @@ static EffectTpl hitFlash(bool large) {
 void Game::impact(Projectile& p, Unit* direct, Vec2 at) {
     p.hit = true;
     p.impactPos = at;
+    // Projectile.update:1102-1103 -> BaseUnit.f:2512 -- teleportSource moves the SHOOTER to the impact point
+    // (the blink weapons), not the target. RWX only refreshes fog and fires a teleported event; it does not
+    // clear velocity or path, so RP just relocates the hull.
+    if (p.teleportSource && p.sourceId >= 0) {
+        Unit* src = get(p.sourceId);
+        if (src && !src->dead) src->pos = at;
+    }
     // :1068 runs the shot's own list ahead of the damage at :1105, which is what lets :1043 read the bubble
     // the hull still has rather than the one this hit is about to drain.
     bool ownBlast = spawnHitFx(p, direct, at);
@@ -2844,7 +3013,25 @@ void Game::impact(Projectile& p, Unit* direct, Vec2 at) {
     // 10px. A shot that brought an explodeEffect list -- or hit a bubble -- replaces all of it (:1170,
     // :1173), which is what ownBlast reports.
     if (!ownBlast && !p.flameWeapon) {
-        if (p.largeHit) {
+        if (p.nuke) {
+            // Projectile.update:1186-1366 -- a nuke with no custom explodeEffect swaps the generic flash for
+            // a mushroom-cloud chain: a bright white light, a full-size fireball and a ground shockwave grown
+            // to the blast radius. RP renders the light/fireball/shockwave layers; the scorch mark and sound
+            // are out of scope. The damage itself is unchanged (areaDamage/areaRadius still drive it).
+            EffectTpl fire = hitFlash(false);
+            fire.scaleFrom = fire.scaleTo = std::max(1.5f, p.areaRadius / 40.0f);
+            fire.alpha = 0.9f;
+            spawnFx(fire, p.from, at, p.impactZ, 0.0f, nullptr);
+            EffectTpl sw = muzzleEffect(5);
+            sw.scaleTo = std::max(2.0f, p.areaRadius / 20.0f);
+            sw.alpha = 0.8f;
+            sw.layer = p.impactZ > 5.0f ? 2 : 1;
+            sw.attached = false;
+            spawnFx(sw, p.from, at, p.impactZ, 0.0f, nullptr);
+            EffectTpl glow = muzzleEffect(6);
+            glow.scaleTo = std::max(2.0f, p.areaRadius / 30.0f);
+            spawnFx(glow, p.from, at, p.impactZ, 0.0f, nullptr);
+        } else if (p.largeHit) {
             if (p.areaRadius > 10) {
                 // createSmallExplosionInternal(...,0): the uncoloured shockwave, grown to areaRadius/25
                 // and dimmed to 0.7, under the units unless the burst hung more than 5px up (:1174-1180).
@@ -3410,4 +3597,380 @@ void Game::checkWinLoss() {
     bool anyEnemy = false; for (auto& t : teams) if (!t.isPlayer && teamHasUnits(*this, t.id)) anyEnemy = true;
     if (!playerAlive) { gameOver = true; gameOverText = "DEFEAT"; }
     else if (!anyEnemy) { gameOver = true; gameOverText = "VICTORY"; }
+}
+
+// ---------------------------------------------------------------------------
+// Attachments, actions and message flushing.
+//
+// These were declared in Game.h but never defined, which the linker reports as
+// eleven LNK2019 symbols. The behaviour below follows RWX's original logic:
+// the attachment half maps almost one-to-one onto AttachmentManagerHook, while
+// the action half is the legacy string-keyed [action_N] system RP parses in
+// Templates.cpp (RWX has since moved to CustomAction/LogicBoolean objects).
+// No call here may reach another declared-but-undefined helper (logicCondition
+// et al.), or it would simply move the link error one step down the chain.
+// ---------------------------------------------------------------------------
+
+// AttachmentManagerHook.a(CustomUnit,short):364-370 -- the slot definition is
+// indexed by the child's attachmentSlot into the *parent's* config.
+const AttachmentTpl* Game::attachmentConfig(const Unit& u) const {
+    if (u.parentId < 0 || u.attachmentSlot < 0) return nullptr;
+    const Unit* parent = get(u.parentId);
+    if (!parent || !parent->tpl) return nullptr;
+    const std::vector<AttachmentTpl>& slots = parent->tpl->attachments;
+    if (u.attachmentSlot >= (int)slots.size()) return nullptr;
+    return &slots[u.attachmentSlot];
+}
+
+// BaseUnit:1411-1418 and AttachmentSlotDefinition.m -- a hull is draggable unless
+// its own config says unselectable, or an attachment slot hides it. RP's parser
+// already resolves the attachment's isUnselectable fallback, so the stored flag
+// is the effective one.
+bool Game::selectable(const Unit& u) const {
+    if (!u.tpl || u.dead || u.riding()) return false;
+    if (u.tpl->unselectable) return false;
+    if (u.parentId >= 0) {
+        const AttachmentTpl* att = attachmentConfig(u);
+        if (att && (att->unselectable || att->hidden)) return false;
+    }
+    return true;
+}
+
+// BaseUnit.isUnselectableAsTarget:2274-2276 -- same as selectable but keyed on
+// untargetable / cannotBeAttacked; an attachment must also be damageable to be a
+// hull a barrel will list as a target.
+bool Game::targetable(const Unit& u) const {
+    if (!u.tpl || u.dead || u.riding()) return false;
+    if (u.tpl->untargetable || u.tpl->cannotBeAttacked) return false;
+    if (u.parentId >= 0) {
+        const AttachmentTpl* att = attachmentConfig(u);
+        if (att) {
+            if (att->untargetable || att->hidden || !att->damageable) return false;
+        }
+    }
+    return true;
+}
+
+// CustomUnit.createAttachments (AttachmentManagerHook.a(CustomUnit):283-336):
+// for every slot with an onCreateSpawnUnitOf list, spawn its first hull, size the
+// parent's attachment list up to the slot, park the hull there and hand it the
+// slot/team/build state. attachmentSpawnDepth (RWX's recursion guard) stops a
+// chain of attachment configs that spawn each other.
+void Game::createAttachments(Unit& u, int depth) {
+    if (!u.tpl || depth > 4 || u.tpl->attachments.empty()) return;
+    const std::vector<AttachmentTpl>& slots = u.tpl->attachments;
+    for (int slot = 0; slot < (int)slots.size(); ++slot) {
+        const AttachmentTpl& att = slots[slot];
+        if (att.spawn.empty()) continue;
+        // Grow the slot vector so `attachments[slot]` is always valid; empty slots
+        // stay -1 (RWX's FastArrayList null entries).
+        if ((int)u.attachments.size() <= slot) u.attachments.resize(slot + 1, -1);
+        const ProjectileTpl::SpawnUnit& e = att.spawn[0];
+        const UnitTemplate* bt = g_templates.find(ToLower(e.name));
+        if (!bt) continue;
+        if (e.chance < 1.0f && g_rng.uniform() > e.chance) continue;
+        // Attachment offsets are in the parent's local frame (x across, y along
+        // the body) and rotate with it -- the same (cos*x - sin*y, sin*x + cos*y)
+        // that updateAttachments uses, applied once at spawn so a hull starts on
+        // its slot instead of at the parent's centre.
+        float c = std::cos(u.facing), s = std::sin(u.facing);
+        Vec2 at{ u.pos.x + c * att.x - s * att.y, u.pos.y + s * att.x + c * att.y };
+        at.x += e.offsetX; at.y += e.offsetY;
+        ++attachmentSpawnDepth;
+        int id = spawnUnit(e.name, u.team, at, u.underConstruction && att.incompleteWithParent);
+        --attachmentSpawnDepth;
+        if (id < 0) continue;
+        Unit* child = get(id);
+        if (!child) continue;
+        child->parentId = u.id;
+        child->attachmentSlot = slot;
+        child->posZ = u.posZ + att.height + e.offsetZ;
+        // idleDir is the body angle relative to the parent, in degrees.
+        child->facing = wrapAngle(u.facing + att.idleDir * 0.0174533f);
+        child->targetFacing = child->facing;
+        if (u.underConstruction && att.incompleteWithParent) child->buildProgress = u.buildProgress;
+        u.attachments[slot] = id;
+    }
+}
+
+// AttachmentManagerHook.b(CustomUnit,float):124-249 -- every tick the child is
+// placed at the parent's position plus the slot offset rotated by the parent's
+// facing, at parent height + slot height. A rotating parent adds its per-frame
+// angle delta to a non-locked child (addRotation), while a locked one is snapped
+// to facing + idleDir / reverseDir. Dead children are unlinked.
+void Game::updateAttachments(Unit& u) {
+    if (u.attachments.empty() || u.dead || !u.tpl) return;
+    float c = std::cos(u.facing), s = std::sin(u.facing);
+    // RWX caches the previous rotation in customUnit.D to form the delta; RP
+    // keeps it in attachmentFacing.
+    float delta = angleDiff(u.attachmentFacing, u.facing);
+    for (int slot = 0; slot < (int)u.attachments.size(); ++slot) {
+        int id = u.attachments[slot];
+        if (id < 0) continue;
+        Unit* ch = get(id);
+        if (!ch) { u.attachments[slot] = -1; continue; }
+        if (ch->dead) { ch->parentId = -1; u.attachments[slot] = -1; continue; }
+        if (slot >= (int)u.tpl->attachments.size()) continue;
+        const AttachmentTpl& att = u.tpl->attachments[slot];
+        float rx = c * att.x - s * att.y;
+        float ry = s * att.x + c * att.y;
+        ch->pos.x = u.pos.x + rx;
+        ch->pos.y = u.pos.y + ry;
+        ch->posZ  = u.posZ + att.height;
+        if (ch->underConstruction && att.incompleteWithParent) ch->buildProgress = u.buildProgress;
+        // lockRotation snaps to facing + the (possibly reversed) idle direction;
+        // otherwise rotateWithParent passes the parent's turn through.
+        if (att.lockRotation) {
+            float want = u.facing + (u.isRotating ? att.reverseDir : att.idleDir) * 0.0174533f;
+            ch->facing = wrapAngle(want);
+            ch->targetFacing = ch->facing;
+        } else if (att.rotateWithParent) {
+            ch->facing = wrapAngle(ch->facing + delta);
+            ch->targetFacing = ch->facing;
+        }
+        // Children inherit the parent's target under prioritizeTarget /
+        // onlyParentTarget; RP only needs the resolved target id here.
+        if ((att.prioritizeTarget || att.onlyParentTarget || att.alwaysParentTarget) && u.targetId >= 0)
+            ch->targetId = u.targetId;
+    }
+    u.attachmentFacing = u.facing;
+}
+
+// AttachmentManagerHook.a(CustomUnit,boolean):251-269 -- on parent removal every
+// slot is unlinked; the hull is only removed from the world when the slot does
+// not ask to keepAliveWhenParentDies.
+void Game::releaseAttachments(Unit& u) {
+    for (int& id : u.attachments) {
+        if (id < 0) continue;
+        Unit* ch = get(id);
+        const AttachmentTpl* att = nullptr;
+        if (ch && ch->attachmentSlot >= 0) {
+            const Unit* parent = ch->parentId >= 0 ? get(ch->parentId) : nullptr;
+            if (parent && parent->tpl && ch->attachmentSlot < (int)parent->tpl->attachments.size())
+                att = &parent->tpl->attachments[ch->attachmentSlot];
+        }
+        if (ch) {
+            ch->parentId = -1;
+            ch->attachmentSlot = -1;
+            if (!att || !att->keepAlive) removeUnit(*ch);
+        }
+        id = -1;
+    }
+    u.attachments.clear();
+}
+
+// Local comma-list splitter -- the identical helper in Templates.cpp is file-static.
+static std::vector<std::string> splitCommaNames(const std::string& s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t end = s.find(',', start);
+        std::string tok = Trim(s.substr(start, end == std::string::npos ? std::string::npos : end - start));
+        if (!tok.empty()) out.push_back(tok);
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return out;
+}
+
+// Apply an `addResources` payload such as "credits=250", "hp:-1000",
+// "setFlag=1", "unsetFlag=1-10" or a bare number (credits). RP only models
+// credits, health, energy and a flat flag/resource store, so unsupported keys
+// are ignored rather than acted on. Kept local because nothing else parses it.
+static void applyAddResources(Game& g, Unit& u, const std::string& raw) {
+    std::string s = Trim(ToLower(raw));
+    if (s.empty()) return;
+    auto number = [](const std::string& v) { return (float)atof(v.c_str()); };
+    // A bare, plain number is the credits shorthand ("addResources : 2000").
+    if (s.find_first_not_of("0123456789.-+eE") == std::string::npos && !s.empty()) {
+        g.reward(u.team, number(s));
+        return;
+    }
+    for (auto& part : splitCommaNames(s)) {
+        size_t eq = part.find_first_of("=:");
+        if (eq == std::string::npos) continue;
+        std::string key = Trim(part.substr(0, eq));
+        std::string val = Trim(part.substr(eq + 1));
+        if (key == "credits") {
+            g.reward(u.team, number(val));
+        } else if (key == "hp" || key == "health") {
+            u.hp += number(val);
+        } else if (key == "energy") {
+            u.energy += number(val);
+        } else if (key == "shield") {
+            u.shield += number(val);
+        } else if (key == "setflag" || key == "unsetflag") {
+            bool set = key == "setflag";
+            size_t dash = val.find('-');
+            int lo = (int)number(val);
+            int hi = dash == std::string::npos ? lo : (int)number(val.substr(dash + 1));
+            for (int f = lo; f <= hi && f >= 0 && f < 64; ++f) {
+                if (set) u.flags |= (1ULL << f);
+                else u.flags &= ~(1ULL << f);
+            }
+        } else {
+            // Named resources (e.g. `slotid`) are kept for condition expressions.
+            u.resources[key] += number(val);
+        }
+    }
+}
+
+// CustomActionDef / the legacy [action_N] availability rules: an action is
+// offered when it is not hidden, its per-action and global cooldowns have run
+// out, its price is affordable, and its require/visible conditions hold. RP has
+// no expression evaluator wired up yet, so a non-empty `require` is treated as
+// satisfied (the permissive fallback) rather than calling an undefined helper.
+bool Game::actionAvailable(const Unit& u, int index) const {
+    if (!u.tpl || index < 0 || index >= (int)u.tpl->actions.size()) return false;
+    const UnitAction& a = u.tpl->actions[index];
+    // Only a hidden action or a conversion to a missing type disqualifies it;
+    // `supported` merely means "not modelled", which must not block a click.
+    if (a.hidden) return false;
+    if (!a.convertTo.empty() && !g_templates.find(ToLower(a.convertTo))) return false;
+    auto cd = u.actionCooldowns.find(a.name);
+    if (cd != u.actionCooldowns.end() && cd->second > 0.0f) return false;
+    if (u.allActionCooldown > 0.0f) return false;
+    // canAfford() is non-const, so read the team's balance directly here.
+    if (a.price > 0.0f) {
+        bool afford = false;
+        for (const Team& t : teams) if (t.id == u.team) { afford = t.credits >= a.price; break; }
+        if (!afford) return false;
+    }
+    return true;
+}
+
+// CustomUnit:2953-2999 (legacy [action_N] execution): pay already happened in
+// orderUpgrade; here the action's effects are applied -- conversion, resource /
+// energy changes, event/queue triggers, cooldowns and the parent-shield drain.
+// `convertUnit` is intentionally implemented inline so no extra symbol is needed.
+void Game::runAction(Unit& u, const UnitAction& a, int depth) {
+    if (depth > 4 || u.dead) return;
+    // Self conversion: reload the template and rebuild the per-template state.
+    if (!a.convertTo.empty()) {
+        const UnitTemplate* to = g_templates.find(ToLower(a.convertTo));
+        if (to && to != u.tpl) {
+            u.tpl = to;
+            u.tplKey = ToLower(a.convertTo);
+            initTurrets(u);
+            initLegs(u);
+            u.hp = std::min(u.hp, u.maxHp = to->maxHp);
+        }
+    }
+    applyAddResources(*this, u, a.addResources);
+    if (a.addEnergy != 0.0f) u.energy += a.addEnergy;
+    if (a.parentShield != 0.0f && u.parentId >= 0) {
+        if (Unit* parent = get(u.parentId)) parent->shield = std::max(0.0f, parent->shield + a.parentShield);
+    }
+    if (a.setBuilt >= 0.0f) { u.underConstruction = false; u.buildProgress = a.setBuilt; }
+    if (!a.playAnimation.empty()) { u.animRequested = true; }
+    // Cooldowns: the action's own slot plus the global queue lock.
+    if (a.cooldown > 0.0f) u.actionCooldowns[a.name] = a.cooldown;
+    if (a.allCooldown > 0.0f) u.allActionCooldown = a.allCooldown;
+    // Follow-up actions by name; splitNames/ToLower match how the parser stored
+    // alsoTriggerAction / alsoQueueAction.
+    for (auto& name : splitCommaNames(ToLower(a.triggerActions))) {
+        if (!u.tpl) break;
+        for (size_t i = 0; i < u.tpl->actions.size(); ++i)
+            if (ToLower(u.tpl->actions[i].name) == name) { runAction(u, u.tpl->actions[i], depth + 1); break; }
+    }
+    for (auto& name : splitCommaNames(ToLower(a.queueActions))) {
+        if (!u.tpl) break;
+        for (size_t i = 0; i < u.tpl->actions.size(); ++i)
+            if (ToLower(u.tpl->actions[i].name) == name) { runAction(u, u.tpl->actions[i], depth + 1); break; }
+    }
+    if (!a.messageTo.empty())
+        actionMessages.push_back({ u.id, a.messageTags, depth });
+}
+
+// CustomUnitActionHandler + the message events: fire the named actions whose
+// autoTriggerOnEvent list contains `event` (optionally gated by a tag), and keep
+// a one-hop guard so a message that re-fires itself cannot loop forever.
+void Game::actionEvent(Unit& u, const std::string& event, const std::string& tags, int depth) {
+    if (depth > 4 || !u.tpl || u.dead) return;
+    const std::string ev = ToLower(event);
+    // Snapshot: runAction may replace u.tpl through convertTo, invalidating a
+    // range-for over the live action vector.
+    const std::vector<UnitAction> actions = u.tpl->actions;
+    for (const UnitAction& a : actions) {
+        if (a.events.empty() || !a.supported) continue;
+        // events is a comma list; an entry may be `newMessage(withTag='x')`.
+        bool wants = false;
+        for (auto& tok : splitCommaNames(a.events)) {
+            if (tok.rfind(ev, 0) == 0) { wants = true; break; }
+        }
+        if (!wants) continue;
+        if (!tags.empty() && a.tags.empty()) continue;
+        if (!a.tags.empty() && !tags.empty()) {
+            bool match = false;
+            for (auto& t : splitCommaNames(tags)) if (a.tags.find(t) != std::string::npos) { match = true; break; }
+            if (!match) continue;
+        }
+        runAction(u, a, depth + 1);
+    }
+}
+
+// CustomUnit auto-trigger pass: decrement cooldowns once per tick, then run
+// actions whose `autoTrigger` condition is met when their checkRate slice comes
+// up. The condition is read into the same predicate atoms as the unload gate
+// (overWater / isOverLiquid / isMoving); atoms RP does not know stay always-true.
+// `created`/`complete` are raised once from their latches and event-driven actions
+// are handled by actionEvent instead.
+void Game::updateActions(Unit& u) {
+    if (!u.tpl || u.dead) return;
+    if (u.autoCooldown > 0.0f) u.autoCooldown -= 1.0f;
+    if (u.allActionCooldown > 0.0f) u.allActionCooldown -= 1.0f;
+    for (auto it = u.actionCooldowns.begin(); it != u.actionCooldowns.end(); ) {
+        if (it->second > 0.0f) it->second -= 1.0f;
+        if (it->second <= 0.0f) it = u.actionCooldowns.erase(it); else ++it;
+    }
+    // One-shot lifecycle events, queued by the spawn/complete paths via the
+    // bool latches on Unit (RWX UnitEventType.created / completeAndActive).
+    if (!u.createdEvent) {
+        u.createdEvent = true;
+        actionEvent(u, "created");
+    }
+    if (!u.completeEvent && u.operational()) {
+        u.completeEvent = true;
+        actionEvent(u, "completeAndActive");
+    }
+    if (u.tookDamageEvent) {
+        u.tookDamageEvent = false;
+        actionEvent(u, "tookDamage");
+    }
+    bool slice = u.tpl->autoCheckRate <= 1 || (tick % u.tpl->autoCheckRate) == 0;
+    if (!slice) return;
+    // Snapshot for the same reason as actionEvent -- a convertTo swaps the tpl.
+    const std::vector<UnitAction> actions = u.tpl->actions;
+    for (const UnitAction& a : actions) {
+        // hidden only hides the UI button; RWX still polls a hiddenAction's autoTrigger condition
+        // (CustomUnitConfigParser:3036 adds it to autoTriggerConditions regardless of isVisible).
+        if (!a.supported || a.autoTrigger.empty()) continue;
+        if (!condTestsOk(*this, u, a.autoCond)) continue;
+        if (u.allActionCooldown > 0.0f) continue;
+        auto cd = u.actionCooldowns.find(a.name);
+        if (cd != u.actionCooldowns.end() && cd->second > 0.0f) continue;
+        if (a.price > 0.0f && !canAfford(u.team, a.price)) continue;
+        if (!a.events.empty()) continue;  // event-driven, not polled
+        runAction(u, a);
+    }
+}
+
+// Frame-end delivery of queued messages: RWX resolves sendMessageTo (parent,
+// children, ...) and hands the message to each target's actionEvent under the
+// newMessage event. RP has no message UI, so delivery is only the action hook.
+void Game::flushMessages() {
+    if (actionMessages.empty()) return;
+    std::deque<ActionMessage> pending;
+    pending.swap(actionMessages);
+    for (const ActionMessage& m : pending) {
+        Unit* src = get(m.unitId);
+        if (!src) continue;
+        if (src->parentId >= 0) {
+            if (Unit* parent = get(src->parentId)) actionEvent(*parent, "newMessage", m.tags, m.depth + 1);
+        }
+        for (int id : src->attachments) {
+            if (id < 0) continue;
+            if (Unit* child = get(id)) actionEvent(*child, "newMessage", m.tags, m.depth + 1);
+        }
+    }
 }

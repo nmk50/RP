@@ -51,7 +51,10 @@ static float maxRangeOf(const UnitTemplate& t) {
 
 void debugHandleKeys(Game& g) {
     if (IsKeyPressed(KEY_F1)) g_debug.stats = !g_debug.stats;
-    if (IsKeyPressed(KEY_F2)) g_debug.inspector = !g_debug.inspector;
+    if (IsKeyPressed(KEY_F2)) {
+        g_debug.inspector = !g_debug.inspector;
+        if (!g_debug.inspector) { g_debug.inspRect = Rectangle{ 0, 0, 0, 0 }; g_debug.inspScroll = 0; }
+    }
     if (IsKeyPressed(KEY_F3)) g_debug.world = !g_debug.world;
     if (IsKeyPressed(KEY_F4)) g_debug.grid = !g_debug.grid;
 
@@ -244,6 +247,23 @@ void debugDrawWorld(Game& g, const Camera2D& cam) {
             Color ac = u.tur[i].active ? Color{ 255, 230, 60, 230 } : Color{ 255, 230, 60, 110 };
             DrawLineV(Vector2{ pv.x, pv.y }, Vector2{ tip.x, tip.y }, ac);
         }
+        // leg rig for the selected unit: attach pivot (cyan), rendered foot cross (magenta), limb line
+        if (u.selected && !u.legs.empty()) {
+            float dir = (u.tpl->lockLegRot && !u.tur.empty()) ? u.tur[0].angle : u.facing;
+            Vec2 aim{ std::cos(dir), std::sin(dir) }, right{ -aim.y, aim.x };
+            for (size_t i = 0; i < u.legs.size() && i < u.tpl->legs.size(); ++i) {
+                const LegTpl& C = u.tpl->legs[i];
+                const LegState& S = u.legs[i];
+                Vec2 aw = u.pos + aim * C.attachY + right * C.attachX;
+                Vector2 ap{ aw.x, aw.y - u.posZ };
+                Vec2 fw = u.pos + S.foot;
+                Vector2 fp{ fw.x, fw.y - S.z - u.posZ };
+                DrawLineV(ap, fp, Color{ 255, 80, 255, 120 });
+                DrawCircleV(ap, 2.0f, Color{ 80, 230, 230, 220 });
+                DrawLineV({ fp.x - 4, fp.y }, { fp.x + 4, fp.y }, Color{ 255, 80, 255, 220 });
+                DrawLineV({ fp.x, fp.y - 4 }, { fp.x, fp.y + 4 }, Color{ 255, 80, 255, 220 });
+            }
+        }
         if (u.selected) {
             char buf[48];
             snprintf(buf, sizeof(buf), "#%d %d/%d", u.id, (int)u.hp, (int)u.maxHp);
@@ -309,6 +329,7 @@ static void drawInspector(Game& g, const Camera2D& cam) {
     if (!u) { auto sel = g.selectedUnits(); if (!sel.empty()) u = sel[0]; }
     float w = 292, x = GetScreenWidth() - w - 8, y = 176;
     if (!u) {
+        g_debug.inspRect = Rectangle{ 0, 0, 0, 0 };
         panel(x, y, w, 30);
         DrawText("F2 inspector: hover or select a unit", (int)x + 8, (int)y + 8, 13, GRAY);
         return;
@@ -383,11 +404,49 @@ static void drawInspector(Game& g, const Camera2D& cam) {
                  u->animPrio, u->animLoop ? " loop" : "");
         lines.push_back(buf);
     }
-    float h = 12 + lines.size() * 15;
+    if (!u->legs.empty()) {
+        snprintf(buf, sizeof(buf), "legs %zu  lockRot %d  scale %.2f",
+                 u->legs.size(), t.lockLegRot ? 1 : 0, t.imageScale * u->animScale);
+        lines.push_back(buf);
+        for (size_t i = 0; i < u->legs.size() && i < t.legs.size(); ++i) {
+            const LegTpl& C = t.legs[i];
+            const LegState& S = u->legs[i];
+            snprintf(buf, sizeof(buf), "leg%zu xy %.0f,%.0f att %.0f,%.0f L%dO%dU%dH%d",
+                     i, C.x, C.y, C.attachX, C.attachY,
+                     C.lockMovement ? 1 : 0, C.drawOverBody ? 1 : 0,
+                     C.drawUnderAllUnits ? 1 : 0, C.hidden ? 1 : 0);
+            lines.push_back(buf);
+            snprintf(buf, sizeof(buf), "  foot %.1f,%.1f z %.1f a %.2f st%d",
+                     S.foot.x, S.foot.y, S.z, S.alpha, S.stepping ? 1 : 0);
+            lines.push_back(buf);
+            snprintf(buf, sizeof(buf), "  ang %.0f sp %.0f tgt %.1f,%.1f i%d%d%d",
+                     S.angle * 57.29578f, S.spin * 57.29578f, S.target.x, S.target.y,
+                     C.imageLeg.empty() ? 0 : 1, C.imageFoot.empty() ? 0 : 1,
+                     C.imageShadow.empty() ? 0 : 1);
+            lines.push_back(buf);
+        }
+    }
+    // Clamp the panel to the screen and wheel-scroll the overflow while hovering it.
+    float maxH = (float)GetScreenHeight() - y - 8;
+    float h = std::min(12 + lines.size() * 15.0f, maxH);
+    g_debug.inspRect = Rectangle{ x, y, w, h };
+    if (CheckCollisionPointRec(GetMousePosition(), g_debug.inspRect)) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0) g_debug.inspScroll -= (int)(wheel * 3);
+    }
+    int visible = std::max(1, (int)((h - 12) / 15));
+    g_debug.inspScroll = std::max(0, std::min(std::max(0, (int)lines.size() - visible), g_debug.inspScroll));
     panel(x, y, w, h);
-    for (size_t i = 0; i < lines.size(); ++i)
-        DrawText(lines[i].c_str(), (int)x + 8, (int)y + 6 + (int)i * 15, 12,
-                 i == 0 ? dbgTeamColor(u->team) : LIGHTGRAY);
+    for (int i = 0; i < visible && g_debug.inspScroll + i < (int)lines.size(); ++i) {
+        size_t li = (size_t)(g_debug.inspScroll + i);
+        DrawText(lines[li].c_str(), (int)x + 8, (int)y + 6 + i * 15, 12,
+                 li == 0 ? dbgTeamColor(u->team) : LIGHTGRAY);
+    }
+    if ((int)lines.size() > visible) {
+        snprintf(buf, sizeof(buf), "%d-%d/%zu", g_debug.inspScroll + 1,
+                 g_debug.inspScroll + visible, lines.size());
+        DrawText(buf, (int)(x + w) - 70, (int)(y + h) - 14, 11, GRAY);
+    }
 }
 
 static void drawPicker() {

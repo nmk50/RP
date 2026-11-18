@@ -18,6 +18,9 @@ struct DebugState {
     std::string spawnFilter;
     std::string spawnName;
     int spawnScroll = 0;
+    // F2 inspector: wheel-scroll offset and last drawn rect (so wheel zoom yields over the panel)
+    int inspScroll = 0;
+    Rectangle inspRect = { 0, 0, 0, 0 };
 };
 extern DebugState g_debug;
 

@@ -38,6 +38,9 @@ struct TurretState {
     // movementLevels[i].targetY -- the angle the barrel held when it last aimed, the sweep centre a
     // shouldResetTurret:false barrel rocks about instead of C(i) (:4005-4006).
     float lastAim = 0;
+    // CustomUnit.G[i] (:1557): the cached round an instantReuseLast barrel resets on each shot instead of
+    // spawning a fresh one, kept as a projectile id (-1 = none).
+    int beamProjId = -1;
 };
 
 // Foot/target offsets use world axes; z is relative to the hull, angle is radians and spin is degrees.
@@ -225,6 +228,9 @@ struct Unit {
 // barrel's pivot along the attachedTo chain, slid by this barrel's recoil, plus [turret_N] x/y rotated
 // into that frame (x right of the nose, y forward). The offsets are world px, never sprite px.
 Vec2 turretPivot(const Unit& u, int i);
+// RWX CustomUnit.D(i):4465-4480 -- the muzzle tip: pivot + barrelY along the muzzle direction + barrelX
+// across it. Where a shot is born and where chargeEffectImage is drawn.
+Vec2 muzzlePoint(const Unit& u, int i);
 // barrel slide along its own aim, recoilOutTime/recoilReturnTime ticks after a shot
 float turretRecoil(const Unit& u, int i);
 
@@ -363,6 +369,22 @@ struct Projectile {
     bool beamImmune = false;
     float deflectHp = 1.0f;
     bool deflected = false;
+    // RWX Projectile.D / g.X / B / M and the teleport/reuse/parent flags (CustomUnit.a:1368-1511). A beam
+    // (isBeam) lands its directDamage once but stays drawn until `life` expires instead of vanishing on
+    // impact; nuke is the anti-nuke lock + blast visual; teleportSource moves the shooter to the impact.
+    bool nuke = false;
+    bool teleportSource = false;
+    bool isBeam = false, laserEffect = false, lightingEffect = false;
+    std::string beamImage, beamImageStart, beamImageEnd;
+    bool beamStartRotated = false, beamEndRotated = false;
+    float beamImageOffsetRate = 0;
+    bool lightCastOnGround = false;
+    bool reuseLast = false, reuseKeepAreaList = false;
+    // moveWithParent (Projectile.au/av/aw/ax/ay): the round adds the firing turret's per-tick muzzle delta
+    // to its own pos so a beam's muzzle end rides a moving hull. lastMuzzle caches the previous world pos.
+    bool moveWithParent = false;
+    int parentUnitId = -1, parentTurret = -1;
+    Vec2 lastMuzzle; float lastMuzzleZ = 0;
     // aH/aI/aJ/aK (:857-888): the arc -- climb to ballisticHeight at the flight speed (aL is pinned to
     // -1 at spawn, CustomUnit.java:1496), with no horizontal step below ballisticDelayHeight, then dive
     // once the target is within 20 px. `apex` is aK.

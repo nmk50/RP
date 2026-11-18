@@ -3,6 +3,8 @@
 #include "Debug.h"
 #include <raylib.h>
 #include <cmath>
+#include <algorithm>
+#include <vector>
 
 static Color terrainColor(int c) {
     switch (c) {
@@ -84,6 +86,8 @@ void Renderer::close() {
     cache_.clear();
     for (auto& kv : teamCache_) if (kv.second.id != missing_.id) UnloadTexture(kv.second);
     teamCache_.clear();
+    for (auto& kv : tilesetCache_) if (kv.second.id != missing_.id) UnloadTexture(kv.second);
+    tilesetCache_.clear();
     UnloadTexture(missing_);
 }
 
@@ -174,6 +178,37 @@ bool Renderer::shared(const std::string& file, Texture2D& out) {
     return tex.id != missing_.id;
 }
 
+bool Renderer::tilesetTexture(const TilesetRender& ts, Texture2D& out, int& columns) {
+    auto it = tilesetCache_.find(ts.imageKey);
+    if (it != tilesetCache_.end()) {
+        out = it->second;
+        columns = std::max(1, it->second.width / std::max(1, ts.strideX));
+        return it->second.id != missing_.id;
+    }
+    std::string path = g_assetsRoot + "/tilesets/bitmaps/" + ts.imageKey;
+    Texture2D tex = missing_;
+    if (FileExists(path.c_str())) tex = LoadTexture(path.c_str());
+    if (tex.id == 0) tex = missing_;
+    tilesetCache_[ts.imageKey] = tex;
+    out = tex;
+    columns = std::max(1, tex.width / std::max(1, ts.strideX));
+    return tex.id != missing_.id;
+}
+
+// RWX MapTile.createTile:251-300 + TileMap.getTileVariant:592-598 -- certain base tiles have a small
+// variant strip; the decompiled selector always picks variant[0] when ((x*13+y*1313)%(count+1))-1 >= 0.
+static int variantLocalIndex(const std::string& key, int local, int x, int y) {
+    int count = 0, offset = 0;
+    if (local == 0) {
+        if (key == "shallowwater.png") count = 5;
+        else if (key == "deepwater.png" || key == "water.png" || key == "snow.png") count = 2;
+        else if (key == "longgrass.png" || key == "mountain.png") count = 3;
+    } else if (local == 7 && key == "stone.png") { count = 4; offset = 23; }
+    if (count > 0 && ((x * 13 + y * 1313) % (count + 1)) - 1 >= 0)
+        return local + 1 + offset;
+    return local;
+}
+
 static void worldViewCull(const Camera2D& cam, float sw, float sh, float& x0, float& y0, float& x1, float& y1) {
     Vector2 tl = GetScreenToWorld2D({ 0.0f, 0.0f }, cam);
     Vector2 br = GetScreenToWorld2D({ sw, sh }, cam);
@@ -222,15 +257,48 @@ void Renderer::drawMap(Game& g, const Camera2D& cam) {
     float x0, y0, x1, y1; worldViewCull(cam, (float)GetScreenWidth(), (float)GetScreenHeight(), x0, y0, x1, y1);
     int tx0 = std::max(0, (int)(x0 / TILE_SIZE) - 1), ty0 = std::max(0, (int)(y0 / TILE_SIZE) - 1);
     int tx1 = std::min(g.map.w - 1, (int)(x1 / TILE_SIZE) + 1), ty1 = std::min(g.map.h - 1, (int)(y1 / TILE_SIZE) + 1);
-    for (int y = ty0; y <= ty1; ++y)
-        for (int x = tx0; x <= tx1; ++x) {
-            const MapTile& t = g.map.at(x, y);
-            Color c = terrainColor(t.color);
-            if (t.blocked) c = Color{ (uint8_t)(c.r * 0.6f), (uint8_t)(c.g * 0.6f), (uint8_t)(c.b * 0.6f), 255 };
-            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, c);
-            if (t.resource) DrawRectangle(x * TILE_SIZE + 4, y * TILE_SIZE + 4, TILE_SIZE - 8, TILE_SIZE - 8, Color{ 150, 220, 255, 120 });
-            if (t.tree) DrawCircle((x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE, 5, Color{ 30, 80, 30, 200 });
+
+    bool realTerrain = !g.map.renderLayers.empty() && !g.map.tilesets.empty();
+    if (realTerrain) {
+        // RWX renders each MapLayer in order: opaque Ground first, then Items / decoration over it.
+        DrawRectangle(0, 0, (int)g.map.worldW(), (int)g.map.worldH(), Color{ 24, 24, 24, 255 });
+        std::vector<int> firsts;
+        firsts.reserve(g.map.tilesets.size());
+        for (auto& ts : g.map.tilesets) firsts.push_back(ts.firstgid);
+        auto findTs = [&](uint32_t gid) -> const TilesetRender* {
+            int idx = (int)(std::upper_bound(firsts.begin(), firsts.end(), (int)gid) - firsts.begin()) - 1;
+            if (idx < 0) return nullptr;
+            return &g.map.tilesets[idx];
+        };
+        for (const auto& layer : g.map.renderLayers) {
+            if (layer.skip || layer.gids.empty()) continue;
+            Color tint{ 255, 255, 255, (uint8_t)(std::max(0.0f, std::min(1.0f, layer.opacity)) * 255.0f) };
+            for (int y = ty0; y <= ty1; ++y)
+                for (int x = tx0; x <= tx1; ++x) {
+                    uint32_t gid = layer.gids[(size_t)y * g.map.w + x];
+                    if (gid == 0) continue;
+                    const TilesetRender* ts = findTs(gid);
+                    if (!ts || ts->imageKey.empty()) continue;
+                    Texture2D tex; int columns;
+                    if (!tilesetTexture(*ts, tex, columns)) continue;
+                    int local = variantLocalIndex(ts->imageKey, (int)gid - ts->firstgid, x, y);
+                    int col = local % columns, row = local / columns;
+                    Rectangle src{ (float)(col * ts->strideX), (float)(row * ts->strideY), (float)ts->tileWidth, (float)ts->tileHeight };
+                    Rectangle dst{ (float)(x * TILE_SIZE), (float)(y * TILE_SIZE), (float)TILE_SIZE, (float)TILE_SIZE };
+                    DrawTexturePro(tex, src, dst, Vector2{ 0, 0 }, 0.0f, tint);
+                }
         }
+    } else {
+        for (int y = ty0; y <= ty1; ++y)
+            for (int x = tx0; x <= tx1; ++x) {
+                const MapTile& t = g.map.at(x, y);
+                Color c = terrainColor(t.color);
+                if (t.blocked) c = Color{ (uint8_t)(c.r * 0.6f), (uint8_t)(c.g * 0.6f), (uint8_t)(c.b * 0.6f), 255 };
+                DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, c);
+                if (t.resource) DrawRectangle(x * TILE_SIZE + 4, y * TILE_SIZE + 4, TILE_SIZE - 8, TILE_SIZE - 8, Color{ 150, 220, 255, 120 });
+                if (t.tree) DrawCircle((x + 0.5f) * TILE_SIZE, (y + 0.5f) * TILE_SIZE, 5, Color{ 30, 80, 30, 200 });
+            }
+    }
     // RWX ScorchMark: permanent ground decals, drawn on the terrain layer below every unit
     Texture2D sc;
     if (!g.scorches.empty() && shared("blood_mark.png", sc)) {
@@ -355,6 +423,23 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
                 drawSpriteFrame(fl, ff, std::min(ff - 1, frame),
                     Vector2{ pv.x + s.flameOff.x, pv.y + s.flameOff.y },
                     20.0f * (s.flameType == 2 ? 0.75f : 1.0f), spriteRot(s.flameAng), WHITE);
+            }
+        }
+        // CustomUnit:2482-2489 -> GameViewUtils.a(unit,texture,f,i):163-173 -- chargeEffectImage is drawn
+        // centred on the muzzle D(i), scaled by movementLevels[i].speed / warmup on both axes, unrotated
+        // and with a null paint: no team dye, no under-construction tint. It shows only while the barrel
+        // holds a charge, so it grows down the barrel as the warmup ticks up and bleeds away with
+        // warmupCallDownRate when the aim is interrupted.
+        if (!u.dead) {
+            for (size_t i = 0; i < t.turrets.size() && i < u.tur.size(); ++i) {
+                const TurretTpl& tt = t.turrets[i];
+                const TurretState& s = u.tur[i];
+                if (tt.chargeEffectImage.empty() || tt.warmup <= 0.0f || s.warm <= 0.0f) continue;
+                Texture2D ch;
+                if (!byName(t, tt.chargeEffectImage, ch)) continue;
+                float f = s.warm / tt.warmup;
+                Vec2 mz = muzzlePoint(u, (int)i);
+                drawSpriteFrame(ch, 1, 0, Vector2{ mz.x, mz.y - u.posZ }, ch.width * f, 0, WHITE);
             }
         }
     }
@@ -672,9 +757,78 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     // travel angle + 90 and scaled to cell*drawSize (Projectile.java:1688-1711 + GameViewUtils.java:100).
     // frame : -1 keeps the plain tinted dot instead.
     for (auto& p : g.projectiles) {
-        if (p.hit) continue;   // RWX clears shouldDraw once the shot lands; only its ring keeps growing
+        // RWX clears shouldDraw once an ordinary shot lands (:1038-1040), but a beam keeps it and stays
+        // drawn until its life runs out, so a landed beam is still rendered here.
+        if (p.hit && !p.isBeam) continue;
         Color tint{ (uint8_t)(p.color >> 24), (uint8_t)((p.color >> 16) & 0xFF),
                     (uint8_t)((p.color >> 8) & 0xFF), (uint8_t)p.color };
+        if (p.isBeam) {
+            // Projectile.c():1552-1683 -- the beam runs from the round's own pos (the muzzle, which
+            // moveWithParent keeps riding the hull) to the live target, or the frozen aim point once the
+            // target is gone. Both ends are lifted by their own posZ.
+            Vector2 a{ p.pos.x, p.pos.y - p.posZ };
+            const Unit* bt = p.targetId >= 0 ? g.get(p.targetId) : nullptr;
+            Vector2 b = (bt && !bt->dead) ? Vector2{ bt->pos.x, bt->pos.y - bt->posZ }
+                                          : Vector2{ p.impactPos.x, p.impactPos.y - p.impactZ };
+            float dx = b.x - a.x, dy = b.y - a.y;
+            float length = std::sqrt(dx * dx + dy * dy);
+            if (length < 0.001f) { b.x = a.x + 0.001f; dx = 0.001f; length = 0.001f; }
+            float ux = dx / length, uy = dy / length;
+            float angDeg = std::atan2(dy, dx) * 57.29578f + 90.0f;
+            Texture2D beamTex;
+            if (!p.beamImage.empty() && p.from && byName(*p.from, p.beamImage, beamTex)) {
+                // :1581-1622 -- beamImage is tiled muzzle->target (width = texture width, length = the
+                // gap), rotated angle+90, with beamImageOffsetRate scrolling the tile phase by age.
+                float texH = (float)beamTex.height;
+                float phase = std::fmod(p.beamImageOffsetRate * p.ticks, texH);
+                if (phase < 0) phase += texH;
+                for (float s = -phase; s < length; s += texH) {
+                    float a0 = std::max(0.0f, s), a1 = std::min(length, s + texH);
+                    if (a1 <= a0) continue;
+                    float seg = a1 - a0;
+                    Vector2 c{ a.x + ux * (a0 + a1) * 0.5f, a.y + uy * (a0 + a1) * 0.5f };
+                    Rectangle src{ 0, a0 - s, (float)beamTex.width, seg };
+                    Rectangle dst{ c.x, c.y, (float)beamTex.width, seg };
+                    DrawTexturePro(beamTex, src, dst, Vector2{ beamTex.width * 0.5f, seg * 0.5f }, angDeg, tint);
+                }
+                Texture2D cap;
+                if (!p.beamImageStart.empty() && byName(*p.from, p.beamImageStart, cap))
+                    drawSpriteFrame(cap, 1, 0, a, (float)cap.width, p.beamStartRotated ? angDeg : 0.0f, tint);
+                if (!p.beamImageEnd.empty() && byName(*p.from, p.beamImageEnd, cap))
+                    drawSpriteFrame(cap, 1, 0, b, (float)cap.width, p.beamEndRotated ? angDeg : 0.0f, tint);
+            } else if (p.lightingEffect) {
+                // :1645-1683 -- a 20-node polyline whose perpendicular jitter (+-10px) is re-rolled every
+                // 4 ticks; under 200px the node count drops by 5. RP derives the jitter from the tick
+                // bucket so it stays stable for those 4 ticks without carrying RWX's O[20]/N state.
+                int nodes = 20;
+                if (length < 200.0f) nodes = std::max(0, nodes - 5);
+                else if (length < 100.0f) nodes = std::max(0, nodes - 10);
+                if (nodes < 2) nodes = 2;
+                float seg = length / (nodes - 1);
+                int bucket = p.ticks / 4;
+                BeginBlendMode(BLEND_ADDITIVE);
+                Vector2 prev = a;
+                for (int i = 1; i < nodes; ++i) {
+                    float j = (i == nodes - 1) ? 0.0f
+                        : std::sin((bucket * 131 + i * 17) * 12.9898f) * 43758.5453f;
+                    j = (j - std::floor(j)) * 20.0f - 10.0f;
+                    Vector2 cur{ a.x + ux * i * seg - uy * j, a.y + uy * i * seg + ux * j };
+                    DrawLineEx(prev, cur, 2.0f, tint);
+                    prev = cur;
+                }
+                EndBlendMode();
+            } else {
+                // :1623-1643 -- laserEffect: a wide faint glow line under a narrow bright core, both
+                // muzzle->target, plus a small hit circle at the far end.
+                BeginBlendMode(BLEND_ADDITIVE);
+                Color glow = tint; glow.a = (uint8_t)(tint.a * 0.5f);
+                DrawLineEx(a, b, 6.0f, glow);
+                DrawLineEx(a, b, 3.0f, tint);
+                DrawCircleV(b, 5.0f, tint);
+                EndBlendMode();
+            }
+            continue;
+        }
         // RWX [projectile_N] lightColor: EffectManager.createLightEffect attaches an additive
         // light_50.png glow (alpha 0.3, size = texture * lightSize) that follows the projectile.
         if (p.lightColor) {

@@ -81,7 +81,8 @@ static MoveType parseMoveType(const std::string& s) {
     if (v == "air") return MoveType::AIR;
     if (v == "water") return MoveType::WATER;
     if (v == "hover") return MoveType::HOVER;
-    if (v == "over_cliff" || v == "over_cliff_water") return MoveType::OVER_CLIFF;
+    if (v == "over_cliff") return MoveType::OVER_CLIFF;
+    if (v == "over_cliff_water") return MoveType::OVER_CLIFF_WATER;
     return MoveType::NONE; // BUILDING / NONE
 }
 
@@ -120,6 +121,7 @@ static void parseCondAtoms(const std::string& raw, UnloadCond& out) {
         if (part.empty()) continue;
         bool neg = part.rfind("not ", 0) == 0 || part.find(" not ") != std::string::npos;
         if (part.find("isoverliquid") != std::string::npos) out.tests.push_back({ CondPred::overLiquid, neg });
+        else if (part.find("overwater") != std::string::npos) out.tests.push_back({ CondPred::overWater, neg });
         else if (part.find("ismoving") != std::string::npos) out.tests.push_back({ CondPred::moving, neg });
         // an atom RP does not know is not evaluated, so it cannot fail either
     }
@@ -199,6 +201,41 @@ static std::vector<std::string> parseTags(const std::string& raw) {
         if (!dup && !s.empty()) out.push_back(s);
     }
     return out;
+}
+
+// UnitPrice.b():165-233 -- the resourceUsage grammar. Split on comma or pipe (:172), a token with no '='
+// or ':' is credits (:176-178), otherwise key=val. Flag keys run through a():134-155 which ORs 1<<id over
+// an optional lo-hi range into a mask. Unknown keys are named resources kept for the cost store (:207-216).
+static ResourceCost parseResourceCost(const std::string& raw) {
+    ResourceCost rc;
+    std::string s = Trim(raw);
+    if (s.empty()) return rc;
+    for (auto& c : s) if (c == '|') c = ',';
+    auto num = [](const std::string& v) { return (float)atof(v.c_str()); };
+    auto flagMask = [&](const std::string& v) -> uint64_t {
+        uint64_t m = 0;
+        size_t dash = v.find('-');
+        int lo = (int)num(v), hi = dash == std::string::npos ? lo : (int)num(v.substr(dash + 1));
+        for (int f = lo; f <= hi && f >= 0 && f <= 31; ++f) m |= (1ULL << f);
+        return m;
+    };
+    for (auto& part : splitNames(s)) {
+        size_t eq = part.find_first_of("=:");
+        std::string key, val;
+        if (eq == std::string::npos) { key = "credits"; val = part; }
+        else { key = ToLower(Trim(part.substr(0, eq))); val = Trim(part.substr(eq + 1)); }
+        if (key == "credits") rc.credits = num(val);
+        else if (key == "energy") rc.energy = num(val);
+        else if (key == "hp" || key == "health") rc.hp = num(val);
+        else if (key == "shield") rc.shield = num(val);
+        else if (key == "ammo") rc.ammo = num(val);
+        else if (key == "hasflag") rc.hasFlag |= flagMask(val);
+        else if (key == "hasmissingflag") rc.hasMissingFlag |= flagMask(val);
+        else if (key == "setflag") rc.setFlag |= flagMask(val);
+        else if (key == "unsetflag") rc.unsetFlag |= flagMask(val);
+        else if (!key.empty()) rc.custom.emplace_back(key, num(val));
+    }
+    return rc;
 }
 
 // UnitSpawnList.b():26-113 parses the projectile spawn lists -- "name, name*3(key = value, key = value)".
@@ -562,6 +599,14 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         a.visible = s.get("isvisible"); a.active = s.get("isactive");
         a.require = s.get("requireconditional"); a.autoTrigger = s.get("autotrigger");
         a.checkRate = s.has("autotriggercheckrate") ? actionCheckRate(s.get("autotriggercheckrate")) : t.autoCheckRate;
+        {
+            // autoTrigger is a LogicBoolean in RWX; RP reads the same predicate atoms as the unload
+            // condition. `true`/absent leaves the test list empty (always fires), `false` never fires.
+            std::string gate = ToLower(Trim(a.autoTrigger));
+            if (gate.rfind("if ", 0) == 0) gate = Trim(gate.substr(3));
+            if (gate == "false") a.autoCond.never = true;
+            else if (!gate.empty() && gate != "true") parseCondAtoms(gate, a.autoCond);
+        }
         a.events = ToLower(s.get("autotriggeronevent")); a.tags = ToLower(s.get("tags"));
         a.addResources = s.get("addresources"); a.setStats = s.get("setunitstats");
         if (ToLower(a.addResources).find("ammo") != std::string::npos) a.supported = false;
@@ -1171,6 +1216,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         // :2010-2011, both plain booleans defaulting to false
         t.moveSlidingMode = m->getBool("moveslidingmode", false);
         t.moveIgnoringBody = m->getBool("moveignoringbody", false);
+        // :2012 -- parsed and stored, but a dead config: RWX has no runtime reader for it (see UnitTemplate.h)
+        t.moveSlidingDir = (int)m->getNum("moveslidingdir", -1);
         // :1982-1991, a tri-state string matched case-insensitively; anything else throws the parse off
         // in RWX, so here it just falls back to false.
         {
@@ -1311,6 +1358,25 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             p.targetSpeedAccel = (float)s.getNum("targetspeedacceleration", 0.1);
             p.speedSpread = (float)s.getNum("speedspread", 0);
             p.instant = s.getBool("instant", false);
+            // CustomProjectileTemplate.java:72,89-113,121-138,171,179-189,249 -- the beam/nuke/teleport family.
+            p.nukeWeapon = s.getBool("nukeweapon", false);
+            p.teleportSource = s.getBool("teleportsource", false);
+            p.instantReuseLast = s.getBool("instantreuselast", false);
+            p.instantReuseLastAlsoChangeTurretAim = s.getBool("instantreuselast_alsochangeturretaim", false);
+            p.instantReuseLastAcrossTurrets = s.getBool("instantreuselast_acrossturrets", false);
+            p.instantReuseLastKeepAreaDamageList = s.getBool("instantreuselast_keepareadamagelist", false);
+            p.moveWithParent = s.getBool("movewithparent", false);
+            p.laserEffect = s.getBool("lasereffect", false);
+            p.lightingEffect = s.getBool("lightingeffect", false);
+            p.lightCastOnGround = s.getBool("lightcastonground", false);
+            p.beamImage = Trim(s.get("beamimage", ""));
+            p.beamImageStart = Trim(s.get("beamimagestart", ""));
+            p.beamImageEnd = Trim(s.get("beamimageend", ""));
+            p.beamImageStartRotated = s.getBool("beamimagestartrotated", false);
+            p.beamImageEndRotated = s.getBool("beamimageendrotated", false);
+            p.beamImageOffsetRate = (float)s.getNum("beamimageoffsetrate", 0);
+            // :181-183 -- a laserEffect with no beamImage and no explicit colour defaults to ARGB(80,255,0,0).
+            if (p.laserEffect && p.beamImage.empty() && !s.has("color")) p.color = 0xFF000050u;
             // :71, straight into ProjectileTemplate.java:77's default of 1.0 -- a round that says nothing is
             // deflectable by one beam hit, and only a value under 0.5 buys immunity (CustomUnit:1401-1404).
             p.deflectionPower = (float)s.getNum("deflectionpower", p.deflectionPower);
@@ -1437,6 +1503,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (s.has("barrelx")) tt.barrelX = (float)s.getNum("barrelx", 0);
             if (s.has("barreloffsetx_onoddshots")) tt.barrelXOdd = (float)s.getNum("barreloffsetx_onoddshots", 0);
             if (s.has("image")) tt.image = Trim(s.get("image", ""));
+            // TurretConfig.java:563-566 -- inherits the copyFrom barrel's texture when the key is absent
+            tt.chargeEffectImage = Trim(s.get("chargeeffectimage", tt.chargeEffectImage));
             if (s.has("onshoot_playanimation")) tt.shootAnimation = ToLower(Trim(s.get("onshoot_playanimation")));
             // TurretConfig.java:551-554 reads this as a nullable Boolean: absent inherits [graphics]
             // teamColorsOnTurret, so RP keeps it tri-state instead of defaulting it to false.
@@ -1458,6 +1526,9 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             if (s.has("delay")) tt.shootDelay = timeTicks("delay", s, tt.shootDelay);
             if (s.has("warmup")) tt.warmup = timeTicks("warmup", s, tt.warmup);
             if (s.has("energyusage")) tt.energyUsage = (float)s.getNum("energyusage", tt.energyUsage);
+            // TurretConfig.java:377-380 -- only read when present, so a copyFrom barrel that says nothing
+            // keeps its source's cost (the struct copy above already brought it across).
+            if (s.has("resourceusage")) tt.resourceUsage = parseResourceCost(s.get("resourceusage", ""));
             if (s.has("warmupcalldownrate")) tt.warmCallDown = (float)s.getNum("warmupcalldownrate", tt.warmCallDown);
             if (s.has("warmupnoreset")) tt.warmNoReset = s.getBool("warmupnoreset", false);
             // 99999 is RWX's "no limit" sentinel (TurretConfig.java:484-496), not a real range.
@@ -1467,6 +1538,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             }
             if (s.has("limitingminrange")) tt.minRange = (float)s.getNum("limitingminrange", tt.minRange);
             if (s.has("canattackmaxangle")) tt.maxAngle = (float)s.getNum("canattackmaxangle", tt.maxAngle);
+            // TurretConfig.java:485-490 -- a plain getFloat, -1 (the default) means no cone at all.
+            if (s.has("limitingangle")) tt.limitingAngle = (float)s.getNum("limitingangle", tt.limitingAngle);
             if (s.has("recoiloffset")) tt.recoil = (float)s.getNum("recoiloffset", tt.recoil);
             if (s.has("recoilouttime")) tt.recoilOut = (float)s.getNum("recoilouttime", tt.recoilOut);
             if (s.has("recoilreturntime")) tt.recoilReturn = timeTicks("recoilreturntime", s, tt.recoilReturn);
@@ -1474,6 +1547,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
                 auto it = turIdx.find(ToLower(Trim(s.get("attachedto"))));
                 if (it != turIdx.end() && it->second != i) tt.attached = it->second;
             }
+            // TurretConfig.java:426-432 -- slave requires attachedTo and points childTurret at that parent,
+            // so the master is exactly the resolved attached index. A slave with no parent is a parse error
+            // in RWX; RP leaves slaveMaster at -1 (a plain attached barrel) rather than aborting the mod.
+            if (s.getBool("slave", false) && tt.attached >= 0) tt.slaveMaster = tt.attached;
             if (s.has("linkdelaywithturret")) {
                 auto it = turIdx.find(ToLower(Trim(s.get("linkdelaywithturret"))));
                 if (it != turIdx.end() && it->second != i) tt.linkDelay = it->second;
@@ -1482,6 +1559,8 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             // :487 the barrel may restate the jitter, defaulting to whatever it already holds
             if (s.has("aimoffsetspread")) tt.aimOffsetSpread = (float)s.getNum("aimoffsetspread", tt.aimOffsetSpread);
             if (s.has("shouldresetturret")) tt.shouldResetTurret = s.getBool("shouldresetturret", true);
+            // TurretConfig.java:219,517 -- a plain getFloat, negative spins the other way
+            tt.idleSpin = (float)s.getNum("idlespin", tt.idleSpin);
             // TurretConfig.java:518-536 -- the idle sweep. Every key takes the inherited value as its
             // default, so a copyFrom barrel that says nothing keeps its source's sweep, and the
             // afterburn variant's bare `idleSweepAngle : 0` switches it off.

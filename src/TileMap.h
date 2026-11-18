@@ -24,6 +24,26 @@ struct SpawnPoint {
     int tx = 0, ty = 0;
 };
 
+// RWX Tileset: image is resolved by basename from tilesets/bitmaps/<imageKey>; the atlas is a grid of
+// tileWidth x tileHeight cells with stride = tile + spacing. columns is derived from the loaded bitmap
+// width at draw time (Tileset.initTextureMetrics), not from the .tsx columns attribute.
+struct TilesetRender {
+    int firstgid = 1;
+    std::string imageKey;
+    int tileWidth = 20, tileHeight = 20;
+    int strideX = 20, strideY = 20;
+};
+
+// RWX MapLayer: raw per-tile global ids kept for rendering, in map layer order. The Units layer holds
+// spawn markers (MapTile.createTile returns null for them) so it is not drawn as terrain.
+struct MapRenderLayer {
+    std::string name;
+    bool ground = false;
+    bool skip = false;
+    float opacity = 1.0f;
+    std::vector<uint32_t> gids; // w*h, 0 = empty
+};
+
 class TileMap {
 public:
     int w = 0, h = 0;
@@ -31,6 +51,11 @@ public:
     std::vector<int> buildOcc;  // per-tile count of buildings occupying it (RW: cost -1)
     std::vector<SpawnPoint> spawns;
     std::string name;
+
+    // Terrain imagery (RWX Tileset / MapLayer). Empty for procedural maps -> renderer falls back to
+    // flat terrain colors. Gameplay classification above is independent of these.
+    std::vector<TilesetRender> tilesets;
+    std::vector<MapRenderLayer> renderLayers;
 
     MapTile& at(int x, int y) { return tiles[y * w + x]; }
     const MapTile& at(int x, int y) const { return tiles[y * w + x]; }
@@ -52,6 +77,13 @@ public:
         return !(t.water || t.lava || t.blocked) && !occupied(x, y);
     }
     bool walkableAir(int x, int y) const { return inBounds(x, y); }
+    // RWX PathCostMap.d:320-337 -- OVER_CLIFF_WATER crosses water, cliff and large rock (z, z2, z3 all
+    // true); only lava and building occupancy still stop it.
+    bool walkableAmphibious(int x, int y) const {
+        if (!inBounds(x, y)) return false;
+        const MapTile& t = tiles[y * w + x];
+        return !t.lava && !occupied(x, y);
+    }
     bool walkableWater(int x, int y) const {
         if (!inBounds(x, y)) return false;
         return tiles[y * w + x].water;

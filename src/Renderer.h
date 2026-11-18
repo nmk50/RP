@@ -33,6 +33,8 @@ private:
     // being the source image itself. RP bakes the same pixels on demand and keeps them here.
     bool teamed(const UnitTemplate& t, const std::string& nm, int which, int colorIdx, Texture2D& out);
     bool shared(const std::string& file, Texture2D& out);          // assets/drawable/<file>
+    // RWX Tileset.initTextureMetrics: load tilesets/bitmaps/<imageKey>, columns = bitmapWidth / strideX.
+    bool tilesetTexture(const TilesetRender& ts, Texture2D& out, int& columns);
     void drawMap(Game& g, const Camera2D& cam);
     void drawUnitShadow(const Unit& u);
     void drawUnit(Game& g, const Unit& u, const Camera2D& cam);
@@ -44,4 +46,5 @@ private:
 
 private:
     std::unordered_map<std::string, Texture2D> teamCache_;
+    std::unordered_map<std::string, Texture2D> tilesetCache_; // key: imageKey basename
 };

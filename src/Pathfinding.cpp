@@ -16,6 +16,7 @@ bool isWalkable(const TileMap& map, int x, int y, MoveType mt) {
         case MoveType::AIR:
         case MoveType::HOVER: return true;
         case MoveType::WATER: return map.walkableWater(x, y);
+        case MoveType::OVER_CLIFF_WATER: return map.walkableAmphibious(x, y);
         default: return map.walkableLand(x, y);
     }
 }
