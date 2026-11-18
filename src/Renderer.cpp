@@ -368,6 +368,9 @@ void Renderer::drawTree(const Unit& u) {
 void Renderer::drawUnitShadow(const Unit& u) {
     if (!u.tpl) return;
     const UnitTemplate& t = *u.tpl;
+    // CustomUnit.canDrawShadow:687 -- a hull that has gone under (posZ < -1) stops casting one, so a
+    // diving submarine does not leave a crisp shadow on the water it is sinking into.
+    if (u.posZ < -1.0f) return;
     if (ToLower(t.imageShadow) != "auto") return;
     Texture2D tex;
     if (!loaded(t, 0, tex)) return;
@@ -390,6 +393,11 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     Color col = WHITE;
     if (u.underConstruction && u.tpl->isBuilding)
         col = Color{ 140, 255, 140, (uint8_t)(40 + 200 * std::max(0.0f, std::min(1.0f, u.buildProgress))) };
+    // RWX OrderableUnit.getRenderPaint:4295-4299 -- the hull's paint is a white filter whose alpha comes
+    // from getSubmergedRenderAlpha (:4280-4289): below posZ -0.3 the sprite fades out so the water shows
+    // through it, (1 - (-z)/10) * 130 + 45 floored at 45, which is 71 for the subs' -8. Without this a
+    // diving hull just slides down the screen and still looks like it is floating on the surface.
+    col.a = (uint8_t)(col.a * submergedRenderAlpha(u.posZ) / 255);
 
     // The hull pose the animation controller wrote this tick (CustomUnit.animationFrameIndex /
     // .currentFrameTime, CustomUnitAnimationController.b():276-279). With no animation running these are
@@ -407,7 +415,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     Texture2D wt;
     if (u.dead && u.corpseWreck && loaded(t, 2, wt)) {
         drawSpriteFrame(wt, 1, 0, pv, wt.width * t.imageScale,
-                        t.isStatic() ? 0 : spriteRot(u.facing), WHITE);
+                        t.isStatic() ? 0 : spriteRot(u.facing), col);
         return;
     }
     // CustomUnit.d():671-677 -- a dead hull draws the raw wreck, a living one the baked variant of its own
