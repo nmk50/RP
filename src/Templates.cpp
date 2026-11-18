@@ -133,6 +133,7 @@ static void parseCondAtoms(const std::string& raw, UnloadCond& out) {
 static void parseBuildLinks(const IniSection& core, const std::string& prefix, std::vector<BuildOption>& out) {
     std::map<int, std::string> names;
     std::map<int, float> poss;
+    std::map<int, int> techs;
     std::string lp = ToLower(prefix) + "_";
     for (auto& kv : core.kv) {
         std::string k = ToLower(kv.first);
@@ -144,6 +145,7 @@ static void parseBuildLinks(const IniSection& core, const std::string& prefix, s
         std::string tag = rest.substr(us + 1);
         if (tag == "name") names[idx] = Trim(kv.second);
         else if (tag == "pos") poss[idx] = (float)std::atof(kv.second.c_str());
+        else if (tag == "tech") techs[idx] = (int)std::atof(kv.second.c_str());
     }
     for (auto& n : names) {
         if (n.second.empty()) continue;
@@ -158,6 +160,7 @@ static void parseBuildLinks(const IniSection& core, const std::string& prefix, s
             // :2602 an option spelled NONE is a placeholder, not a unit -- it never becomes an action.
             if (ToLower(one) == "none") continue;
             BuildOption b; b.unitName = one; b.pos = poss.count(n.first) ? poss[n.first] : (float)n.first;
+            b.tech = techs.count(n.first) ? techs[n.first] : 1;
             out.push_back(b);
         }
     }
@@ -496,6 +499,9 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         t.unselectable = c->getBool("isunselectable", false);
         t.untargetable = c->getBool("isunselectableastarget", t.unselectable);
         t.cannotBeAttacked = c->getBool("cannotbedirectlyattacked", false);
+        // CustomUnitConfigParser:1738 -- canNotBeDamaged defaults to canNotBeDirectlyAttacked, but is a
+        // separate hook: the former blocks the damage itself (CustomUnit:4744), the latter only aiming.
+        t.cannotBeDamaged = c->getBool("cannotbedamaged", t.cannotBeAttacked);
         t.disableDeathOnZeroHp = c->getBool("disabledeathonzerohp", false);
         t.autoCooldown = timeTicks("autotriggercooldowntime", *c, 60);
         t.autoCheckRate = actionCheckRate(c->get("autotriggercheckrate"));
@@ -540,9 +546,10 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         }
         if (sn.rfind("canbuild_", 0) == 0) {
             // `reclaim` is the built-in ReclaimTargetAction, which RP already shows for canReclaimResources.
+            int tech = (int)sec.getNum("tech", 1);   // CustomUnitConfigParser:2562
             for (auto& name : splitNames(sec.get("name")))
                 if (ToLower(name) != "none" && ToLower(name) != "reclaim")
-                    t.canBuild.push_back({name, (float)sec.getNum("pos", 1), sec.get("isvisible"), sec.getBool("forcenano", false)});
+                    t.canBuild.push_back({name, (float)sec.getNum("pos", 1), sec.get("isvisible"), sec.getBool("forcenano", false), tech});
         }
     }
     // hiddenAction_X first so a derived file's action_X (nautilusLand's trigger_onLand) overrides the keys

@@ -3125,6 +3125,9 @@ void Game::splash(Projectile& p, float frac) {
 // - and only the remainder, scaled by hullMult, is subtracted from health.
 float Game::damage(Unit& target, float dmg, const Projectile* p) {
     if (dmg <= 0 || target.dead) return 0.0f;
+    // CustomUnit:4744 -- `if (dH() || unitConfig.canNotBeDamaged) return;` sits at the top of takeDamage,
+    // so the hit lands on nothing: no armour, no shield, no death.
+    if (target.tpl && target.tpl->cannotBeDamaged) return 0.0f;
     const Projectile def;
     if (!p) p = &def;
     target.tookDamageEvent = true;
@@ -3583,7 +3586,8 @@ void Game::runAI() {
             if (u.prodQueue.empty())
                 for (auto& bo : u.tpl->canBuild) {
                     const UnitTemplate* it = g_templates.find(ToLower(bo.unitName));
-                    if (it && it->isBuilder && builders >= 2) continue;
+                    if (!it || !buildOptionAllowed(*u.tpl, *it, bo.tech)) continue;
+                    if (it->isBuilder && builders >= 2) continue;
                     // with no income yet, save up so the builder can afford an extractor (700)
                     if (it && !it->isBuilding && t.credits > it->price + 100 && (extractors > 0 || t.credits > it->price + 800)) { orderProduce(u.id, bo.unitName); break; }
                 }

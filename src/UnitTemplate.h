@@ -480,7 +480,9 @@ struct ProjectileTpl {
     std::vector<SpawnUnit> spawnUnits;
 };
 
-struct BuildOption { std::string unitName; float pos = 1; std::string visible; bool forceNano = false; };
+// `tech` is CustomActionDef.techLevel (CustomUnitConfigParser:2562): the option is filed into the
+// owner's specialActionLists[tech-1], so a hull whose own core.techLevel is lower never sees it.
+struct BuildOption { std::string unitName; float pos = 1; std::string visible; bool forceNano = false; int tech = 1; };
 
 // One keyframe of a body animation. `t` is in ticks: a key written "0.8s" is 48 (the trailing 's' is
 // worth 60, IniFile.parseUnitValue:761-783), and the animation clock steps by 1 per logic tick because
@@ -580,6 +582,10 @@ struct UnitTemplate {
     std::vector<std::string> tags;
     std::vector<AttachmentTpl> attachments;
     bool unselectable = false, untargetable = false, cannotBeAttacked = false;
+    // CustomUnitConfig.canNotBeDamaged (:207, parsed :1738 with canNotBeDirectlyAttacked as its default):
+    // a separate hook from cannotBeAttacked -- this one is checked inside takeDamage, so the hull can be
+    // aimed at and hit but nothing comes off its health bar.
+    bool cannotBeDamaged = false;
     bool disableDeathOnZeroHp = false;
     float autoCooldown = 60, fallingAcceleration = 0.03f;
     int autoCheckRate = 1;
@@ -932,12 +938,21 @@ public:
 };
 
 extern TemplateStore g_templates;
+// Whether `owner` shows `target` in its build/produce menu. Two rules, both from the RWX parser:
+//  1. CustomUnitConfigParser:2562 -- the entry's `tech` files it under specialActionLists[tech-1], so a
+//     hull only sees entries whose tech is within its own core.techLevel.
+//  2. Placement vs production follows the *target*: structures need a builder, mobile units need a
+//     factory. The roles are not exclusive -- combatEngineer/mechEngineer/experimentalGunship are
+//     isBuilder AND isFactory in the shipped assets -- so filtering on the owner's own flags with an
+//     `&&`/mutual-exclusion test hid every option such a hull had.
+inline bool buildOptionAllowed(const UnitTemplate& owner, const UnitTemplate& target, int tech) {
+    if (tech > 1 && tech > owner.techLevel) return false;
+    if (target.isBuilding) return owner.isBuilder;
+    return owner.isFactory;
+}
 // --unusedkeys: after each .ini is parsed, log every key the template builder never asked for.
 // Those are the fragments the .ini carries but this build silently drops.
 extern bool g_iniUnusedKeyReport;
-
-// RWX's hard-coded units (UnitTypeEnum.java), which ship no .ini. Called by TemplateStore::loadAll
-// before the ini scan so a custom unit of the same name -- or an `overrideAndReplace` -- still wins.
 
 // UnitSpawnList.b():26-113, the grammar of a spawnProjectilesOn* value: "name, name*3(key = value, ...)".
 // Exposed for the harness in out/sim_main.cpp, which cannot feed it through an ini file.

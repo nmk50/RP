@@ -690,9 +690,10 @@ static std::vector<const UnitTemplate*> buildableOptions(Game& g) {
     for (auto& bo : tpl->canBuild) {
         const UnitTemplate* it = g_templates.find(ToLower(bo.unitName));
         if (!it) continue;
-        // builder lists buildings; factory lists non-buildings
-        if (tpl->isBuilder && !it->isBuilding) continue;
-        if (tpl->isFactory && it->isBuilding) continue;
+        // Whether an option shows up at all: tech hook plus placement-vs-production, decided by the
+        // target. Both roles can live on one hull (combatEngineer is builder and factory), so asking
+        // the owner's own flags with a mutual-exclusion test used to blank the whole menu.
+        if (!buildOptionAllowed(*tpl, *it, bo.tech)) continue;
         bool dup = false; for (auto* o : out) if (o->name == it->name || o == it) dup = true;
         if (!dup) out.push_back(it);
     }
@@ -1050,7 +1051,7 @@ static void resetCamera(Camera2D& cam, Game& game, int SW, int SH) {
 int main(int argc, char** argv) {
     // Optional headless-ish screenshot: `rp.exe --shot out.png [N]` renders N frames
     // (default 3) then writes the screen buffer to PNG and exits. Normal play is untouched.
-    std::string shotPath, mapOverride, testUpgrade, testWeapon;
+    std::string shotPath, mapOverride, testUpgrade, testWeapon, testBuild, testDamage;
     int shotFrame = 3;
     bool startInGame = false, startInLevels = false;
     bool checkMaps = false;
@@ -1069,6 +1070,8 @@ int main(int argc, char** argv) {
         else if (a == "--checkbuiltins") checkBuiltins = true;
         else if (a == "--unusedkeys") unusedKeys = true;
         else if (a == "--testupgrade" && i + 1 < argc) { testUpgrade = argv[++i]; }
+        else if (a == "--testbuild" && i + 1 < argc) { testBuild = argv[++i]; }
+        else if (a == "--testdamage" && i + 1 < argc) { testDamage = argv[++i]; }
         else if (a == "--testweapon" && i + 1 < argc) { testWeapon = argv[++i]; }
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
         else if (a == "--size" && i + 1 < argc) {
@@ -1158,6 +1161,37 @@ int main(int argc, char** argv) {
                      t.imageShield.c_str(), t.totalFrames, t.shieldRenderRadius,
                      (int)t.isMelee, (int)t.isBuilder, (int)t.isFixedFiring, t.targetHeight, t.targetHeightDrift,
                      cbList.c_str());
+            // What the HUD would actually list for this hull, using the same rule the UI does. An empty
+            // menu on a unit that owns canBuild entries is the symptom of the flag/tech gate going wrong.
+            if (t.isBuilder || t.isFactory) {
+                std::string vis;
+                int resolvable = 0;
+                for (const BuildOption& b : t.canBuild) {
+                    const UnitTemplate* it = g_templates.find(ToLower(b.unitName));
+                    if (!it) {
+                        // Built-in hull actions rather than templates: repair / reclaim are run by
+                        // the builder itself and setRally moves a factory's waypoint. Anything else
+                        // that does not resolve is an option the menu silently loses.
+                        std::string lo = ToLower(b.unitName);
+                        if (lo != "repair" && lo != "reclaim" && lo != "setrally" && lo != "none") {
+                            TraceLog(LOG_WARNING, "BADOPT %s -> %s (no such template)", key.c_str(), b.unitName.c_str());
+                            ++bad;
+                        }
+                        continue;
+                    }
+                    ++resolvable;
+                    if (!buildOptionAllowed(t, *it, b.tech)) continue;
+                    if (!vis.empty()) vis += ',';
+                    vis += it->name;
+                    if (b.tech > 1) vis += "@" + std::to_string(b.tech);
+                }
+                TraceLog(LOG_INFO, "MENU %s tech=%d -> %s", key.c_str(), t.techLevel,
+                         vis.empty() ? "(empty)" : vis.c_str());
+                if (vis.empty() && resolvable > 0) {
+                    TraceLog(LOG_WARNING, "BADMENU %s has %d resolvable option(s) but none usable", key.c_str(), resolvable);
+                    ++bad;
+                }
+            }
             for (size_t i = 0; i < t.projectiles.size(); ++i) {
                 const ProjectileTpl& p = t.projectiles[i];
                 TraceLog(LOG_INFO, "  proj[%zu] dmg=%.0f speed=%.2f tgt=%.2f acc=%.2f life=%d frame=%d draw=%d size=%.0f color=%08X turn=%.2f area=%.0f/%.0f flags=%d%d%d reuse=%d mwp=%d",
@@ -1278,6 +1312,87 @@ int main(int argc, char** argv) {
                  shooter.c_str(), targetName.c_str(), dmg, spd, fromProj, atTick);
         CloseWindow();
         return atTick >= 0 ? 0 : 1;
+    }
+
+    if (!testBuild.empty()) {
+        // `--testbuild <builder>,<target>` runs the player's build path end to end: pick a hull that
+        // offers the option, scan the map for a legal tile, and call orderBuild exactly as tryPlace
+        // does. This is the runtime proof that the menu gate and placement both let a player build.
+        std::string owner = testBuild, targetName = "landFactory";
+        size_t comma = testBuild.find(',');
+        if (comma != std::string::npos) { owner = testBuild.substr(0, comma); targetName = testBuild.substr(comma + 1); }
+        const UnitTemplate* to = g_templates.find(ToLower(owner));
+        const UnitTemplate* tt = g_templates.find(ToLower(targetName));
+        if (!to || !tt) {
+            TraceLog(LOG_WARNING, "testbuild: unknown template (owner=%s target=%s)", owner.c_str(), targetName.c_str());
+            CloseWindow();
+            return 1;
+        }
+        // does the menu gate even offer it?
+        bool offered = false;
+        for (const BuildOption& b : to->canBuild) {
+            const UnitTemplate* it = g_templates.find(ToLower(b.unitName));
+            if (it && ToLower(it->name) == ToLower(tt->name) && buildOptionAllowed(*to, *it, b.tech)) offered = true;
+        }
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int bid = game.spawnUnit(to->name, 0, mid);
+        game.reward(0, 100000);
+        if (!tt->isBuilding) {
+            // Production path: queue it like the HUD's produce button does, then tick until the hull
+            // pops out. Buildings go through orderBuild below instead.
+            bool queued = game.orderProduce(bid, tt->name);
+            int baseCount = 0;
+            for (auto& u : game.units) if (!u.dead && u.tpl && ToLower(u.tpl->name) == ToLower(tt->name)) ++baseCount;
+            int producedTick = -1;
+            for (int i = 0; i < 6000 && queued && producedTick < 0; ++i) {
+                game.update();
+                int now = 0;
+                for (auto& u : game.units) if (!u.dead && u.tpl && ToLower(u.tpl->name) == ToLower(tt->name)) ++now;
+                if (now > baseCount) producedTick = i;
+            }
+            TraceLog(LOG_INFO, "testbuild: %s -> %s offered=%d queued=%d produced=%d tick=%d",
+                     owner.c_str(), tt->name.c_str(), (int)offered, (int)queued,
+                     producedTick >= 0 ? 1 : 0, producedTick);
+            CloseWindow();
+            return (offered && producedTick >= 0) ? 0 : 1;
+        }
+        int builtAtX = -1, builtAtY = -1;
+        for (int y = 2; y < game.map.h - 2 && builtAtX < 0; ++y)
+            for (int x = 2; x < game.map.w - 2 && builtAtX < 0; ++x)
+                if (game.orderBuild(bid, tt->name, x, y)) { builtAtX = x; builtAtY = y; }
+        TraceLog(LOG_INFO, "testbuild: %s -> %s offered=%d placed=%d at=(%d,%d) orderBuild=%d",
+                 owner.c_str(), tt->name.c_str(), (int)offered, builtAtX >= 0 ? 1 : 0,
+                 builtAtX, builtAtY, builtAtX >= 0 ? 1 : 0);
+        CloseWindow();
+        return (offered && builtAtX >= 0) ? 0 : 1;
+    }
+
+    if (!testDamage.empty()) {
+        // `--testdamage <template>,<amount>` applies one real hit through Game::damage and reports the
+        // health delta. A hull with core.canNotBeDamaged must not move at all (CustomUnit:4744), while
+        // an ordinary one has to lose health -- that pair is the check.
+        std::string name = testDamage;
+        float amount = 100.0f;
+        size_t comma = testDamage.find(',');
+        if (comma != std::string::npos) { name = testDamage.substr(0, comma); amount = (float)atof(testDamage.c_str() + comma + 1); }
+        const UnitTemplate* tpl = g_templates.find(ToLower(name));
+        if (!tpl) {
+            TraceLog(LOG_WARNING, "testdamage: unknown template (%s)", name.c_str());
+            CloseWindow();
+            return 1;
+        }
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int id = game.spawnUnit(tpl->name, 1, mid);
+        Unit* u = game.get(id);
+        if (!u) { CloseWindow(); return 1; }
+        float before = u->hp;
+        game.damage(*u, amount, nullptr);
+        float after = u->hp;
+        TraceLog(LOG_INFO, "testdamage: %s dmg=%.0f hp=%.1f -> %.1f blocked=%d cannotBeDamaged=%d",
+                 tpl->name.c_str(), amount, before, after, (after == before) ? 1 : 0,
+                 (int)tpl->cannotBeDamaged);
+        CloseWindow();
+        return 0;
     }
 
     g_render.init();
