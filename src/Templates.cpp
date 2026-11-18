@@ -7,6 +7,8 @@
 #include <sstream>
 #include <functional>
 
+bool g_iniUnusedKeyReport = false;
+
 static std::vector<float> parseCSV(const std::string& s) {
     std::vector<float> out; std::stringstream ss(s); std::string tok;
     while (std::getline(ss, tok, ',')) { tok = Trim(tok); if (!tok.empty()) out.push_back((float)std::atof(tok.c_str())); }
@@ -135,6 +137,7 @@ static void parseBuildLinks(const IniSection& core, const std::string& prefix, s
     for (auto& kv : core.kv) {
         std::string k = ToLower(kv.first);
         if (k.rfind(lp, 0) != 0) continue;
+        core.readKeys.insert(k);   // consumed by prefix scan, not by a get()
         std::string rest = k.substr(lp.size()); // e.g. "1_name"
         size_t us = rest.find('_'); if (us == std::string::npos) continue;
         int idx = atoi(rest.substr(0, us).c_str());
@@ -547,6 +550,9 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
     std::vector<IniSection> actions;
     std::vector<bool> hiddenFlags;
     auto addAction = [&](const IniSection& sec, const std::string& name, bool hidden) {
+        // The whole section is taken over and re-read key by key on the merged action, so mark its
+        // keys here; otherwise every [action_*] fragment would look unread to --unusedkeys.
+        for (auto& kv : sec.kv) sec.readKeys.insert(ToLower(kv.first));
         for (size_t i = 0; i < actions.size(); ++i) {
             if (ToLower(actions[i].name) != name) continue;
             for (auto& kv : sec.kv) actions[i].set(kv.first, kv.second);
@@ -570,6 +576,7 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         for (auto& kv : c->kv) {
             std::string key = ToLower(kv.first);
             if (key.rfind("action_", 0) != 0) continue;
+            c->readKeys.insert(key);   // legacy action_N_key form, re-read on the merged action
             size_t end = key.find('_', 7);
             if (end == std::string::npos) continue;
             auto& sec = legacy[key.substr(7, end - 7)];
@@ -905,6 +912,7 @@ static void parseBodyAnim(const IniSection& s, const std::string& prefix, BodyAn
     for (auto& kv : s.kv) {
         std::string k = ToLower(kv.first);
         if (k.rfind(prefix, 0) != 0) continue;
+        s.readKeys.insert(k);   // prefix scan, consumed here rather than through get()
         k = k.substr(prefix.size());
         size_t sep = k.find('_');
         if (sep == std::string::npos) continue;
@@ -1710,6 +1718,19 @@ void TemplateStore::loadAll(const std::string& assetsRoot) {
                 for (size_t w = 0; w < warn.size() && w < 20; ++w) printf("varsub: %s\n", warn[w].c_str());
             }
             UnitTemplate t = buildTemplate(ini, path);
+            if (g_iniUnusedKeyReport) {
+                std::string rel = path;
+                size_t slash = rel.find("/units/");
+                if (slash != std::string::npos) rel = rel.substr(slash + 7);
+                for (const auto& sec : ini.sections) {
+                    for (const auto& kvp : sec.kv) {
+                        std::string lk = ToLower(Trim(kvp.first));
+                        if (sec.readKeys.count(lk)) continue;
+                        TraceLog(LOG_INFO, "UNUSED %s [%s] %s = %s", rel.c_str(),
+                                 sec.name.c_str(), kvp.first.c_str(), kvp.second.c_str());
+                    }
+                }
+            }
             if (t.name.empty()) continue;
             byName[ToLower(t.name)] = t;
             order.push_back(ToLower(t.name));

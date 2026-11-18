@@ -1055,6 +1055,7 @@ int main(int argc, char** argv) {
     bool startInGame = false, startInLevels = false;
     bool checkMaps = false;
     bool checkBuiltins = false;
+    bool unusedKeys = false;
     // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
     // exists for the screenshot harness and for testing smaller windows.
     int winW = 1920, winH = 1080;
@@ -1066,6 +1067,7 @@ int main(int argc, char** argv) {
         else if (a == "--levels") startInLevels = true;
         else if (a == "--checkmaps") checkMaps = true;
         else if (a == "--checkbuiltins") checkBuiltins = true;
+        else if (a == "--unusedkeys") unusedKeys = true;
         else if (a == "--testupgrade" && i + 1 < argc) { testUpgrade = argv[++i]; }
         else if (a == "--testweapon" && i + 1 < argc) { testWeapon = argv[++i]; }
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
@@ -1120,6 +1122,7 @@ int main(int argc, char** argv) {
     }
     std::string currentMapRel = mapOverride.empty() ? MAP_REL : mapOverride;
     TraceLog(LOG_INFO, "Loading unit templates...");
+    g_iniUnusedKeyReport = unusedKeys;
     g_templates.loadAll(g_assetsRoot);
     TraceLog(LOG_INFO, TextFormat("Loaded %zu unit templates", g_templates.order.size()));
 
@@ -1188,6 +1191,13 @@ int main(int argc, char** argv) {
             }
         }
         TraceLog(LOG_INFO, "checkbuiltins: %d row(s), %d bad reference(s)", rows, bad);
+        CloseWindow();
+        return 0;
+    }
+
+    if (unusedKeys) {
+        // The UNUSED rows were already emitted while each .ini was parsed; nothing more to do.
+        TraceLog(LOG_INFO, "unusedkeys: done");
         CloseWindow();
         return 0;
     }

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <fstream>
 #include <sstream>
 #include "Common.h"
@@ -13,6 +14,10 @@ struct IniSection {
     std::vector<std::pair<std::string, std::string>> kv; // preserves order, allows override tracking
     std::map<std::string, std::string> idx;              // lowercased key -> value
 
+    // Keys the template builder actually asked for. Anything present in idx but absent here was
+    // written by the .ini and silently dropped -- the --unusedkeys gate reports those.
+    mutable std::set<std::string> readKeys;
+
     void set(const std::string& k, const std::string& v) {
         std::string lk = ToLower(k);
         idx[lk] = v;
@@ -20,16 +25,21 @@ struct IniSection {
         for (auto& p : kv) if (ToLower(p.first) == lk) { p.second = v; return; }
         kv.push_back({ k, v });
     }
-    bool has(const std::string& k) const { return idx.count(ToLower(k)) > 0; }
+    bool has(const std::string& k) const {
+        std::string lk = ToLower(k); readKeys.insert(lk); return idx.count(lk) > 0;
+    }
     std::string get(const std::string& k, const std::string& def = "") const {
-        auto it = idx.find(ToLower(k)); return it == idx.end() ? def : it->second;
+        std::string lk = ToLower(k); readKeys.insert(lk);
+        auto it = idx.find(lk); return it == idx.end() ? def : it->second;
     }
     double getNum(const std::string& k, double def = 0) const {
-        auto it = idx.find(ToLower(k)); if (it == idx.end()) return def;
+        std::string lk = ToLower(k); readKeys.insert(lk);
+        auto it = idx.find(lk); if (it == idx.end()) return def;
         try { return std::stod(it->second); } catch (...) { return def; }
     }
     bool getBool(const std::string& k, bool def = false) const {
-        auto it = idx.find(ToLower(k)); if (it == idx.end()) return def;
+        std::string lk = ToLower(k); readKeys.insert(lk);
+        auto it = idx.find(lk); if (it == idx.end()) return def;
         std::string v = ToLower(Trim(it->second));
         return v == "true" || v == "1" || v == "yes";
     }

@@ -932,6 +932,9 @@ public:
 };
 
 extern TemplateStore g_templates;
+// --unusedkeys: after each .ini is parsed, log every key the template builder never asked for.
+// Those are the fragments the .ini carries but this build silently drops.
+extern bool g_iniUnusedKeyReport;
 
 // RWX's hard-coded units (UnitTypeEnum.java), which ship no .ini. Called by TemplateStore::loadAll
 // before the ini scan so a custom unit of the same name -- or an `overrideAndReplace` -- still wins.
