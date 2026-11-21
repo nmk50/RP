@@ -102,7 +102,7 @@ static UnloadCond parseUnloadCond(const std::string& raw) {
     std::string s = ToLower(Trim(raw));
     if (s.rfind("if ", 0) == 0) s = Trim(s.substr(3));
     if (s.empty()) {
-        out.tests = { { CondPred::overLiquid, true }, { CondPred::moving, true } };
+        out.tests = { { CondPred::overLiquid, true, 0 }, { CondPred::moving, true, 0 } };
         return out;
     }
     if (s == "false") { out.never = true; return out; }
@@ -124,9 +124,17 @@ static void parseCondAtoms(const std::string& raw, UnloadCond& out) {
         at = (nxt == std::string::npos) ? s.size() + 1 : nxt + 5;
         if (part.empty()) continue;
         bool neg = part.rfind("not ", 0) == 0 || part.find(" not ") != std::string::npos;
-        if (part.find("isoverliquid") != std::string::npos) out.tests.push_back({ CondPred::overLiquid, neg });
-        else if (part.find("overwater") != std::string::npos) out.tests.push_back({ CondPred::overWater, neg });
-        else if (part.find("ismoving") != std::string::npos) out.tests.push_back({ CondPred::moving, neg });
+        if (part.find("isoverliquid") != std::string::npos) out.tests.push_back({ CondPred::overLiquid, neg, 0 });
+        else if (part.find("overwater") != std::string::npos) out.tests.push_back({ CondPred::overWater, neg, 0 });
+        else if (part.find("ismoving") != std::string::npos) out.tests.push_back({ CondPred::moving, neg, 0 });
+        // self.timeAlive(laterThanSeconds=10) -- the flare's own removal. Also written as
+        // self.timeAlive() in an arithmetic expression, which is not a test and parses to a threshold
+        // of 0, i.e. "alive at all"; those callers use it for a timer, not a gate.
+        else if (part.find("timealive") != std::string::npos) {
+            size_t eq = part.find("laterthanseconds=");
+            float secs = eq == std::string::npos ? 0.0f : (float)atof(part.c_str() + eq + 17);
+            out.tests.push_back({ CondPred::timeAlive, neg, secs });
+        }
         // an atom RP does not know is not evaluated, so it cannot fail either
     }
 }
@@ -549,9 +557,14 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         if (sn.rfind("canbuild_", 0) == 0) {
             // `reclaim` is the built-in ReclaimTargetAction, which RP already shows for canReclaimResources.
             int tech = (int)sec.getNum("tech", 1);   // CustomUnitConfigParser:2562
-            for (auto& name : splitNames(sec.get("name")))
-                if (ToLower(name) != "none" && ToLower(name) != "reclaim")
-                    t.canBuild.push_back({name, (float)sec.getNum("pos", 1), sec.get("isvisible"), sec.getBool("forcenano", false), tech});
+            for (auto& name : splitNames(sec.get("name"))) {
+                std::string lo = ToLower(name);
+                // `NULL` is the mech factories' placeholder for a body-part slot (mech_large_common and
+                // friends are dont_load fragments). It is not a unit, so it must not become an option --
+                // it only ever resolved before because RP registered a template literally named `null`.
+                if (lo == "none" || lo == "reclaim" || lo == "null") continue;
+                t.canBuild.push_back({name, (float)sec.getNum("pos", 1), sec.get("isvisible"), sec.getBool("forcenano", false), tech});
+            }
         }
     }
     // hiddenAction_X first so a derived file's action_X (nautilusLand's trigger_onLand) overrides the keys
@@ -600,14 +613,16 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         a.name = s.name;
         a.convertTo = Trim(s.get("convertto"));
         a.text = s.get("text"); a.textUnit = s.get("textaddunitname"); a.textPostfix = s.get("textpostfix");
-        // price is a number or a resource list, `credits=250, energy=1`; only credits is a resource RP has
+        // price is a UnitPrice: either a bare number (credits) or a resource list, `credits=250, ammo=1`.
+        // Everything goes into priceCost so the pools are actually charged; `price` keeps the credits part
+        // because that is what the build-menu affordability check already reads.
         std::string price = ToLower(Trim(s.get("price")));
-        if (price.find('=') == std::string::npos) a.price = (float)atof(price.c_str());
-        else for (auto& part : splitNames(price)) {
-            size_t eq = part.find('=');
-            std::string k = Trim(part.substr(0, eq));
-            if (k == "credits") a.price = (float)atof(part.c_str() + eq + 1);
-            else a.supported = false;
+        if (price.find('=') == std::string::npos && price.find(':') == std::string::npos) {
+            a.price = (float)atof(price.c_str());
+            a.priceCost.credits = a.price;
+        } else {
+            a.priceCost = parseResourceCost(price);
+            a.price = a.priceCost.credits;
         }
         a.buildSpeed = perTickRate(s, "buildspeed", 0.001f);
         if (Trim(s.get("buildspeed")) == "0s" || a.buildSpeed == 0) a.buildSpeed = 1.0e9f;
@@ -625,7 +640,14 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
         }
         a.events = ToLower(s.get("autotriggeronevent")); a.tags = ToLower(s.get("tags"));
         a.addResources = s.get("addresources"); a.setStats = s.get("setunitstats");
-        if (ToLower(a.addResources).find("ammo") != std::string::npos) a.supported = false;
+        // `resourceAmount : <pool>` plus `resourceAmount_setValue : <n>` sets a pool outright; it is not
+        // the additive addResources spelling, and `IGNORE` in either slot means "no-op".
+        a.resourceAmount = ToLower(Trim(s.get("resourceamount")));
+        if (a.resourceAmount == "ignore") a.resourceAmount.clear();
+        if (s.has("resourceamount_setvalue")) {
+            std::string v = ToLower(Trim(s.get("resourceamount_setvalue")));
+            if (v != "ignore") { a.resourceAmountValue = (float)atof(v.c_str()); a.hasResourceAmountValue = true; }
+        }
         a.setBuilt = (float)s.getNum("setbuilt", -1);
         a.addEnergy = (float)s.getNum("addenergy", 0);
         a.triggerActions = ToLower(s.get("alsotriggeraction")); a.queueActions = ToLower(s.get("alsoqueueaction"));
@@ -645,8 +667,15 @@ static void parseRuntimeSections(IniFile& ini, UnitTemplate& t) {
                 a.parentShield = -(float)atof(take.c_str() + 7);
             else a.supported = false;
         }
-        for (const char* key : {"fireturretxatground", "teleportto", "sendmessagewithdata", "alsotriggerorqueueactionwithtarget",
-                                "spawnunits", "attachments_addnewunits", "deleteself", "resourceamount", "setresourceswithlogic"})
+        // fireTurretXAtGround is a targeted shot, not an unsupported key: the action arms a ground pick
+        // and Game::runActionAt fires that barrel at the chosen point (Game::fire already takes one).
+        a.fireAtGround = ToLower(Trim(s.get("fireturretxatground")));
+        a.fireAtGroundDecal = ToLower(Trim(s.get("fireturretxatground_showguidedecals")));
+        a.deleteSelf = s.getBool("deleteself", false);
+        // Still genuinely unmodelled: teleporting, spawning units, adding attachments on the fly and
+        // data-carrying messages. Those keep the flag so the auto-trigger path can skip them.
+        for (const char* key : {"teleportto", "sendmessagewithdata", "alsotriggerorqueueactionwithtarget",
+                                "spawnunits", "attachments_addnewunits", "setresourceswithlogic"})
             if (s.has(key)) a.supported = false;
         if (a.text.empty() || a.text.rfind("i:", 0) == 0) {
             size_t n = 0;
@@ -1154,6 +1183,10 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
         t.turretImageScale = (float)g->getNum("turretimagescale", 1);
         t.imageShadow = g->get("image_shadow");
         t.imageShield = g->get("image_shield");
+        // CustomUnitConfigParser.java:1586 -- [graphics] whenBeingBuiltMakeTransparentTill, the
+        // buildProgress below which the hull is still painted light green (OrderableUnit.getRenderPaint
+        // :4300-4303). Default 1, i.e. green for the whole build.
+        t.builtTransparentTill = (float)g->getNum("whenbeingbuiltmaketransparenttill", 1.0f);
         t.showShieldBar = g->getBool("showshieldbar", true);
         t.showEnergyBar = g->getBool("showenergybar", true);
         // :1953 the cargo bar over a transport, on by default
@@ -1542,12 +1575,13 @@ static UnitTemplate buildTemplate(IniFile& ini, const std::string& iniPath) {
             visiting[i] = 1;
             const IniSection& s = *tsec[i];
             TurretTpl tt;
+            tt.name = ToLower(Trim(s.name.substr(7)));   // [turret_<name>] suffix, for convertTo state matching
             bool copied = false;
             if (s.has("copyfrom")) {
                 auto it = turIdx.find(ToLower(Trim(s.get("copyfrom"))));
                 if (it != turIdx.end() && it->second != i) {
                     parseTurret(it->second);            // RWX resolves a forward reference too
-                    if (done[it->second]) { tt = arr[it->second]; copied = true; }
+                    if (done[it->second]) { tt = arr[it->second]; tt.name = ToLower(Trim(s.name.substr(7))); copied = true; }
                 }
             }
             if (!copied) {                             // [attack] defaults, not inherited by a copy
@@ -1790,7 +1824,15 @@ void TemplateStore::loadAll(const std::string& assetsRoot) {
     auto loadIni = [&](const std::string& path) {
         IniFile ini;
         if (!ParseIni(path, ini)) return;
-        if (!ini.find("core")) return;
+        const IniSection* core = ini.find("core");
+        if (!core) return;
+        // CustomUnitConfigParser.java:1184 -- a file that says `[core] dont_load : true` is a fragment
+        // other configs copyFrom, not a unit. RWX returns null before building the config, so the mech
+        // body parts (mech_large_common / mech_med_common / mechs_small_common, all named NULL), the
+        // faction picker example and the editor's test_tank never reach the template list. Loading them
+        // registered a literal `null` unit, which then satisfied mechFactory's `NULL:5` build option, and
+        // gave --checkbuiltins a template whose action points at a unit that does not exist.
+        if (core->getBool("dont_load", false)) return;
         applyCopyFrom(ini, path, 0);
         applyCopyFromSections(ini);
         // CustomUnitConfigParser.java:1220 - ${...} is resolved on the merged file before any key is

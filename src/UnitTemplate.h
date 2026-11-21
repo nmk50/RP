@@ -24,10 +24,17 @@ enum class UnitSize { Unknown, VerySmall, Small, Normal, Large, LargeUnit, Build
 // `if not self.isOverLiquid() and not self.isMoving()` (logic_notOverLiquidAndNotMoving,
 // CustomUnitConfig.java:754). RP reads those atoms into a test list instead of carrying a logic-boolean
 // VM; a predicate it does not know is kept as always-true, since RWX would have rejected the ini outright.
-enum class CondPred { overLiquid, overWater, moving };
+enum class CondPred { overLiquid, overWater, moving, timeAlive };
+// One atom of a LogicBoolean list. `arg` carries the atom's parameter -- only timeAlive has one
+// (`self.timeAlive(laterThanSeconds=N)`, the 10 s flare's self-remove).
+struct CondTest {
+    CondPred pred = CondPred::moving;
+    bool negated = false;
+    float arg = 0;
+};
 struct UnloadCond {
     bool never = false;
-    std::vector<std::pair<CondPred, bool>> tests;   // predicate, negated -- all of them must hold
+    std::vector<CondTest> tests;   // predicate, negated -- all of them must hold
 };
 
 // A [effect_NAME] section: RWX EffectTemplate (game/units/custom/EffectTemplate.java). Every member
@@ -140,6 +147,7 @@ struct ResourceCost {
 };
 
 struct TurretTpl {
+    std::string name;         // the [turret_<name>] suffix; RWX matches movementLevels by this on convert
     float x = 0, y = 0;
     // RWX [turret_N]: size/barrelY = muzzle distance along the aim (defaults to [attack] turretSize),
     // barrelX = lateral offset, image_drawOffsetX/Y = turret sprite shift relative to the pivot.
@@ -553,6 +561,21 @@ struct UnitAction {
     std::string messageTo, messageTags, playAnimation;
     std::vector<FlameSpec> effects;
     float price = 0, buildSpeed = 0.001f, pos = 0;
+    // `price : ammo=1` is a UnitPrice, not a number: the nuke launcher pays its shot out of the ammo
+    // pool it fills with [action_buildNuke], and the anti-nuke launchers do the same. RP used to read
+    // only the credits part and mark everything else unsupported, which made those actions free.
+    // `price` above stays the credits portion so the existing affordability path keeps working.
+    ResourceCost priceCost;
+    // `fireTurretXAtGround : <turret>` -- the action is a targeted shot: the player picks a point and
+    // that barrel fires at it (nuke_launcher's siloTop, the modular spider's artillery, ...).
+    std::string fireAtGround, fireAtGroundDecal;
+    // `deleteSelf : true` -- the hull is consumed by the action (the 10 s flare).
+    bool deleteSelf = false;
+    // `resourceAmount : energy` + `resourceAmount_setValue : 6` -- not an addition, a *set*: the AA beam
+    // gunship's afterburn refills its energy pool to 6 when it switches back. `IGNORE` turns it off.
+    std::string resourceAmount;
+    float resourceAmountValue = 0;
+    bool hasResourceAmountValue = false;
     float setBuilt = -1, cooldown = 0, allCooldown = 0, addEnergy = 0;
     float parentShield = 0;
     int checkRate = 1;
@@ -768,6 +791,10 @@ struct UnitTemplate {
     bool hideScorchMark = false;
 
     float imageScale = 1, turretImageScale = 1;
+    // [graphics] whenBeingBuiltMakeTransparentTill (CustomUnitConfigParser.java:1586, default 1): the
+    // buildProgress below which the hull is still painted light green. CustomUnit.getPathStepScale
+    // :3600-3602 answers this, and OrderableUnit.getRenderPaint:4300-4303 is the reader.
+    float builtTransparentTill = 1.0f;
     int totalFrames = 1;
     // [graphics] default_frame (CustomUnitConfigParser.java:1311) is the frame the hull reverts to
     // whenever no frame animation is playing -- CustomUnitAnimationController.b(true):262 uses it as the

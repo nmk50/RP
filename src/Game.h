@@ -73,6 +73,8 @@ struct Unit {
     // RWX BaseUnit.shield / unitEnergyMax / unitShieldMax: the bubble, its capacity and the white
     // deflection flash it accumulates when a hit is soaked up.
     float shield = 0, shieldMax = 0, shieldFlash = 0;
+    // RWX UnitStats.shieldRegen is carried across convertTo, so regen lives on the unit too.
+    float shieldRegen = 0.25f;
     // RWX BaseUnit.currentEnergy plus the CustomUnit.v latch (:1353): once a shot has spent the pool
     // below what the next one costs, energyNeedsToRechargeToFull keeps the barrels locked until the
     // pool is whole again.
@@ -102,10 +104,18 @@ struct Unit {
     // the order a target that is already more than half gone -- a site under 50% built, a hull under 50% hp
     // -- is left alone, so a builder never finishes off something that was nearly lost anyway.
     int nanoOrderAge = 0;
+    // RWX BuilderUnit.targetPriorityPoints / .unitRenderPoints (BuilderUnit:29-32): six anchors that
+    // chase a jittered spot inside the repair/reclaim target (updateTargetPriorityPoints:157-192), and
+    // the nano tether lines run from the builder's nano muzzle to each one
+    // (drawTargetPriorityPoints:206-236). They live on the unit so the sway survives between frames.
+    Vec2 nanoPoints[6];
+    Vec2 nanoRenders[6];
     std::vector<std::string> prodQueue;
     float prodProgress = 0;
     bool underConstruction = false;
-    float buildProgress = 0; // 0..1 for buildings being constructed
+    // BaseUnit.java:386 -- a hull is born finished; only a placed building starts at 0 and climbs to 1
+    // (OrderableUnit:2301). The under-construction paint keys off this, so the default must be 1.
+    float buildProgress = 1.0f; // 0..1 for buildings being constructed
     Vec2 rallyPoint; bool hasRally = false;
     // RWX attachment / action runtime: slot child links, flag bits, named resources and cooldowns.
     int parentId = -1, attachmentSlot = -1;
@@ -200,6 +210,9 @@ struct Unit {
     // CustomUnit.update:1981-1984 -- `s`, the ticks since the hull last moved. [movement] landOnGround
     // waits for it to pass 3 before letting an AIR hull settle down (see UnitTemplate::landOnGround).
     float idleTime = 0;
+    // Ticks since spawn. RWX reads the same clock through `self.timeAlive(...)`, which is how the 10 s
+    // flare deletes itself; it is a plain counter rather than a timestamp so a paused game freezes it.
+    float age = 0;
     float movementEffectTimer = 0, splashEffectTimer = 0;
     // AutoRepairRenderHook.b's `customUnit.u`: [core] autoRepair counts up whether the hull is busy or
     // not, and only zeroes itself on the tick it actually spends the search, so a hull that was ordered
@@ -472,6 +485,23 @@ struct Particle {
     bool dead = false;
 };
 
+// Build blueprint: the marker shown after a build order is given, while the builder walks to the
+// site (RWX gameFramework/effects/BuildPreview.java). It is NOT the mouse-follow placement ghost.
+// The blue foundation outline + translucent ghost fade in, then vanish once the builder arrives and
+// the under-construction hull (with its own green buildProgress paint) takes over.
+struct Blueprint {
+    const UnitTemplate* tpl = nullptr;
+    Vec2 pos;                 // world coords of the ordered build site
+    int builderId = -1;       // first controllable selected unit that received the order
+    int targetId = -1;        // the under-construction unit spawned for this site (RP equivalent of a waypoint)
+    int team = 0;
+    float fade = 1.15f;       // fadeInProgress: 1 + 0.15*queueIndex, decays 0.04/tick (BuildPreview:108,236)
+    float lifeTimer = 0;      // ticks since creation; expires at 180 (BuildPreview:244)
+    float timer = 0;          // 6-tick validity recheck counter (BuildPreview:238)
+    bool wasEverPlaceable = false;
+    bool dead = false;
+};
+
 // RWX ScorchMark: a permanent ground decal left by an exploding unit — blood_mark.png is a row of
 // four 50x40 cells and the mark picks one of them at random.
 struct Scorch { Vec2 pos; int variant = 0; };
@@ -486,6 +516,9 @@ struct Team {
     float credits = 0;
     bool isPlayer = false;
     bool alive = true;
+    // PlayerTeam.allyGroup from the map's `team_N_info` object. Equal values are allies; -1 means the
+    // map said nothing, which keeps the old "everyone else is an enemy" behaviour.
+    int allyGroup = -1;
 };
 
 class Game {
@@ -503,6 +536,7 @@ public:
     // shoot_flame spawn list puts on screen (EffectManager.createEffectWithTemplateInternal). Kept apart
     // from `effects`, which is the explosion/puff pool.
     std::vector<Fx> fx;
+    std::vector<Blueprint> blueprints;  // pending build sites (RWX BuildPreview.activePreviews)
     std::vector<Particle> particles;
     std::vector<Scorch> scorches;   // permanent ground decals, drawn with the map
     std::vector<Wreck> wrecks;      // dead units that left an image_wreak behind
@@ -536,9 +570,14 @@ public:
     // (GameUI.handleUnitTargetClick:2700-2726 -> issueReclaimCommand).
     bool orderReclaim(int builderId, int targetId);
     void orderStop(std::vector<int> ids);
-    bool orderBuild(int builderId, const std::string& unitName, int tx, int ty);
+    bool orderBuild(int builderId, const std::string& unitName, int tx, int ty, float facing = -3.14159265f / 2.0f);
+    void updateBlueprints();   // RWX BuildPreview.updateAll
     bool orderProduce(int factoryId, const std::string& unitName);
     bool orderUpgrade(int unitId, int actionIdx);
+    // fireTurretXAtGround: the action is aimed, not instant -- the player picks a world point and the
+    // named barrel fires at it. Returns false when the hull has no such action, cannot pay, or the
+    // action names a turret it does not own.
+    bool runActionAt(int unitId, const std::string& actionName, Vec2 point);
     double logicNumber(const Unit& u, const std::string& expression) const;
     bool logicCondition(const Unit& u, const std::string& expression, bool fallback = true) const;
     const Unit* logicUnit(const Unit& u, const std::string& expression) const;
@@ -572,7 +611,17 @@ public:
     int  spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underConstruction = false);
 
     // helpers
-    bool isEnemy(int a, int b) const { return a != b; }
+    // PlayerTeam.isAllied: the map's `team_N_info` objects carry an allyGroup, and every team in the same
+    // group fights together (1v3 Island puts teams 1/2/4 in group 1 against the player). A team the map
+    // says nothing about keeps group -1, and two -1's are NOT allies -- that is "unspecified", not "all
+    // friends", which is what keeps ordinary free-for-all maps working.
+    bool isEnemy(int a, int b) const {
+        if (a == b) return false;
+        const Team* ta = nullptr; const Team* tb = nullptr;
+        for (const auto& t : teams) { if (t.id == a) ta = &t; else if (t.id == b) tb = &t; }
+        if (ta && tb && ta->allyGroup >= 0 && ta->allyGroup == tb->allyGroup) return false;
+        return true;
+    }
     Vec2 nearestEnemyPos(int team);
     int playerTeam() const { return 0; }
 

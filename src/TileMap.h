@@ -35,6 +35,23 @@ struct SpawnPoint {
     int tx = 0, ty = 0;
 };
 
+// The `Triggers` object layer. It is not decoration: RWX reads it before the units and it carries the
+// rules of the map -- what kind of game it is, who is allied to whom, how much money everyone starts
+// with, how the map ends and which fog mode it wants. 84 of the 85 shipped maps have one.
+struct MapInfo {
+    bool present = false;
+    std::string type;          // skirmish / mission / challenge / survival
+    std::string winCondition;  // mainBuilings / none / requiredObjectives (absent = last unit standing)
+    std::string loseCondition;
+    std::string fog;           // map / los / none (absent = the game default)
+    std::string introText;
+};
+struct MapTeamInfo {
+    int team = -1;
+    int allyGroup = -1;    // -1 = not specified; equal values are allied (PlayerTeam.allyGroup)
+    float credits = -1.0f; // -1 = not specified
+};
+
 // RWX Tileset: image is resolved by basename from tilesets/bitmaps/<imageKey>; the atlas is a grid of
 // tileWidth x tileHeight cells with stride = tile + spacing. columns is derived from the loaded bitmap
 // width at draw time (Tileset.initTextureMetrics), not from the .tsx columns attribute.
@@ -65,6 +82,12 @@ public:
     std::vector<SpawnPoint> spawns;
     std::string name;
 
+    // `Triggers` object layer (see MapInfo / MapTeamInfo above).
+    MapInfo info;
+    std::vector<MapTeamInfo> teamInfos;
+    bool hasCameraStart = false;
+    Vec2 cameraStart;
+
     // Terrain imagery (RWX Tileset / MapLayer). Empty for procedural maps -> renderer falls back to
     // flat terrain colors. Gameplay classification above is independent of these.
     std::vector<TilesetRender> tilesets;
@@ -94,6 +117,24 @@ public:
         return !(t.water || t.lava || t.blocked) && !occupied(x, y);
     }
     bool walkableAir(int x, int y) const { return inBounds(x, y); }
+    // PathCostMap.d:320-343. RWX builds the per-movement-type blocking mask from three booleans:
+    //   z  = WATER || HOVER || OVER_CLIFF_WATER   -> may enter water
+    //   z2 = HOVER || OVER_CLIFF || OVER_CLIFF_WATER -> may enter cliff
+    //   z3 = OVER_CLIFF || OVER_CLIFF_WATER       -> may enter a large object
+    // lava blocks every movement type, and only WATER additionally requires water underneath.
+    // HOVER is the easy one to get wrong: it crosses water and cliffs but NOT a large rock or lava, and
+    // it is not an air unit -- it still collides with building occupancy.
+    bool walkableHover(int x, int y) const {
+        if (!inBounds(x, y)) return false;
+        const MapTile& t = tiles[y * w + x];
+        return !t.lava && !t.largeObject && !occupied(x, y);
+    }
+    // OVER_CLIFF: z2 and z3 on, z off -- climbs cliff and large rock, but cannot swim.
+    bool walkableOverCliff(int x, int y) const {
+        if (!inBounds(x, y)) return false;
+        const MapTile& t = tiles[y * w + x];
+        return !t.water && !t.lava && !occupied(x, y);
+    }
     // RWX PathCostMap.d:320-337 -- OVER_CLIFF_WATER crosses water, cliff and large rock (z, z2, z3 all
     // true); only lava and building occupancy still stop it.
     bool walkableAmphibious(int x, int y) const {
@@ -101,10 +142,11 @@ public:
         const MapTile& t = tiles[y * w + x];
         return !t.lava && !occupied(x, y);
     }
+    // z only: water yes, cliff / large object / lava no, and the tile has to actually be water.
     bool walkableWater(int x, int y) const {
         if (!inBounds(x, y)) return false;
         const MapTile& t = tiles[y * w + x];
-        return t.water || t.waterBridge;
+        return (t.water || t.waterBridge) && !t.cliff && !t.largeObject && !t.lava;
     }
     bool canPlaceBuilding(int x, int y) const {
         if (!inBounds(x, y)) return false;

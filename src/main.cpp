@@ -69,18 +69,64 @@ struct UI {
     std::string placingName;
     Vec2 placingWorld;
     bool placingValid = false;
+    float placeFacing = -3.14159265f / 2.0f;  // RWX buildingRotation: rotated by R while placing
     // selection drag
     bool dragging = false;
     Vector2 dragA, dragB;
     // RWX ActionType.reclaimTarget pick mode (GameUI:1934-1955): the builder action bar arms it and the next
     // map click issues the command.
     bool reclaimPick = false;
+    // fireTurretXAtGround pick mode: the action's name while the next map click should become its target
+    // point (nuke launcher, modular spider artillery). Empty means nothing is armed.
+    std::string groundPick;
     // command marker anim
     bool markerOn = false; Vector2 markerPos; float markerT = 0;
     // HUD tooltip text set while hovering the UnitInfo button (GameUI.drawActionTooltip).
     std::string hudTip;
 };
 static UI ui;
+
+// Control groups (RWX gameFramework/ui/UnitGroupMarker.java + InputController:131-166).
+// 10 slots; 10th is bound to the 0 key. Ctrl+N replaces the slot with the current selection,
+// N selects the group, Shift+N adds it, and a second N within 700 ms centres the view on it.
+struct ControlGroup {
+    std::vector<int> ids;   // unit ids (dead ones are pruned on use)
+    double lastSelect = 0;  // RWX UnitGroupMarker.c, milliseconds, for double-tap focus
+};
+static ControlGroup g_groups[10];
+
+static void groupClear(int n) { g_groups[n].ids.clear(); }
+static void groupCapture(Game& g, int n) {
+    // UnitGroupMarker.c(): every selected, alive OrderableUnit. RP has no transport-hold flag on the
+    // group path, so `selected && !dead` is the equivalent.
+    groupClear(n);
+    for (auto& u : g.units)
+        if (u.selected && !u.dead) g_groups[n].ids.push_back(u.id);
+}
+static void groupPrune(Game& g, int n) {
+    auto& v = g_groups[n].ids;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](int id) {
+        Unit* u = g.get(id);
+        return !u || u->dead;
+    }), v.end());
+}
+static void groupSelect(Game& g, int n, bool additive, Camera2D& cam) {
+    groupPrune(g, n);
+    if (!additive) for (auto& u : g.units) u.selected = false;
+    Unit* last = nullptr;
+    for (int id : g_groups[n].ids) {
+        Unit* u = g.get(id);
+        if (u && !u->dead && g.visibleToPlayer(*u)) { u->selected = true; last = u; }
+    }
+    double now = GetTime() * 1000.0;
+    // UnitGroupMarker.a(): a second press within 700 ms centres the view on the last live member.
+    if (!additive && last && g_groups[n].lastSelect > 0 && now - g_groups[n].lastSelect < 700.0) {
+        cam.target = Vector2{ last->pos.x, last->pos.y };
+    }
+    if (!additive) g_groups[n].lastSelect = now;
+}
+// --placedemo: keeps the build preview pinned for a screenshot instead of tracking the mouse.
+static bool g_placeDemo = false;
 
 // ---------------------------------------------------------------------------
 // Main menu. Mirrors RWX's kotlin MainMenuSceneHost (core/.../io/github/rwx/ui/host/
@@ -1358,7 +1404,7 @@ static void renderHUD(Game& g, Camera2D& cam) {
 
     // ---- command grid inside the sidebar: two compact columns ----
     std::string detailTip;
-    struct PBtn { bool upgrade; bool reclaim = false; bool selType = false; int info = 0; std::string label; float price; std::string key; };
+    struct PBtn { bool upgrade; bool reclaim = false; bool selType = false; int info = 0; std::string label; float price; std::string key; std::string actionName; bool aimed = false; };
     std::vector<PBtn> btns;
     // GameUI.setupInterfaceFlags:610-615 -- bO is true on PC, and SettingsEngine:188
     // defaults showSelectedUnitsList to true, so every selection prepends one
@@ -1459,9 +1505,15 @@ static void renderHUD(Game& g, Camera2D& cam) {
         if (s->team != g.playerTeam() || !s->tpl) continue;
         if (s->tpl->canReclaimResources) anyReclaimer = true;
         for (auto& a : s->tpl->actions) {
+            // One button per action, keyed by the action's name. Keying by convertTo collapsed every
+            // action that does not convert (the nuke launcher's launchNuke/buildNuke pair, the aimed
+            // shots) into a single button.
             bool dup = false;
-            for (auto& o : btns) if (o.upgrade && o.key == a.convertTo) dup = true;
-            if (!dup) btns.push_back({ true, false, false, 0, a.text, a.price, a.convertTo });
+            for (auto& o : btns) if (o.upgrade && o.actionName == a.name) dup = true;
+            if (!dup) {
+                PBtn nb{ true, false, false, 0, a.text, a.price, a.convertTo, a.name, !a.fireAtGround.empty() };
+                btns.push_back(nb);
+            }
         }
     }
     if (anyReclaimer) btns.push_back({ false, true, false, 0, "Reclaim", 0, "" });
@@ -1488,6 +1540,17 @@ static void renderHUD(Game& g, Camera2D& cam) {
         bool afford = b.selType || b.info > 0 || (me && me->credits >= b.price);
         DrawRectangleRec(btn, hover ? Color{ 58, 58, 62, 255 } : Color{ 34, 34, 38, 255 });
         DrawRectangleLinesEx(btn, 1, afford ? Color{ 90, 90, 95, 255 } : Color{ 60, 50, 50, 255 });
+        // Active build item (RWX GameInterfaceRenderer:1688 b6 -> paintUnitInfo.a(155,255,255,255)):
+        // the command whose place-building mode is armed gets a bright highlight. PlaceBuildingAction
+        // also reports isGuiBlinking()==true (:171-173), so the highlight breathes until placed.
+        bool placingThis = ui.placing && !b.selType && b.info == 0 && !b.upgrade && !b.reclaim &&
+                           ToLower(b.key) == ToLower(ui.placingName);
+        if (placingThis) {
+            float pulse = 0.5f + 0.5f * std::sin((float)GetTime() * 5.0f);
+            uint8_t hi = (uint8_t)(175 + 80 * pulse);
+            DrawRectangleLinesEx(btn, 2 * k, Color{ 155, 255, 255, hi });
+            DrawRectangleRec(btn, Color{ 60, 90, 90, (uint8_t)(30 + 25 * pulse) });
+        }
 
         Texture2D icon{};
         bool drew = false;
@@ -1617,17 +1680,21 @@ static void renderHUD(Game& g, Camera2D& cam) {
                 }
                 if (!changed) continue;
             }
-            else if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; }
+            else if (b.reclaim) { ui.reclaimPick = true; ui.placing = false; ui.groundPick.clear(); }
             else if (b.upgrade) {
-                for (auto* u : sel) {
+                // An aimed action (fireTurretXAtGround) does not run on the click: it arms the next map
+                // click as its target point. Everything else goes straight through orderUpgrade.
+                if (b.aimed) { ui.groundPick = b.actionName; ui.placing = false; ui.reclaimPick = false; }
+                else for (auto* u : sel) {
                     if (!u->tpl) continue;
                     for (size_t k = 0; k < u->tpl->actions.size(); ++k)
-                        if (ToLower(u->tpl->actions[k].convertTo) == ToLower(b.key)) {
+                        if (ToLower(u->tpl->actions[k].name) == ToLower(b.actionName)) {
                             g.orderUpgrade(u->id, (int)k); break;
                         }
                 }
             } else if (g_templates.find(ToLower(b.key)) && g_templates.find(ToLower(b.key))->isBuilding) {
                 ui.placing = true; ui.placingName = b.key;
+                ui.placeFacing = -3.14159265f / 2.0f;  // reset rotation for each new build item
             } else {
                 int reps = 1;
                 if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) reps = 5;
@@ -1666,6 +1733,32 @@ static void renderHUD(Game& g, Camera2D& cam) {
     // GameInterfaceRenderer:2030-2051; the selected-unit UI is the Name xN buttons
     // prepended to the grid above.
 
+    // Control group slots, bottom of the sidebar (RWX GameInterfaceRenderer:2578-2630). Each slot
+    // shows its member count; the digit label is the key that selects it (0 = group 10).
+    {
+        groupPrune(g, 0); // keep counts live even without a key press; prune all below
+        for (int n = 1; n < 10; ++n) groupPrune(g, n);
+        float slotW = (side - 12 * k) / 5.0f, slotH = 22 * k;
+        float gy2 = (float)SH - 2 * slotH - 10 * k;
+        for (int n = 0; n < 10; ++n) {
+            int col = n % 5, row = n / 5;
+            Rectangle s{ sideX + 6 * k + col * slotW, gy2 + row * slotH, slotW - 2 * k, slotH - 2 * k };
+            bool has = !g_groups[n].ids.empty();
+            DrawRectangleRec(s, has ? Color{ 40, 52, 40, 235 } : Color{ 22, 24, 26, 220 });
+            DrawRectangleLinesEx(s, 1, Color{ 0, 0, 0, 255 });
+            char cnt[8];
+            snprintf(cnt, sizeof(cnt), "%d", has ? (int)g_groups[n].ids.size() : 0);
+            int fs = px(13);
+            DrawText(cnt, (int)(s.x + 3 * k), (int)(s.y + (s.height - fs) / 2), fs,
+                     has ? Color{ 170, 230, 170, 255 } : Color{ 90, 95, 100, 255 });
+            char key[4];
+            snprintf(key, sizeof(key), "%d", n == 9 ? 0 : n + 1);
+            int kfs = px(10);
+            DrawText(key, (int)(s.x + s.width - kfs - 3 * k), (int)(s.y + 2 * k), kfs,
+                     Color{ 120, 130, 140, 255 });
+        }
+    }
+
     // Selection circles are already drawn by Renderer::drawUnit; no extra HUD box.
 
     if (g.gameOver) {
@@ -1677,6 +1770,7 @@ static void renderHUD(Game& g, Camera2D& cam) {
 
 static void handlePlacement(Game& g, Vec2 world) {
     if (!ui.placing) return;
+    if (g_placeDemo) return;   // --placedemo parks the ghost where it was put instead of following the mouse
     int tx = (int)(world.x / TILE_SIZE), ty = (int)(world.y / TILE_SIZE);
     ui.placingWorld = world;
     const UnitTemplate* t = g_templates.find(ToLower(ui.placingName));
@@ -1700,7 +1794,7 @@ static void tryPlace(Game& g) {
         auto sel = g.selectedUnits();
         for (auto* b : sel) if (b->tpl && b->tpl->isBuilder) {
             int tx = (int)(ui.placingWorld.x / TILE_SIZE), ty = (int)(ui.placingWorld.y / TILE_SIZE);
-            if (g.orderBuild(b->id, ui.placingName, tx, ty)) break;
+            if (g.orderBuild(b->id, ui.placingName, tx, ty, ui.placeFacing)) break;
         }
     }
     ui.placing = false;
@@ -1718,6 +1812,17 @@ static bool loadMap(Game& game, const std::string& rel) {
     game = std::move(fresh);
     TraceLog(LOG_INFO, TextFormat("Map: %dx%d, spawns=%zu, units=%zu",
              game.map.w, game.map.h, game.map.spawns.size(), game.units.size()));
+    // The `Triggers` layer decides how the map plays; print it so a wrong winCondition or a lost
+    // allyGroup is visible in the log instead of only showing up as strange behaviour later.
+    const MapInfo& mi = game.map.info;
+    if (mi.present)
+        TraceLog(LOG_INFO, TextFormat("map_info: type='%s' win='%s' lose='%s' fog='%s' teams=%zu",
+                 mi.type.c_str(), mi.winCondition.c_str(), mi.loseCondition.c_str(), mi.fog.c_str(),
+                 game.map.teamInfos.size()));
+    else
+        TraceLog(LOG_INFO, "map_info: absent (no Triggers object layer)");
+    for (const auto& ti : game.map.teamInfos)
+        TraceLog(LOG_INFO, TextFormat("  team %d: credits=%.0f allyGroup=%d", ti.team, ti.credits, ti.allyGroup));
     return true;
 }
 
@@ -1745,6 +1850,12 @@ static void buildFallback(Game& game) {
 static void resetCamera(Camera2D& cam, Game& game, int SW, int SH) {
     cam.rotation = 0; cam.zoom = 1.0f;
     cam.offset = { SW / 2.0f, SH / 2.0f };
+    // The map's own `camera_start` object wins (8 shipped maps place one); otherwise open on the player's
+    // command center, and failing that on the middle of the map.
+    if (game.map.hasCameraStart) {
+        cam.target = Vector2{ game.map.cameraStart.x, game.map.cameraStart.y };
+        return;
+    }
     Vector2 cc{ game.map.worldW() / 2, game.map.worldH() / 2 };
     for (auto& u : game.units)
         if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") {
@@ -1756,7 +1867,9 @@ static void resetCamera(Camera2D& cam, Game& game, int SW, int SH) {
 int main(int argc, char** argv) {
     // Optional headless-ish screenshot: `rp.exe --shot out.png [N]` renders N frames
     // (default 3) then writes the screen buffer to PNG and exits. Normal play is untouched.
-    std::string shotPath, mapOverride, testUpgrade, testWeapon, testBuild, testDamage, testRepair, selectTpl, testMods;
+    std::string shotPath, mapOverride, testUpgrade, testWeapon, testBuild, testDamage, testRepair, selectTpl, testMods, testFire, testSelf;
+    std::string unitDemo;
+    float zoomOverride = 0.0f;
     int shotFrame = 3;
     bool startInGame = false, startInLevels = false, startInMods = false;
     bool checkMaps = false;
@@ -1765,7 +1878,16 @@ int main(int argc, char** argv) {
     bool listMods = false;
     bool noFog = false;
     bool testFog = false;
+    bool testGroups = false;
+    bool testPass = false;
+    bool testTeams = false;
     bool fogDemo = false;
+    bool buildDemo = false;
+    bool placeDemo = false;
+    bool blueprintDemo = false;
+    bool convertDemo = false;
+    bool nanoDemo = false;
+    bool shadowDemo = false;
     // RWX's HUD metrics are authored against 1920x1080, so that is the default surface; `--size WxH`
     // exists for the screenshot harness and for testing smaller windows.
     int winW = 1920, winH = 1080;
@@ -1781,7 +1903,16 @@ int main(int argc, char** argv) {
         else if (a == "--listmods") listMods = true;
         else if (a == "--nofog") noFog = true;
         else if (a == "--testfog") testFog = true;
+        else if (a == "--testgroups") testGroups = true;
+        else if (a == "--testpass") testPass = true;
+        else if (a == "--testteams") testTeams = true;
         else if (a == "--fogdemo") fogDemo = true;
+        else if (a == "--builddemo") buildDemo = true;
+        else if (a == "--placedemo") placeDemo = true;
+        else if (a == "--blueprintdemo") blueprintDemo = true;
+        else if (a == "--convertdemo") convertDemo = true;
+        else if (a == "--nanodemo") nanoDemo = true;
+        else if (a == "--shadowdemo") shadowDemo = true;
         else if (a == "--unusedkeys") unusedKeys = true;
         else if (a == "--testupgrade" && i + 1 < argc) { testUpgrade = argv[++i]; }
         else if (a == "--testbuild" && i + 1 < argc) { testBuild = argv[++i]; }
@@ -1789,8 +1920,12 @@ int main(int argc, char** argv) {
         else if (a == "--testrepair" && i + 1 < argc) { testRepair = argv[++i]; }
         else if (a == "--testmods" && i + 1 < argc) { testMods = argv[++i]; }
         else if (a == "--testweapon" && i + 1 < argc) { testWeapon = argv[++i]; }
+        else if (a == "--testfire" && i + 1 < argc) { testFire = argv[++i]; }
+        else if (a == "--testself" && i + 1 < argc) { testSelf = argv[++i]; }
         else if (a == "--map" && i + 1 < argc) { mapOverride = argv[++i]; }
         else if (a == "--select" && i + 1 < argc) { selectTpl = argv[++i]; }
+        else if (a == "--unitdemo" && i + 1 < argc) { unitDemo = argv[++i]; }
+        else if (a == "--zoom" && i + 1 < argc) { zoomOverride = (float)atof(argv[++i]); }
         else if (a == "--size" && i + 1 < argc) {
             // "--size 1920x1080" -- the surface RWX's HUD metrics are authored against
             const char* sz = argv[++i];
@@ -2078,7 +2213,191 @@ int main(int argc, char** argv) {
         TraceLog(LOG_INFO, "testfog: probe hidden=%d shown=%d", (int)hidden, (int)shown);
         if (!hidden || !shown) ++bad;
 
+        // The rim ramp has to reach 10 at the outer edge, otherwise `value < 5` never hides anything and
+        // the whole sight circle counts as visible. With sight 15 RWX lights (i-3)=12 tiles fully and
+        // fades to black over the next three, so 13 tiles out is still seen and 15 is not.
+        game.initFog();
+        game.revealFogAt(c, 15.0f, Game::FOG_VISIBLE);
+        uint8_t near13 = game.fogAtWorld(c + Vec2{ TILE_SIZE * 13.0f, 0.0f });
+        uint8_t rim15 = game.fogAtWorld(c + Vec2{ TILE_SIZE * 15.0f, 0.0f });
+        TraceLog(LOG_INFO, "testfog: sight15 near13=%d rim15=%d", near13, rim15);
+        if (near13 >= Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: 13 tiles out is %d, want < 5", near13); ++bad; }
+        if (rim15 < Game::FOG_EXPLORED) { TraceLog(LOG_WARNING, "testfog: rim at 15 is %d, want >= 5", rim15); ++bad; }
+
         TraceLog(LOG_INFO, "testfog: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+    }
+
+    if (testTeams) {
+        // `--testteams` checks what the map's `team_N_info` objects turned into: the starting credits,
+        // the allyGroup relation (PlayerTeam.isAllied), and that a `mainBuilings` map is not already
+        // decided on the first tick -- a side that spawns without a factory would otherwise read as
+        // wiped out and end the game immediately.
+        int bad = 0;
+        for (auto& t : game.teams) {
+            if (game.isEnemy(t.id, t.id)) { TraceLog(LOG_WARNING, "testteams: team %d is its own enemy", t.id); ++bad; }
+            TraceLog(LOG_INFO, "testteams: team %d credits=%.0f allyGroup=%d player=%d units=%d",
+                     t.id, t.credits, t.allyGroup, (int)t.isPlayer,
+                     (int)std::count_if(game.units.begin(), game.units.end(),
+                                        [&](const Unit& u) { return !u.dead && u.team == t.id; }));
+        }
+        for (auto& a : game.teams)
+            for (auto& b : game.teams) {
+                if (a.id >= b.id) continue;
+                bool e = game.isEnemy(a.id, b.id);
+                if (e != game.isEnemy(b.id, a.id)) { TraceLog(LOG_WARNING, "testteams: %d/%d asymmetric", a.id, b.id); ++bad; }
+                bool allied = a.allyGroup >= 0 && a.allyGroup == b.allyGroup;
+                if (allied && e) { TraceLog(LOG_WARNING, "testteams: team %d and %d share allyGroup %d but are enemies", a.id, b.id, a.allyGroup); ++bad; }
+                if (!allied && !e) { TraceLog(LOG_WARNING, "testteams: team %d and %d are allies without an allyGroup", a.id, b.id); ++bad; }
+            }
+        TraceLog(LOG_INFO, "testteams: winCondition='%s' gameOver=%d",
+                 game.map.info.winCondition.c_str(), (int)game.gameOver);
+        if (game.gameOver) { TraceLog(LOG_WARNING, "testteams: map is already decided on tick 1"); ++bad; }
+        TraceLog(LOG_INFO, "testteams: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+    }
+
+    if (testPass) {
+        // `--testpass` checks the terrain rules from PathCostMap.d:320-343 against every tile of the
+        // loaded map. RWX derives them from three booleans:
+        //   z  = WATER|HOVER|OVER_CLIFF_WATER      can enter water
+        //   z2 = HOVER|OVER_CLIFF|OVER_CLIFF_WATER can enter cliff
+        //   z3 = OVER_CLIFF|OVER_CLIFF_WATER       can enter a large object
+        // lava blocks everyone, and only WATER additionally demands water underneath. The two rules RP
+        // had backwards are exactly the ones asserted hardest here: HOVER was "anywhere" (so it drove
+        // through lava and buildings) and OVER_CLIFF fell through to walkableLand (so it could not climb).
+        int bad = 0, lavaN = 0, waterN = 0, cliffN = 0, rockN = 0, costN = 0, occN = 0;
+        const TileMap& m = game.map;
+        for (int y = 0; y < m.h; ++y)
+            for (int x = 0; x < m.w; ++x) {
+                // Building occupancy is a separate axis: a sea factory parked on water blocks every
+                // movement type on purpose, so those tiles say nothing about the terrain rule.
+                if (m.occupied(x, y)) { ++occN; continue; }
+                const MapTile& t = m.at(x, y);
+                bool land = m.walkableLand(x, y), hover = m.walkableHover(x, y),
+                     over = m.walkableOverCliff(x, y), amph = m.walkableAmphibious(x, y),
+                     ship = m.walkableWater(x, y);
+                if (t.lava) {
+                    ++lavaN;
+                    if (land || hover || over || amph || ship) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: lava at %d,%d passable land=%d hover=%d over=%d amph=%d water=%d",
+                                                 x, y, (int)land, (int)hover, (int)over, (int)amph, (int)ship);
+                    }
+                } else if (t.water || t.waterBridge) {
+                    ++waterN;
+                    if (land || over) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: water at %d,%d crossed by land=%d over=%d", x, y, (int)land, (int)over);
+                    }
+                    if (!hover && !t.cliff && !t.largeObject) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: plain water at %d,%d refused by hover", x, y);
+                    }
+                } else if (t.cliff) {
+                    ++cliffN;
+                    if (land || ship) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: cliff at %d,%d crossed by land=%d water=%d", x, y, (int)land, (int)ship);
+                    }
+                    if (!hover || !over) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: cliff at %d,%d refused by hover=%d over=%d", x, y, (int)hover, (int)over);
+                    }
+                } else if (t.largeObject) {
+                    ++rockN;
+                    if (land || hover || ship) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: large object at %d,%d crossed by land=%d hover=%d water=%d",
+                                                 x, y, (int)land, (int)hover, (int)ship);
+                    }
+                    if (!over) {
+                        if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: large object at %d,%d refused by over-cliff", x, y);
+                    }
+                } else if (t.cost) {
+                    ++costN;   // movementBlockLevel 40: slow, not blocked
+                    if (!land) { if (++bad <= 5) TraceLog(LOG_WARNING, "testpass: small rock at %d,%d blocks land", x, y); }
+                }
+            }
+        TraceLog(LOG_INFO, "testpass: tiles lava=%d water=%d cliff=%d largeObject=%d smallRock=%d occupied=%d",
+                 lavaN, waterN, cliffN, rockN, costN, occN);
+        TraceLog(LOG_INFO, "testpass: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+    }
+
+    if (testGroups) {
+        // `--testgroups` walks the control-group lifecycle without needing real key presses: capture
+        // a selection, clear it, restore it from the group, and confirm dead members are pruned.
+        // Mirrors RWX UnitGroupMarker.c()/a()/d() (UnitGroupMarker.java:33-59,88).
+        int bad = 0;
+        for (int n = 0; n < 10; ++n) groupClear(n);
+        std::vector<int> picked;
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && !u.dead) {
+                u.selected = true; picked.push_back(u.id);
+                if (picked.size() >= 3) break;
+            }
+        if (picked.empty()) { TraceLog(LOG_WARNING, "testgroups: no player hull"); ++bad; }
+        else {
+            groupCapture(game, 0);
+            if ((int)g_groups[0].ids.size() != (int)picked.size()) {
+                TraceLog(LOG_WARNING, "testgroups: captured %zu want %zu", g_groups[0].ids.size(), picked.size()); ++bad;
+            }
+            for (auto& u : game.units) u.selected = false;
+            Camera2D tc{};
+            groupSelect(game, 0, false, tc);
+            int restored = 0;
+            for (int id : picked) { Unit* u = game.get(id); if (u && u->selected) ++restored; }
+            if (restored != (int)picked.size()) {
+                TraceLog(LOG_WARNING, "testgroups: restored %d want %zu", restored, picked.size()); ++bad;
+            }
+            // A dead member must drop out on the next use (UnitGroupMarker.d()).
+            Unit* victim = game.get(picked.front());
+            if (victim) victim->dead = true;
+            size_t before = g_groups[0].ids.size();
+            groupPrune(game, 0);
+            if (g_groups[0].ids.size() != before - 1) {
+                TraceLog(LOG_WARNING, "testgroups: prune %zu -> %zu", before, g_groups[0].ids.size()); ++bad;
+            }
+            if (victim) victim->dead = false;   // leave the game state as we found it
+            // Shift-add: capture into slot 1 from a fresh single selection, then add slot 1 to slot 0.
+            for (auto& u : game.units) u.selected = false;
+            Unit* one = game.get(picked.back());
+            if (one) one->selected = true;
+            groupCapture(game, 1);
+            for (auto& u : game.units) u.selected = false;
+            groupSelect(game, 0, false, tc);
+            groupSelect(game, 1, true, tc);
+            bool additive = one && one->selected;
+            TraceLog(LOG_INFO, "testgroups: capture=%zu restore=%d prune=%zu->%zu additive=%d",
+                     picked.size(), restored, before, g_groups[0].ids.size(), (int)additive);
+            if (!additive) ++bad;
+        }
+        // Formation: a group move must spread the members onto distinct grid slots rather than
+        // sending every hull to the exact same point (RWX FormationEngine.a 6-wide grid).
+        {
+            std::vector<int> movers;
+            for (auto& u : game.units)
+                if (u.team == game.playerTeam() && u.tpl && !u.isStatic() && !u.dead &&
+                    u.tpl->joinsGroupFormations) {
+                    movers.push_back(u.id);
+                    if (movers.size() >= 6) break;
+                }
+            if (movers.size() < 2) { TraceLog(LOG_WARNING, "testgroups: not enough movers for formation"); ++bad; }
+            else {
+                Vec2 dst{ game.map.worldW() * 0.4f, game.map.worldH() * 0.4f };
+                game.orderMove(movers, dst);
+                std::vector<Vec2> goals;
+                for (int id : movers) { Unit* u = game.get(id); if (u) goals.push_back(u->moveGoal); }
+                int distinct = 0;
+                for (size_t i = 0; i < goals.size(); ++i) {
+                    bool seen = false;
+                    for (size_t j = 0; j < i; ++j)
+                        if (std::abs(goals[i].x - goals[j].x) < 0.5f && std::abs(goals[i].y - goals[j].y) < 0.5f) seen = true;
+                    if (!seen) ++distinct;
+                }
+                TraceLog(LOG_INFO, "testgroups: formation movers=%zu distinct_goals=%d", movers.size(), distinct);
+                if (distinct < (int)movers.size() - 1) ++bad;
+            }
+        }
+        TraceLog(LOG_INFO, "testgroups: %d failure(s)", bad);
         CloseWindow();
         return bad ? 1 : 0;
     }
@@ -2236,6 +2555,148 @@ int main(int argc, char** argv) {
         return (offered && builtAtX >= 0 && built) ? 0 : 1;
     }
 
+    if (!testFire.empty()) {
+        // `--testfire <template>[,<action>]` is the gate for fireTurretXAtGround: spawn the hull, aim the
+        // action at a point 600 px away and let the round fly. It covers the three things that were broken
+        // before -- the action existed but did nothing, the price was ignored, and the min-range guard for
+        // a nuke was missing. Which assertions apply depends on what the action actually costs, so the
+        // gate reads the parsed UnitPrice instead of assuming ammo.
+        std::string fireName = testFire, forceAction;
+        size_t fireComma = testFire.find(',');
+        if (fireComma != std::string::npos) {
+            fireName = testFire.substr(0, fireComma);
+            forceAction = ToLower(Trim(testFire.substr(fireComma + 1)));
+        }
+        const UnitTemplate* ft = g_templates.find(ToLower(fireName));
+        if (!ft) {
+            TraceLog(LOG_WARNING, "testfire: unknown template (%s)", fireName.c_str());
+            CloseWindow();
+            return 1;
+        }
+        int bad = 0;
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int id = game.spawnUnit(ft->name, 0, mid);
+        Unit* fu = game.get(id);
+        if (!fu) { CloseWindow(); return 1; }
+        // Pick the aimed action this hull can actually run in its current form: the gunship's `blink`
+        // is hidden while it flies, so the first fireTurretXAtGround entry is not always usable.
+        std::string actName, turretName;
+        const UnitAction* fa = nullptr;
+        for (size_t i = 0; i < ft->actions.size(); ++i) {
+            const UnitAction& a = ft->actions[i];
+            if (a.fireAtGround.empty()) continue;
+            if (!forceAction.empty() && ToLower(a.name) != forceAction) continue;
+            // Structural pick only: the barrel has to exist. Availability is what the gate is testing,
+            // so it must not be part of the choice -- the launcher starts with an empty magazine.
+            bool hasBarrel = false;
+            for (auto& tr : ft->turrets) if (ToLower(tr.name) == a.fireAtGround) hasBarrel = true;
+            if (!hasBarrel) continue;
+            actName = a.name; turretName = a.fireAtGround; fa = &a; break;
+        }
+        if (actName.empty()) {
+            TraceLog(LOG_WARNING, "testfire: %s has no usable fireTurretXAtGround action", ft->name.c_str());
+            CloseWindow();
+            return 1;
+        }
+        // The nuke's magazine: an empty pool has to refuse the shot, and a real shot has to drain it.
+        bool costsAmmo = fa->priceCost.ammo > 0.0f;
+        bool firedEmpty = false;
+        double ammoBefore = 0.0, ammoAfter = 0.0;
+        if (costsAmmo) {
+            fu->resources["ammo"] = 0.0;
+            firedEmpty = game.runActionAt(id, actName, mid + Vec2{ 600.0f, 0.0f });
+            fu->resources["ammo"] = 5.0;
+            ammoBefore = fu->resources["ammo"];
+        }
+        // Is the barrel's round a nuke? That decides whether the 450 px floor applies.
+        int nti = -1;
+        for (size_t i = 0; i < ft->turrets.size(); ++i)
+            if (ToLower(ft->turrets[i].name) == turretName) { nti = (int)i; break; }
+        bool nukeShot = nti >= 0 && ft->turrets[nti].projectile >= 0 &&
+                        ft->turrets[nti].projectile < (int)ft->projectiles.size() &&
+                        ft->projectiles[ft->turrets[nti].projectile].nukeWeapon;
+        bool tooClose = game.runActionAt(id, actName, mid + Vec2{ 100.0f, 0.0f });
+        // Each attempt may have armed the action's own cooldown (blink is long); clear it so the two
+        // probes below are independent of the one before.
+        fu->actionCooldowns.clear();
+        fu->allActionCooldown = 0.0f;
+        if (costsAmmo) fu->resources["ammo"] = 5.0;
+        ammoBefore = costsAmmo ? fu->resources["ammo"] : 0.0;
+        size_t projBefore = game.projectiles.size();
+        int newestId = game.nextProjectileId;
+        bool fired = game.runActionAt(id, actName, mid + Vec2{ 600.0f, 0.0f });
+        if (costsAmmo) ammoAfter = fu->resources["ammo"];
+        int spawned = (int)game.projectiles.size() - (int)projBefore;
+        Projectile* shot = nullptr;
+        for (auto& pr : game.projectiles) if (pr.id == newestId) shot = &pr;
+        TraceLog(LOG_INFO, "testfire: %s action='%s' turret='%s' empty=%d tooClose=%d fired=%d ammo=%.0f->%.0f proj=%d nuke=%d",
+                 ft->name.c_str(), actName.c_str(), turretName.c_str(), (int)firedEmpty, (int)tooClose,
+                 (int)fired, ammoBefore, ammoAfter, spawned, (int)(shot && shot->nuke));
+        if (costsAmmo && firedEmpty) { TraceLog(LOG_WARNING, "testfire: fired with an empty magazine"); ++bad; }
+        if (nukeShot && tooClose) { TraceLog(LOG_WARNING, "testfire: accepted a nuke target 100 px away"); ++bad; }
+        if (!fired) { TraceLog(LOG_WARNING, "testfire: the action did not fire"); ++bad; }
+        if (spawned <= 0 || !shot) { TraceLog(LOG_WARNING, "testfire: no projectile appeared"); ++bad; }
+        if (costsAmmo && ammoAfter >= ammoBefore) { TraceLog(LOG_WARNING, "testfire: ammo price was not paid"); ++bad; }
+        // A nuke cruises at 0.1 px a tick and is ballistic: it climbs to ballistic_delaymove_height (80)
+        // before it moves sideways at all, so the horizontal check has to allow for the lob.
+        Vec2 aimPoint = mid + Vec2{ 600.0f, 0.0f };
+        float d0 = shot ? shot->pos.dist(aimPoint) : 1e9f, d1 = d0, z1 = 0.0f;
+        for (int i = 0; i < 160 && shot; ++i) {
+            game.update();
+            Projectile* now = game.findProjectile(newestId);
+            if (!now) break;
+            d1 = now->pos.dist(aimPoint); z1 = now->posZ;
+        }
+        TraceLog(LOG_INFO, "testfire: range to target %.1f -> %.1f after 160 ticks (posZ=%.1f)", d0, d1, z1);
+        if (shot && !(d1 < d0) && z1 <= 0.0f) { TraceLog(LOG_WARNING, "testfire: the round neither climbed nor closed"); ++bad; }
+        TraceLog(LOG_INFO, "testfire: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+        return bad ? 1 : 0;
+    }
+
+    if (!testSelf.empty()) {
+        // `--testself <template>` is the gate for deleteSelf + self.timeAlive(...): the hull has to remove
+        // itself once the condition is met, and stay put until then. The 10 s flare is the shipped case.
+        const UnitTemplate* st = g_templates.find(ToLower(testSelf));
+        if (!st) {
+            TraceLog(LOG_WARNING, "testself: unknown template (%s)", testSelf.c_str());
+            CloseWindow();
+            return 1;
+        }
+        int bad = 0;
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int id = game.spawnUnit(st->name, 0, mid);
+        Unit* su = game.get(id);
+        if (!su) { CloseWindow(); return 1; }
+        // Find the earliest timeAlive threshold among its auto-triggered deleteSelf actions.
+        float waitTicks = 0.0f;
+        for (auto& a : st->actions) {
+            if (!a.deleteSelf) continue;
+            for (auto& t : a.autoCond.tests)
+                if (t.pred == CondPred::timeAlive) waitTicks = std::max(waitTicks, t.arg * 60.0f);
+        }
+        if (waitTicks <= 0.0f) {
+            TraceLog(LOG_WARNING, "testself: %s has no auto-triggered deleteSelf with a timeAlive gate", st->name.c_str());
+            CloseWindow();
+            return 1;
+        }
+        int died = -1;
+        for (int i = 0; i < (int)waitTicks + 120; ++i) {
+            game.update();
+            Unit* now = game.get(id);
+            if (!now || now->dead) { died = i; break; }
+        }
+        TraceLog(LOG_INFO, "testself: %s wait=%.0f ticks diedTick=%d age=%.0f", st->name.c_str(), waitTicks, died,
+                 game.get(id) ? game.get(id)->age : -1.0f);
+        // It must survive its own delay and be gone shortly after it.
+        if (died < 0) { TraceLog(LOG_WARNING, "testself: hull never removed itself"); ++bad; }
+        else if ((float)died < waitTicks - 1.0f) { TraceLog(LOG_WARNING, "testself: removed %d ticks in, too early", died); ++bad; }
+        TraceLog(LOG_INFO, "testself: %d failure(s)", bad);
+        CloseWindow();
+        return bad ? 1 : 0;
+    }
+
     if (!testDamage.empty()) {
         // `--testdamage <template>,<amount>` applies one real hit through Game::damage and reports the
         // health delta. A hull with core.canNotBeDamaged must not move at all (CustomUnit:4744), while
@@ -2260,8 +2721,33 @@ int main(int argc, char** argv) {
         TraceLog(LOG_INFO, "testdamage: %s dmg=%.0f hp=%.1f -> %.1f blocked=%d cannotBeDamaged=%d",
                  tpl->name.c_str(), amount, before, after, (after == before) ? 1 : 0,
                  (int)tpl->cannotBeDamaged);
+        // No shipped hull carries [core] armour, so the one thing the ordering fix changes is invisible
+        // on real assets. Synthesize it: CustomUnit.setTarget:4187-4205 subtracts armour first and
+        // BaseUnit.setTarget:1560-1562 then applies 1.75x to a hull under construction, so 100 damage
+        // against 20 armour on a half-built target is (100-20)*1.75 = 140 -- multiplying first would
+        // give 100*1.75-20 = 155.
+        int bad = 0;
+        if (!tpl->cannotBeDamaged) {
+            UnitTemplate armoured = *tpl;      // local copy, alive for the rest of this gate
+            armoured.armour = 20.0f;
+            armoured.armourMinKeep = 0.0f;
+            Unit* b = game.get(game.spawnUnit(tpl->name, 1, mid + Vec2{ 0.0f, 96.0f }));
+            if (b) {
+                b->tpl = &armoured;
+                b->underConstruction = true; b->buildProgress = 0.5f;
+                b->maxHp = b->hp = 100000.0f;
+                float b0 = b->hp;
+                game.damage(*b, 100.0f, nullptr);
+                float got = b0 - b->hp;
+                TraceLog(LOG_INFO, "testdamage: armour-order got=%.1f want=140.0 (multiply-first would be 155.0)", got);
+                if (std::fabs(got - 140.0f) > 0.01f) {
+                    TraceLog(LOG_WARNING, "testdamage: armour/build order is wrong (%.1f)", got);
+                    ++bad;
+                }
+            }
+        }
         CloseWindow();
-        return 0;
+        return bad ? 1 : 0;
     }
 
     if (!testRepair.empty()) {
@@ -2332,6 +2818,205 @@ int main(int argc, char** argv) {
 
     Camera2D cam{};
     resetCamera(cam, game, SW, SH);
+
+    if (buildDemo) {
+        // Screenshot aid for the build visuals: drop a half-finished factory next to the player's base
+        // and park a builder on it, so the green under-construction paint and the nano stream both show
+        // up without having to play through a build. Runs after resetCamera so it can aim at the site.
+        Vec2 base{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") { base = u.pos; break; }
+        int fid = game.spawnUnit("landFactory", game.playerTeam(), base + Vec2{ 120, 0 }, true);
+        int bid = game.spawnUnit("builder", game.playerTeam(), base + Vec2{ 120, 70 });
+        Unit* f = game.get(fid);
+        Unit* b = game.get(bid);
+        if (f) { f->buildProgress = 0.35f; f->hp = f->maxHp * 0.35f; }
+        if (b && f) {
+            b->nanoTargetId = fid;
+            b->facing = -3.14159265f / 2.0f;
+            for (auto& s : b->tur) s.angle = b->facing;
+        }
+        cam.target = Vector2{ base.x + 60.0f, base.y + 20.0f };
+        cam.zoom = 2.0f;
+        TraceLog(LOG_INFO, "builddemo: factory=%d builder=%d at %.0f,%.0f units=%zu", fid, bid,
+                 base.x + 120.0f, base.y, game.units.size());
+    }
+    if (nanoDemo) {
+        // Screenshot aid for the nano tethers and the build paint: one builder raising a half-built
+        // factory, one raising a half-built laser turret, and one taking a finished factory apart. The
+        // three clusters fit one frame at zoom 1.6.
+        Vec2 base{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") { base = u.pos; break; }
+        auto park = [](Unit* b) {
+            if (!b) return;
+            b->facing = -3.14159265f / 2.0f;
+            for (auto& s : b->tur) s.angle = b->facing;
+        };
+        int facId = game.spawnUnit("landFactory", game.playerTeam(), base + Vec2{ -150, -110 }, true);
+        int b1 = game.spawnUnit("builder", game.playerTeam(), base + Vec2{ -150, -50 });
+        if (Unit* f = game.get(facId)) { f->buildProgress = 0.35f; f->hp = f->maxHp * 0.35f; }
+        if (Unit* b = game.get(b1)) { b->nanoTargetId = facId; b->nanoReclaim = false; park(b); }
+        int turId = game.spawnUnit("laserDefence", game.playerTeam(), base + Vec2{ 20, -110 }, true);
+        int b2 = game.spawnUnit("builder", game.playerTeam(), base + Vec2{ 20, -50 });
+        if (Unit* f = game.get(turId)) { f->buildProgress = 0.55f; f->hp = f->maxHp * 0.55f; }
+        if (Unit* b = game.get(b2)) { b->nanoTargetId = turId; b->nanoReclaim = false; park(b); }
+        int oldId = game.spawnUnit("landFactory", game.playerTeam(), base + Vec2{ 190, -110 });
+        int b3 = game.spawnUnit("builder", game.playerTeam(), base + Vec2{ 190, -50 });
+        if (Unit* b = game.get(b3)) { b->nanoTargetId = oldId; b->nanoReclaim = true; park(b); }
+        cam.target = Vector2{ base.x + 20.0f, base.y - 80.0f };
+        cam.zoom = 1.6f;
+        TraceLog(LOG_INFO, "nanodemo: build=%d turret=%d reclaim=%d builders=%d,%d,%d",
+                 facId, turId, oldId, b1, b2, b3);
+    }
+    if (!unitDemo.empty()) {
+        // Screenshot aid: "--unitdemo ladybug,experimentalhovertank" spawns those templates in a row,
+        // facing east, at a zoom that shows the art at close to its native pixels. Handy for checking
+        // one hull's sprite layout -- a frame strip, a turret count -- without hunting it down on a map.
+        Vec2 base{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") { base = u.pos; break; }
+        std::vector<std::string> names;
+        std::string cur;
+        for (char c : unitDemo) {
+            if (c == ',') { names.push_back(cur); cur.clear(); }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) names.push_back(cur);
+        float step = 110.0f;
+        float x0 = -step * (float)(names.size() - 1) * 0.5f;
+        for (size_t i = 0; i < names.size(); ++i) {
+            int id = game.spawnUnit(names[i], game.playerTeam(), base + Vec2{ x0 + step * (float)i, -60.0f });
+            Unit* s = game.get(id);
+            if (!s) { TraceLog(LOG_WARNING, "unitdemo: could not spawn '%s'", names[i].c_str()); continue; }
+            s->facing = 0.0f; s->targetFacing = 0.0f;
+            for (auto& tr : s->tur) tr.angle = 0.0f;
+            TraceLog(LOG_INFO, "unitdemo: %s id=%d key='%s' frames=%d turrets=%d shadow='%s' anim=%d/%d/%d lockBody=%d",
+                     names[i].c_str(), id, s->tplKey.c_str(), s->tpl->totalFrames, (int)s->tpl->turrets.size(),
+                     s->tpl->imageShadow.c_str(), (int)s->tpl->animMoving.valid(),
+                     (int)s->tpl->animIdle.valid(), (int)s->tpl->animAttack.valid(),
+                     (int)s->tpl->lockBodyRot);
+            // A hull with a moving strip is walked east so the frame cycle is visible in a screenshot.
+            if (s->tpl->animMoving.valid()) game.orderMove({ id }, base + Vec2{ x0 + step * (float)i + 420.0f, -60.0f });
+            // Two behaviours need a second actor to show up at all, so the demo supplies one. The dropship
+            // is the only RWX airframe that touches its own height (Dropship.java:278-284): with a
+            // waypoint it climbs to 35, with none it settles to 2, so ordering it away and then letting it
+            // arrive shows both halves. The heavy hover tank is drawn along its turret's aim
+            // (getRenderRotation:204-206), which is only visible once it has something to shoot at.
+            if (s->tpl->name == "dropship")
+                game.orderMove({ id }, base + Vec2{ x0 + step * (float)i + 900.0f, -60.0f });
+            if (s->tpl->name == "heavyHoverTank") {
+                int foe = game.spawnUnit("tank", 1 - game.playerTeam(), base + Vec2{ x0 + step * (float)i + 60.0f, -140.0f });
+                TraceLog(LOG_INFO, "unitdemo: heavyHoverTank target=%d assigned=%d", foe,
+                         game.orderAttackTarget({ id }, foe));
+            }
+        }
+        cam.target = Vector2{ base.x, base.y - 60.0f };
+        cam.zoom = zoomOverride > 0.0f ? zoomOverride : 2.4f;
+    }
+    if (shadowDemo) {
+        // Screenshot aid for the shadow pass: one row of hulls whose [graphics] image_shadow names a
+        // file (dropship / gunship / hovercraft / hover tank / interceptor / mech gun), then one AUTO
+        // and one NONE for contrast. Airframes are parked at altitude so the silhouette detaches.
+        Vec2 base{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") { base = u.pos; break; }
+        const char* names[] = { "dropship", "gunship", "hovercraft", "hovertank",
+                                "c_interceptor", "mechGun", "bomber", "landFactory" };
+        for (int i = 0; i < 8; ++i) {
+            int id = game.spawnUnit(names[i], game.playerTeam(), base + Vec2{ -260.0f + 74.0f * i, -120.0f });
+            Unit* s = game.get(id);
+            if (!s) { TraceLog(LOG_WARNING, "shadowdemo: could not spawn %s", names[i]); continue; }
+            s->facing = 0.0f; s->targetFacing = 0.0f;
+            for (auto& tr : s->tur) tr.angle = 0.0f;
+            if (s->tpl->moveType == MoveType::AIR) s->posZ = 26.0f;   // hold it in the air, not mid-takeoff
+            TraceLog(LOG_INFO, "shadowdemo: %s id=%d shadow='%s' posZ=%.0f",
+                     names[i], id, s->tpl->imageShadow.c_str(), s->posZ);
+        }
+        cam.target = Vector2{ base.x, base.y - 120.0f };
+        cam.zoom = 1.9f;
+    }
+    if (placeDemo) {
+        // Screenshot aid for the build preview: arm placement so Renderer draws the ghost + outline.
+        g_placeDemo = true;
+        ui.placing = true;
+        ui.placingName = "landFactory";
+        ui.placingWorld = Vec2{ cam.target.x, cam.target.y };
+        ui.placingValid = true;
+        cam.zoom = 2.0f;
+    }
+    if (blueprintDemo) {
+        // Screenshot aid for the BuildPreview blueprint: a builder that has ordered a factory some way
+        // off, so the blue foundation + fading ghost stay up while it walks over. The site is a real
+        // under-construction hull (green), and the blueprint sits on top of it until the builder arrives.
+        Vec2 base{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        for (auto& u : game.units)
+            if (u.team == game.playerTeam() && u.tpl && u.tpl->name == "commandCenter") { base = u.pos; break; }
+        Vec2 site = base + Vec2{ 160, 0 };
+        int fid = game.spawnUnit("landFactory", game.playerTeam(), site, true);
+        int bid = game.spawnUnit("builder", game.playerTeam(), base + Vec2{ 60, 90 });
+        Unit* f = game.get(fid);
+        Unit* b = game.get(bid);
+        if (f) { f->buildProgress = 0.10f; f->hp = f->maxHp * 0.10f; }
+        if (b) { b->facing = -3.14159265f / 2.0f; for (auto& s : b->tur) s.angle = b->facing; }
+        const UnitTemplate* t = g_templates.find("landfactory");
+        if (t && f && b) {
+            Blueprint bp;
+            bp.tpl = t; bp.pos = site; bp.builderId = bid; bp.targetId = fid;
+            bp.team = game.playerTeam(); bp.fade = 1.0f; bp.lifeTimer = 0;
+            game.blueprints.push_back(bp);
+        }
+        cam.target = Vector2{ site.x + 30.0f, site.y };
+        cam.zoom = 2.0f;
+        TraceLog(LOG_INFO, "blueprintdemo: site=%d builder=%d blueprints=%zu", fid, bid, game.blueprints.size());
+    }
+    if (convertDemo) {
+        // Screenshot aid for the landed<->flying gunship convertTo: put a directly-spawned gunship next
+        // to one converted from experimentalGunshipLanded, so the turret remap can be compared visually.
+        Vec2 mid{ game.map.worldW() * 0.5f, game.map.worldH() * 0.5f };
+        int direct = game.spawnUnit("experimentalGunship", game.playerTeam(), mid + Vec2{ -90, 0 });
+        int landed = game.spawnUnit("experimentalGunshipLanded", game.playerTeam(), mid + Vec2{ 90, 0 });
+        Unit* lu = game.get(landed);
+        if (lu && lu->tpl) {
+            int ltx = (int)(lu->pos.x / TILE_SIZE), lty = (int)(lu->pos.y / TILE_SIZE);
+            TraceLog(LOG_INFO, "convertdemo: landed building=%d occ=%d facing=%.1f shield=%.0f/%.0f",
+                     (int)lu->tpl->isBuilding, (int)game.map.occupied(ltx, lty),
+                     lu->facing * 57.29578f, lu->shield, lu->shieldMax);
+            int act = -1;
+            for (size_t i = 0; i < lu->tpl->actions.size(); ++i)
+                if (!lu->tpl->actions[i].convertTo.empty()) { act = (int)i; break; }
+            if (act >= 0 && game.orderUpgrade(landed, act)) {
+                // Finish the build timer instantly so the converted hull renders at full detail.
+                for (int k = 0; k < 300 && lu->upgradeIdx >= 0; ++k) game.update();
+            }
+        }
+        Unit* du = game.get(direct);
+        TraceLog(LOG_INFO, "convertdemo: direct=%d(%s,%zu tur,face%.1f,shield%.0f/%.0f) "
+                           "converted=%d(%s,%zu tur,face%.1f,shield%.0f/%.0f,regen%.2f,legs%zu,anim%d)",
+                 direct, du && du->tpl ? du->tpl->name.c_str() : "?", du ? du->tur.size() : 0,
+                 du ? du->facing * 57.29578f : 0.0f, du ? du->shield : 0.0f, du ? du->shieldMax : 0.0f,
+                 landed, lu && lu->tpl ? lu->tpl->name.c_str() : "?", lu ? lu->tur.size() : 0,
+                 lu ? lu->facing * 57.29578f : 0.0f, lu ? lu->shield : 0.0f, lu ? lu->shieldMax : 0.0f,
+                 lu ? lu->shieldRegen : 0.0f, lu ? lu->legs.size() : 0, lu ? (int)lu->animPlaying : 0);
+
+        // Reverse direction: a flying gunship deploying must keep the facing it arrived with.
+        int gun2land = game.spawnUnit("experimentalGunship", game.playerTeam(), mid + Vec2{ 0, 170 });
+        Unit* gu = game.get(gun2land);
+        if (gu && gu->tpl) {
+            gu->facing = 0.35f; gu->targetFacing = gu->facing;  // a non-default heading to prove it is kept
+            int act = -1;
+            for (size_t i = 0; i < gu->tpl->actions.size(); ++i)
+                if (!gu->tpl->actions[i].convertTo.empty()) { act = (int)i; break; }
+            if (act >= 0 && game.orderUpgrade(gun2land, act)) {
+                for (int k = 0; k < 300 && gu->upgradeIdx >= 0; ++k) game.update();
+            }
+            TraceLog(LOG_INFO, "convertdemo: gun2land=%d(%s,face%.1f,shield%.0f/%.0f,building%d)",
+                     gun2land, gu->tpl ? gu->tpl->name.c_str() : "?", gu->facing * 57.29578f,
+                     gu->shield, gu->shieldMax, (int)gu->tpl->isBuilding);
+        }
+        cam.target = Vector2{ mid.x, mid.y + 60.0f };
+        cam.zoom = 1.8f;
+    }
 
     double acc = 0; double last = GetTime();
     int renderedFrames = 0;
@@ -2469,7 +3154,27 @@ int main(int argc, char** argv) {
         bool overUI = ui.overPanel || ui.overMinimap;
 
         debugHandleKeys(game);
-        if (g_debug.spawnOpen || g_debug.spawnArmed) { ui.placing = false; ui.reclaimPick = false; }
+        if (g_debug.spawnOpen || g_debug.spawnArmed) { ui.placing = false; ui.reclaimPick = false; ui.groundPick.clear(); }
+
+        // RWX buildingRotation: R rotates the placement ghost by 90 degrees before the order is given.
+        if (ui.placing && IsKeyPressed(KEY_R)) ui.placeFacing += 3.14159265f / 2.0f;
+
+        // Control groups (RWX InputController:131-166 / GameInterfaceRenderer.e():2550-2576):
+        // Ctrl+digit captures, plain digit selects (double-tap within 700 ms centres the view),
+        // Shift+digit adds to the current selection. The 10th group uses the 0 key.
+        if (!g_debug.spawnOpen) {
+            static const int digitKeys[10] = { KEY_ZERO, KEY_ONE, KEY_TWO, KEY_THREE, KEY_FOUR,
+                                               KEY_FIVE, KEY_SIX, KEY_SEVEN, KEY_EIGHT, KEY_NINE };
+            for (int n = 0; n < 10; ++n) {
+                if (!IsKeyPressed(digitKeys[n])) continue;
+                int slot = (n == 0) ? 9 : n - 1;   // 0 -> group 10
+                bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+                bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                if (ctrl) groupCapture(game, slot);
+                else groupSelect(game, slot, shift, cam);
+                ui.placing = false; ui.reclaimPick = false;
+            }
+        }
 
         if (ui.markerOn) { ui.markerT += (float)GetFrameTime(); if (ui.markerT > 0.6f) ui.markerOn = false; }
         handlePlacement(game, world);
@@ -2494,7 +3199,11 @@ int main(int argc, char** argv) {
                     // ReclaimTargetAction(true) isAvailableAndVisible():79-84 answers true for all of them.
                     // orderReclaim then drops the hulls RWX's canReclaimTarget:2179 would drop.
                     // Shift leaves the action armed for another target, as clearCurrentAction() is skipped.
-                    if (ui.reclaimPick && best) {
+                    if (!ui.groundPick.empty()) {
+                        // fireTurretXAtGround: this click is the target point, whatever is under it.
+                        for (auto* s : game.selectedUnits()) game.runActionAt(s->id, ui.groundPick, Vec2{ a.x, a.y });
+                        if (!IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_RIGHT_SHIFT)) ui.groundPick.clear();
+                    } else if (ui.reclaimPick && best) {
                         for (auto* s : game.selectedUnits()) if (s->tpl && s->tpl->canReclaimResources) game.orderReclaim(s->id, best->id);
                         if (!IsKeyDown(KEY_LEFT_SHIFT) && !IsKeyDown(KEY_RIGHT_SHIFT)) ui.reclaimPick = false;
                     } else if (!ui.reclaimPick) {
@@ -2509,7 +3218,7 @@ int main(int argc, char** argv) {
         // ---- right click orders ----
         if (debugMouseRight()) {}
         else if (!overUI && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
-            if (ui.placing || ui.reclaimPick) { ui.placing = false; ui.reclaimPick = false; }
+            if (ui.placing || ui.reclaimPick || !ui.groundPick.empty()) { ui.placing = false; ui.reclaimPick = false; ui.groundPick.clear(); }
             else {
                 auto sel = game.selectedUnits();
                 if (!sel.empty()) {
@@ -2575,7 +3284,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (IsKeyPressed(KEY_ESCAPE)) { ui.placing = false; ui.reclaimPick = false; clearSelection(game); }
+        if (IsKeyPressed(KEY_ESCAPE)) { ui.placing = false; ui.reclaimPick = false; ui.groundPick.clear(); clearSelection(game); }
         if (!g_debug.spawnOpen) {
         if (IsKeyPressed(KEY_X)) { std::vector<int> ids; for (auto* s : game.selectedUnits()) ids.push_back(s->id); game.orderStop(ids); }
         // RWX puts unload / load-up in the command bar for every carrier with
@@ -2603,7 +3312,7 @@ int main(int argc, char** argv) {
         // ---- render ----
         ViewState view;
         view.cam = cam;
-        view.placing = ui.placing; view.placingName = ui.placingName; view.placingWorld = ui.placingWorld; view.placingValid = ui.placingValid;
+        view.placing = ui.placing; view.placingName = ui.placingName; view.placingWorld = ui.placingWorld; view.placingValid = ui.placingValid; view.placeFacing = ui.placeFacing;
         view.selActive = ui.dragging; view.selA = { ui.dragA.x, ui.dragA.y }; view.selB = { ui.dragB.x, ui.dragB.y };
         view.cmdMarkerOn = ui.markerOn; view.cmdMarker = { ui.markerPos.x, ui.markerPos.y }; view.cmdMarkerT = ui.markerT;
 
@@ -2617,6 +3326,10 @@ int main(int argc, char** argv) {
         if (ui.reclaimPick) {
             Vector2 m2 = GetMousePosition();
             DrawText("Reclaim: click a target", m2.x + 14, m2.y + 16, 16, Color{ 255, 200, 90, 255 });
+        }
+        if (!ui.groundPick.empty()) {
+            Vector2 m2 = GetMousePosition();
+            DrawText("Click the ground to fire", m2.x + 14, m2.y + 16, 16, Color{ 255, 200, 90, 255 });
         }
         EndDrawing();
         if (!shotPath.empty() && ++renderedFrames >= shotFrame) {

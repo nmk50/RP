@@ -116,6 +116,24 @@ bool Renderer::loaded(const UnitTemplate& t, int which, Texture2D& out) {
     return tex.id != missing_.id;
 }
 
+bool Renderer::shadowByName(const UnitTemplate& t, const std::string& nm, Texture2D& out) {
+    if (nm.empty() || nm == "NONE" || nm == "AUTO") return false;
+    std::string key = nm + "|" + t.sourceDir + "|shadow";
+    auto it = cache_.find(key);
+    if (it != cache_.end()) { out = it->second; return it->second.id != missing_.id; }
+    UnitTemplate tmp = t;
+    tmp.image = nm;
+    bool shadow;
+    std::string path = resolveImage(tmp, shadow);
+    Texture2D tex = path.empty() ? missing_ : loadResolvedTexture(path, shadow);
+    if (tex.id == 0) tex = missing_;
+    if (tex.id == missing_.id)
+        TraceLog(LOG_WARNING, "missing shadow image: %s (unit %s)", nm.c_str(), t.name.c_str());
+    cache_[key] = tex;
+    out = tex;
+    return tex.id != missing_.id;
+}
+
 // RWX CustomUnit.d(i):691 - a barrel with [turret_N] image draws that sprite, and barrels that name
 // the same file share one load.
 bool Renderer::byName(const UnitTemplate& t, const std::string& nm, Texture2D& out) {
@@ -254,9 +272,23 @@ static int submergedRenderAlpha(float z) {
 }
 
 static Color unitRenderPaint(const Unit& u) {
-    Color col{ 255, 255, 255, (uint8_t)submergedRenderAlpha(u.posZ) };
-    if (u.underConstruction && u.buildProgress < 1.0f)
-        col = Color{ 140, 255, 140, (uint8_t)(20.0f + 220.0f * std::max(0.0f, u.buildProgress)) };
+    // RWX OrderableUnit.getRenderPaint:4292-4303. A hull still under construction is painted light green
+    // (140,255,140) with its alpha ramping 20 -> 240 over getPathStepScale(), which
+    // CustomUnit.getPathStepScale:3600-3602 answers with [graphics] whenBeingBuiltMakeTransparentTill
+    // (default 1). Past that threshold the hull paints normally even though it is still building -- that
+    // is the second `<` test, and it is why a turret that writes the field fades its green out early.
+    // CustomUnitLegController:52 hands this same paint to the limbs, so the legs of a half-built turret
+    // go green with its body.
+    Color col{ 255, 255, 255, 255 };
+    if (u.buildProgress < 1.0f) {
+        float till = (u.tpl && u.tpl->builtTransparentTill > 0.0f) ? u.tpl->builtTransparentTill : 1.0f;
+        if (u.buildProgress < till) {
+            float a = 20.0f + (u.buildProgress / till) * 220.0f;
+            col = Color{ 140, 255, 140, (uint8_t)std::min(240.0f, a) };
+        }
+    }
+    // :4295-4299 -- below posZ -0.3 the sprite fades out so the water shows through it.
+    col.a = (uint8_t)(col.a * submergedRenderAlpha(u.posZ) / 255);
     return col;
 }
 
@@ -380,7 +412,6 @@ void Renderer::drawFog(Game& g, const Camera2D& cam) {
     int y0 = std::max(0, (int)std::floor(tl.y / TILE_SIZE));
     int x1 = std::min(g.map.w - 1, (int)std::floor(br.x / TILE_SIZE));
     int y1 = std::min(g.map.h - 1, (int)std::floor(br.y / TILE_SIZE));
-    const Color explored{ 0, 0, 0, 150 };
     for (int y = y0; y <= y1; ++y) {
         int x = x0;
         while (x <= x1) {
@@ -390,13 +421,84 @@ void Renderer::drawFog(Game& g, const Camera2D& cam) {
             // 1 px seams a per-tile fill leaves at fractional camera zooms.
             int run = x;
             while (run <= x1 && g.fog[(size_t)y * g.map.w + run] == f) ++run;
-            // 1..4 is the sight rim (Game::revealFogAt ramps it), 5 is explored, 10 is never seen.
-            Color c = f >= Game::FOG_UNSEEN ? Color{ 0, 0, 0, 255 }
-                    : (f >= Game::FOG_EXPLORED ? explored
-                                               : Color{ 0, 0, 0, (uint8_t)(f * 30) });
-            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, (run - x) * TILE_SIZE, TILE_SIZE, c);
+            // Game::revealFogAt keeps RWX's full 0..10 gradient now: 1..4 is the lit rim, 5 is
+            // "explored, nothing seen here", and 6..10 walk the ring out to solid black. Drawing 5..9 as
+            // one flat explored colour would throw that gradient away, so the alpha keeps climbing past
+            // 150 and only reaches 255 at 10.
+            uint8_t alpha = f >= Game::FOG_EXPLORED ? (uint8_t)(150 + (f - Game::FOG_EXPLORED) * 21)
+                                                    : (uint8_t)(f * 30);
+            DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, (run - x) * TILE_SIZE, TILE_SIZE, Color{ 0, 0, 0, alpha });
             x = run;
         }
+    }
+}
+
+// RWX BuildPreview.draw:261-319 -- the blue "pending site" marker shown after a build order while the
+// builder walks over. Distinct from the mouse-follow placement ghost: foundationPaint is
+// a(90,0,0,255) / inactive a(40,0,0,255), i.e. ARGB alpha 90/40 with RGB(0,0,255) -- a blue outline.
+void Renderer::drawBlueprints(Game& g, const Camera2D& cam) {
+    if (g.blueprints.empty()) return;
+    for (const Blueprint& bp : g.blueprints) {
+        if (!bp.tpl) continue;
+        // RWX BuildPreview.draw:265 -- only the local player's team sees the marker.
+        Unit* b = g.get(bp.builderId);
+        if (bp.team != g.playerTeam() || (bp.builderId >= 0 && (!b || b->team != g.playerTeam()))) continue;
+        const UnitTemplate& t = *bp.tpl;
+        float fade = std::max(0.0f, bp.fade);
+        // :286-293 fFastCos = 1 - cos(fade * 90 degrees), fastCos taking degrees; fade > 1 => 1.
+        float ease = fade <= 0.0f ? 0.0f : (fade < 1.0f ? 1.0f - std::cos(fade * 90.0f * 0.017453292f) : 1.0f);
+
+        // Footprint rect. bp.pos is the hull centre = footprintPos(cx,cy); recover the center tile cx/cy
+        // the same way orderBuild/tryPlace did, then apply footL/footU exactly like the placement ghost
+        // (RWX's BaseUnit.cd() already carries these offsets).
+        int cx = (int)std::floor((bp.pos.x - t.buildingToFootprintOffsetX) / TILE_SIZE + 0.5f);
+        int cy = (int)std::floor((bp.pos.y - t.buildingToFootprintOffsetY) / TILE_SIZE + 0.5f);
+        float left = (float)(cx + t.footL) * TILE_SIZE;
+        float top = (float)(cy + t.footU) * TILE_SIZE;
+        float w = (float)t.footprintTilesW() * TILE_SIZE;
+        float h = (float)t.footprintTilesH() * TILE_SIZE;
+        // :302 grow = (halfTile - 3) + ease*5, :304 f5 = 3 + ease*7 is the per-edge overshoot.
+        float grow = (TILE_SIZE * 0.5f - 3.0f) + ease * 5.0f;
+        float f5 = 3.0f + ease * 7.0f;
+        Rectangle o{ left - grow, top - grow, w + 2 * grow, h + 2 * grow };
+        // :305-308 the active paint while it is still settling, the faint inactive one afterwards.
+        Color fc{ 0, 0, 255, (uint8_t)(fade > 0.0f ? 90 : 40) };
+        const float stroke = 2.0f;   // foundationPaint.a(2.0f) at :121
+        // :309-312 four separate edges, each running f5 past both ends.
+        DrawLineEx(Vector2{ o.x - f5, o.y }, Vector2{ o.x + o.width + f5, o.y }, stroke, fc);
+        DrawLineEx(Vector2{ o.x - f5, o.y + o.height }, Vector2{ o.x + o.width + f5, o.y + o.height }, stroke, fc);
+        DrawLineEx(Vector2{ o.x, o.y - f5 }, Vector2{ o.x, o.y + o.height + f5 }, stroke, fc);
+        DrawLineEx(Vector2{ o.x + o.width, o.y - f5 }, Vector2{ o.x + o.width, o.y + o.height + f5 }, stroke, fc);
+
+        // :314-318 the real unit as a ghost, dropped the last 10*ease px. drawUnitWithBoolean sets
+        // isUnitInvulnerable for isBuilding=true, which getRenderPaint answers with a blue filter.
+        Unit gh;
+        gh.tpl = &t;
+        gh.tplKey = ToLower(t.name);
+        gh.team = bp.team;
+        gh.pos = Vec2{ bp.pos.x, bp.pos.y - 10.0f * ease };
+        gh.facing = -3.14159265f / 2.0f;
+        gh.hp = gh.maxHp = std::max(1.0f, t.maxHp);
+        gh.buildProgress = 1.0f;
+        gh.animFrame = t.defaultFrame;
+        gh.animScale = 1.0f;
+        gh.tur.assign(t.turrets.size(), TurretState{});
+        for (auto& s : gh.tur) s.angle = gh.facing;
+        gh.legs.assign(t.legs.size(), LegState{});
+        for (size_t i = 0; i < gh.legs.size(); ++i) {
+            const LegTpl& L = t.legs[i];
+            gh.legs[i].alpha = L.alpha;
+            gh.legs[i].foot = Vec2{ L.attachX, L.attachY };
+            gh.legs[i].angle = gh.facing;
+        }
+        iconRender_ = true;
+        ghostAlpha_ = 200.0f / 255.0f;
+        ghostTint_ = Color{ 120, 120, 255, 255 };   // overlayFilterBlue-ish (getRenderPaint isUnitInvulnerable)
+        drawLegs(g, gh, 2, cam);
+        drawUnit(g, gh, cam);
+        ghostTint_ = Color{ 255, 255, 255, 255 };
+        ghostAlpha_ = 1.0f;
+        iconRender_ = false;
     }
 }
 
@@ -406,17 +508,36 @@ void Renderer::drawUnitShadow(const Unit& u) {
     // CustomUnit.canDrawShadow:687 -- a hull that has gone under (posZ < -1) stops casting one, so a
     // diving submarine does not leave a crisp shadow on the water it is sinking into.
     if (u.posZ < -1.0f) return;
-    if (ToLower(t.imageShadow) != "auto") return;
-    Texture2D tex;
-    if (!loaded(t, 0, tex)) return;
-    int frames = std::max(1, t.totalFrames);
-    int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
-    int anim = ef > 1 ? u.animFrame % ef : 0;
-    float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, true));
-    // RWX OrderableUnit.drawShadow:4425-4438 builds the same es/et frame rect the hull uses and scales
-    // it by getRenderScale(), so the shadow is the body frame at its native pixel size.
-    drawSpriteFrame(tex, ef, anim, Vector2{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY },
-        (tex.width / (float)ef) * t.imageScale * u.animScale, rot, Color{ 0, 0, 0, 128 });
+    // CustomUnitConfigParser:1373 -- [graphics] image_shadow defaults to NONE, so a hull that never
+    // writes the key casts nothing at all: that is why the land factory, the command centre and most of
+    // the ground roster have no shadow in RWX either. AUTO / AUTO_ANIMATED bake a black silhouette out
+    // of the hull sprite (BaseUnit.attackUnit:446-463 keeps the sprite's alpha and zeroes the colour);
+    // any other value names a shadow image, and a SHADOW: prefix means the loader blackens a hull
+    // sprite on the way in (openUnitConfigStream:3133). resolveImage already handles both prefixes.
+    std::string sh = ToLower(t.imageShadow);
+    if (sh.empty() || sh == "none") return;
+    // The shadow stays flat on the ground: OrderableUnit.drawShadow:4414-4425 never subtracts posZ,
+    // which is precisely what makes an aircraft's silhouette sit *under* it instead of on it.
+    Vector2 at{ u.pos.x + t.shadowOffX, u.pos.y + t.shadowOffY };
+    float rot = spriteRot(unitRenderAngle(u, true));
+    float scale = t.imageScale * u.animScale;
+    if (sh == "auto" || sh == "auto_animated") {
+        Texture2D tex;
+        if (!loaded(t, 0, tex)) return;
+        int frames = std::max(1, t.totalFrames);
+        int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
+        // AUTO bakes one silhouette per hull frame; AUTO_ANIMATED bakes the whole strip and keeps the
+        // frame counter (hasShadowFrames), so the two only differ in how the sheet is stepped.
+        int anim = ef > 1 ? u.animFrame % ef : 0;
+        drawSpriteFrame(tex, ef, anim, at, (tex.width / (float)ef) * scale, rot, Color{ 0, 0, 0, 128 });
+        return;
+    }
+    // A named shadow image, drawn centred on the shadow offset at the hull's own render scale.
+    // Dropship, gunship, hovercraft, both hover tanks, both interceptors, the heavy AA ship and every
+    // mech carry one, and until now they cast nothing at all.
+    Texture2D st;
+    if (!shadowByName(t, t.imageShadow, st)) return;
+    drawSpriteFrame(st, 1, 0, at, st.width * scale, rot, Color{ 0, 0, 0, 128 });
 }
 
 void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
@@ -425,14 +546,19 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // RWX UnitTypeEnum.tree is a NaturalUnit with its own sprite path (Tree.c()).
     if (u.tplKey == "tree") { drawTree(u); return; }
     float r = std::max(6.0f, t.displayRadius);
-    Color col = WHITE;
-    if (u.underConstruction && u.tpl->isBuilding)
-        col = Color{ 140, 255, 140, (uint8_t)(40 + 200 * std::max(0.0f, std::min(1.0f, u.buildProgress))) };
-    // RWX OrderableUnit.getRenderPaint:4295-4299 -- the hull's paint is a white filter whose alpha comes
-    // from getSubmergedRenderAlpha (:4280-4289): below posZ -0.3 the sprite fades out so the water shows
-    // through it, (1 - (-z)/10) * 130 + 45 floored at 45, which is 71 for the subs' -8. Without this a
-    // diving hull just slides down the screen and still looks like it is floating on the surface.
-    col.a = (uint8_t)(col.a * submergedRenderAlpha(u.posZ) / 255);
+    // The hull's paint: the under-construction light green, faded out when it is under water
+    // (OrderableUnit.getRenderPaint:4292-4303). Legs, turrets and every pass share it, as they do in
+    // RWX, where getRenderPaint() is read by GameViewUtils:181 and CustomUnitLegController:52 alike.
+    Color col = unitRenderPaint(u);
+    // Build preview ghost: BuildPreview.draw:318 hands the real unit to drawUnitWithBoolean rather than
+    // painting a coloured block, so the preview shows the hull that is about to appear. A site that
+    // cannot take the building tints it red, which is what RWX's isUnitCapturable does (:4309-4312).
+    col.a = (uint8_t)(col.a * ghostAlpha_);
+    if (ghostTint_.r != 255 || ghostTint_.g != 255 || ghostTint_.b != 255) {
+        col.r = (uint8_t)(col.r * ghostTint_.r / 255);
+        col.g = (uint8_t)(col.g * ghostTint_.g / 255);
+        col.b = (uint8_t)(col.b * ghostTint_.b / 255);
+    }
 
     // The hull pose the animation controller wrote this tick (CustomUnit.animationFrameIndex /
     // .currentFrameTime, CustomUnitAnimationController.b():276-279). With no animation running these are
@@ -450,7 +576,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     Texture2D wt;
     if (u.dead && u.corpseWreck && loaded(t, 2, wt)) {
         drawSpriteFrame(wt, 1, 0, pv, wt.width * t.imageScale,
-                        t.isStatic() ? 0 : spriteRot(u.facing), col);
+                        spriteRot(u.facing), col);
         return;
     }
     // CustomUnit.d():671-677 -- a dead hull draws the raw wreck, a living one the baked variant of its own
@@ -462,7 +588,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     Vector2 bv{ pv.x + t.bodyOffsetDrawX(), pv.y + t.bodyOffsetDrawY() };
     if (teamed(t, t.image, 0, colorIdx, tex)) {
         int ef = (frames > 1 && tex.width % frames == 0) ? frames : 1;
-        float rot = t.isStatic() ? 0 : spriteRot(unitRenderAngle(u, false));
+        float rot = spriteRot(unitRenderAngle(u, false));
         // RWX sizes the hull from es/et, which CustomUnit:1046-1052 sets to the config's frameWidth x
         // frameHeight -- the sprite's own pixels -- and then scales that rect by getRenderScale():2327 =
         // imageScale * currentFrameTime. displayRadius is a HUD/collision radius, never a sprite size.
@@ -546,7 +672,9 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // drawable/shield_mid.png, drawn 1.25x over shieldRenderRadius on top of the whole unit. Its
     // alpha is how full the pool is plus how recently it soaked a hit, so a shielded unit glows
     // brighter the moment it is shot at.
-    if (u.shield > 0.0f && t.maxShield > 0 && !iconRender_) {
+    // Use the unit's pool capacity: convertTo can carry a shield stat onto a template that declares
+    // none (landed gunship -> flying gunship), and RWX still draws that bubble.
+    if (u.shield > 0.0f && u.shieldMax > 0 && !iconRender_) {
         Texture2D sh;
         bool custom = !t.imageShield.empty() && byName(t, t.imageShield, sh);
         if (custom || shared("shield_mid.png", sh)) {
@@ -557,7 +685,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
             if (a > 1.0f) a = 1.0f;
             if (a > 0.0f) {
                 float f = (t.shieldRenderRadius * 2.0f) / (custom ? (float)sh.width : 87.0f) * 1.25f;
-                drawSpriteFrame(sh, 1, 0, pv, sh.width * f, t.isStatic() ? 0 : spriteRot(u.facing),
+                drawSpriteFrame(sh, 1, 0, pv, sh.width * f, spriteRot(u.facing),
                     Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
             }
         }
@@ -569,7 +697,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
     // hp bar
     bool energyBar = !iconRender_ && t.maxEnergy > 0 && t.showEnergyBar && u.energy < t.maxEnergy;
     if (!iconRender_ && (u.hp < u.maxHp || u.selected || t.isBuilding || energyBar ||
-        (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax))) {
+        (u.shieldMax > 0 && t.showShieldBar && u.shield < u.shieldMax))) {
         float bw = r * 2.0f, bh = 4;
         float frac = std::max(0.0f, u.hp / u.maxHp);
         Vector2 p{ pv.x - r, pv.y - (r + 8) };
@@ -601,7 +729,7 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         // getSecondaryBarProgress (CustomUnit.java:3479-3495) fills that slot with the energy pool
         // *before* the bubble -- a unit with both only ever shows its charge. While the
         // recharge-to-full latch holds the barrels the bar is drawn in the dim grey of :1170-1174.
-        if (energyBar || (t.maxShield > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
+        if (energyBar || (u.shieldMax > 0 && t.showShieldBar && u.shield < u.shieldMax)) {
             // :1163 -- f8 becomes 3+5 once the cells are drawn, so the secondary bar drops 5 px for them
             float by = p.y + 5 + (u.underConstruction ? 5 : 0) + (transportBar ? 5 : 0);
             float sf = energyBar ? std::max(0.0f, u.energy / t.maxEnergy)
@@ -625,6 +753,35 @@ void Renderer::drawUnit(Game& g, const Unit& u, const Camera2D& cam) {
         Vector2 p{ pv.x - r, pv.y - (r + 13) };
         DrawRectangle((int)p.x, (int)p.y, (int)bw, 3, Color{ 30, 30, 30, 200 });
         DrawRectangle((int)p.x, (int)p.y, (int)(bw * std::min(1.0f, u.upgradeProgress)), 3, Color{ 60, 200, 210, 255 });
+    }
+    // RWX BuilderUnit.drawTargetPriorityPoints:206-236 -- the nano tethers, the visual that says a
+    // builder is on the job. Six lines run from the builder's nano muzzle (bn() = D(mainNanoTurret)) to
+    // the six live anchors that wander over the target (updateTargetPriorityPoints:157-192), each target
+    // end carrying a 0.5x builder_charge.png going up / builder_decharge.png coming down under a
+    // ARGB(60,255,255,255) paint. The line is 2 px round-capped: ARGB(40,0,255,0) to build,
+    // ARGB(55,255,60,60) to tear down. The muzzle end is nudged 0.15x along the same anchor offset so the
+    // six lines fan out of the barrel instead of stacking on one pixel.
+    if (t.isBuilder && u.nanoTargetId >= 0 && !u.dead && !iconRender_) {
+        const Unit* nt = g.get(u.nanoTargetId);
+        if (nt && nt->tpl) {
+            Texture2D up, down;
+            bool haveUp = shared("builder_charge.png", up);
+            bool haveDown = shared("builder_decharge.png", down);
+            Texture2D& dot = u.nanoReclaim ? down : up;
+            if (u.nanoReclaim ? haveDown : haveUp) {
+                int nanoIdx = t.mainNanoTurret >= 0 ? t.mainNanoTurret : 0;
+                Vec2 mz = muzzlePoint(u, nanoIdx);
+                Color line = u.nanoReclaim ? Color{ 255, 60, 60, 55 } : Color{ 0, 255, 0, 40 };
+                Color dotPaint{ 255, 255, 255, 60 };
+                for (int i = 0; i < 6; ++i) {
+                    const Vec2& o = u.nanoPoints[i];
+                    Vector2 a{ mz.x + o.x * 0.15f, mz.y - u.posZ + o.y * 0.15f };
+                    Vector2 b{ nt->pos.x + o.x, nt->pos.y - nt->posZ + o.y };
+                    DrawLineEx(a, b, 2.0f, line);
+                    drawSpriteFrame(dot, 1, 0, b, dot.width * 0.5f, 0.0f, dotPaint);
+                }
+            }
+        }
     }
 }
 
@@ -795,6 +952,9 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     // painting the fog into the map layers (MapLayer) rather than as a separate scene pass. Hulls are
     // filtered by Game::visibleToPlayer, so what is left on top is exactly what the player can see.
     drawFog(g, view.cam);
+    // Pending build sites (RWX BuildPreview.drawAll, GameLogic:1912) -- blue foundation + ghost while
+    // the builder walks over. Before the hulls so a real unit standing on the site covers the marker.
+    drawBlueprints(g, view.cam);
     // under-construction + normal units sorted so buildings draw first. A hull in someone's hold is not
     // drawn at all (CustomUnit.a(GameEngine):4656) -- it reappears where b():718-809 puts it.
     for (auto& u : g.units) if (!u.riding() && g.visibleToPlayer(u)) drawUnitShadow(u);
@@ -995,29 +1155,87 @@ void Renderer::drawWorld(Game& g, const ViewState& view) {
     // RWX GameLogic.java:1984 -- drawEffect(f, 2) is the air pass, after the units and the shots. The muzzle
     // list lands here, which is what puts a shockwave or a spark cloud over the barrel that made it.
     drawFx(g, false);
-    // nano build particles (green flecks flying builder -> building, RW effects.png frame 6)
-    for (auto& p : g.particles) {
-        float prog = p.dur > 0 ? std::min(1.0f, p.t / p.dur) : 1.0f;
-        float rad = 2.5f + 10.0f * prog;
-        uint8_t a = (uint8_t)(200 * (1 - prog));
-        Color pc = p.reclaim ? Color{ 200, 40, 40, a } : Color{ 80, 200, 40, a };
-        DrawCircleV(Vector2{ p.pos.x, p.pos.y }, rad, pc);
+    // nano build / reclaim flecks. OrderableUnit.a(...):5175 sets ap=6 (effects.png cell 6, the green
+    // one) and b(...):5198 sets ap=5 (cell 5, red), with V=W=20 ticks, E=0.8 alpha, G=0.2 -> F=1.0
+    // scale. The sheet is a row of 25x25 cells stepped by 26 from origin (1,1), which is kFxSheets[0].
+    {
+        Texture2D sheet;
+        if (!g.particles.empty() && shared("effects.png", sheet)) {
+            for (auto& p : g.particles) {
+                float prog = p.dur > 0 ? std::min(1.0f, p.t / p.dur) : 1.0f;
+                int cell = p.reclaim ? 5 : 6;
+                float sz = 25.0f * (0.2f + 0.8f * prog);          // G -> F
+                float a = 0.8f * (1.0f - prog);                   // E, fading out over V
+                Rectangle src{ 1.0f + 26.0f * cell, 1.0f, 25.0f, 25.0f };
+                Rectangle dst{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f, sz, sz };
+                DrawTexturePro(sheet, src, dst, Vector2{ 0.0f, 0.0f }, 0.0f,
+                               Color{ 255, 255, 255, (uint8_t)(a * 255.0f) });
+            }
+        }
     }
     // command marker
     if (view.cmdMarkerOn) {
         float a = 1.0f - view.cmdMarkerT / 0.6f;
         DrawCircleLines((int)view.cmdMarker.x, (int)view.cmdMarker.y, 14 * (1 + (1 - a)), Fade(WHITE, std::max(0.0f, a)));
     }
-    // placement ghost
+    // Placement preview -- the thing that follows the mouse BEFORE the player clicks. This is NOT
+    // BuildPreview (the blue blueprint a builder walks to after the order is given). The real source is
+    // GameUI.validateBuildingPlacement:4002-4054: it draws the actual unit with isUnitDisabled=true
+    // when the spot is placeable (green) or isUnitCapturable=true when it is not (red), via
+    // OrderableUnit.getRenderPaint:4304-4312 (green paint ARGB(200,20,255,20) + Multiply RGB(70,255,70);
+    // red ARGB(200,255,20,20) + Multiply RGB(255,40,40)), plus a per-tile footprint outline through
+    // drawPlacementOverlay -> TileMap.renderBuildPlacementOverlay:1232-1257.
     if (view.placing) {
         const UnitTemplate* t = g_templates.find(ToLower(view.placingName));
         if (t) {
-            Color gc = view.placingValid ? Color{ 90, 220, 90, 120 } : Color{ 220, 80, 80, 120 };
             int fw = t->footprintTilesW(), fh = t->footprintTilesH();
             int cx = (int)(view.placingWorld.x / TILE_SIZE), cy = (int)(view.placingWorld.y / TILE_SIZE);
             int minx = cx + t->footL, miny = cy + t->footU;
-            for (int y = miny; y < miny + fh; ++y) for (int x = minx; x < minx + fw; ++x)
-                DrawRectangle(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE, gc);
+            // TileMap:735/739/741 -- valid hover stroke ARGB(100,0,185,0) = RGB(0,185,0) green, 1 px;
+            // invalid fill ARGB(155,175,0,0) = RGB(175,0,0) red + stroke ARGB(255,175,0,0) red, 1 px.
+            for (int y = miny; y < miny + fh; ++y) {
+                for (int x = minx; x < minx + fw; ++x) {
+                    Rectangle cell{ (float)(x * TILE_SIZE), (float)(y * TILE_SIZE),
+                                    (float)TILE_SIZE, (float)TILE_SIZE };
+                    if (view.placingValid) {
+                        DrawRectangleLinesEx(cell, 1.0f, Color{ 0, 185, 0, 140 });
+                    } else {
+                        DrawRectangleRec(cell, Color{ 175, 0, 0, 155 });
+                        DrawRectangleLinesEx(cell, 1.0f, Color{ 175, 0, 0, 255 });
+                    }
+                }
+            }
+
+            // The real unit, tinted exactly like getRenderPaint's disabled/capturable branches.
+            // No drop animation and no blueprint box: validateBuildingPlacement draws it straight at
+            // the cursor with c(0.0f). Multiply RGB(70,255,70)/RGB(255,40,40) is the tint below.
+            Unit gh;
+            gh.tpl = t;
+            gh.tplKey = ToLower(t->name);
+            gh.team = g.playerTeam();
+            gh.pos = view.placingWorld;
+            gh.facing = view.placeFacing;   // RWX buildingRotation, rotated by R while placing
+            gh.hp = gh.maxHp = std::max(1.0f, t->maxHp);
+            gh.buildProgress = 1.0f;
+            gh.animFrame = t->defaultFrame;
+            gh.animScale = 1.0f;
+            gh.tur.assign(t->turrets.size(), TurretState{});
+            for (auto& s : gh.tur) s.angle = gh.facing;
+            gh.legs.assign(t->legs.size(), LegState{});
+            for (size_t i = 0; i < gh.legs.size(); ++i) {
+                const LegTpl& C = t->legs[i];
+                gh.legs[i].alpha = C.alpha;
+                gh.legs[i].foot = Vec2{ C.attachX, C.attachY };
+                gh.legs[i].angle = gh.facing;
+            }
+            iconRender_ = true;      // a preview gets no HP bar, selection ring or shield bubble
+            ghostAlpha_ = 200.0f / 255.0f;   // getRenderPaint's paint alpha (200)
+            ghostTint_ = view.placingValid ? Color{ 70, 255, 70, 255 } : Color{ 255, 40, 40, 255 };
+            drawLegs(g, gh, 2, view.cam);
+            drawUnit(g, gh, view.cam);
+            ghostTint_ = Color{ 255, 255, 255, 255 };
+            ghostAlpha_ = 1.0f;
+            iconRender_ = false;
         }
     }
     debugDrawWorld(g, view.cam);

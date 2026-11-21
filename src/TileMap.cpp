@@ -322,5 +322,62 @@ bool TileMap::loadTmx(const std::string& path, std::string* err) {
 
     for (XMLElement* layer = map->FirstChildElement("layer"); layer; layer = layer->NextSiblingElement("layer"))
         processLayer(layer);
+
+    // ---- the `Triggers` object layer -------------------------------------------------------------
+    // RWX builds these into MapObject before a single unit exists, and they carry the rules of the map:
+    // `map_info` says what kind of game it is and how it ends, `team_N_info` carries each side's starting
+    // credits and allyGroup, `camera_start` is where the view opens. RP ignored the layer outright, so
+    // every map ran as a free-for-all with the same hard-coded economy.
+    info = MapInfo{};
+    teamInfos.clear();
+    hasCameraStart = false;
+    int ogSeen = 0, obSeen = 0;
+    for (XMLElement* og = map->FirstChildElement("objectgroup"); og; og = og->NextSiblingElement("objectgroup")) {
+        ++ogSeen;
+        const char* gname = og->Attribute("name");
+        if (!gname || ToLower(Trim(gname)) != "triggers") continue;
+        for (XMLElement* ob = og->FirstChildElement("object"); ob; ob = ob->NextSiblingElement("object")) {
+            ++obSeen;
+            std::unordered_map<std::string, std::string> props;
+            if (XMLElement* ps = ob->FirstChildElement("properties"))
+                for (XMLElement* pe = ps->FirstChildElement("property"); pe; pe = pe->NextSiblingElement("property")) {
+                    const char* n = pe->Attribute("name");
+                    const char* v = pe->Attribute("value");
+                    if (n) props[ToLower(n)] = v ? v : "";
+                }
+            auto num = [&](const char* k, float def) {
+                auto it = props.find(k);
+                return it == props.end() ? def : (float)atof(it->second.c_str());
+            };
+            auto str = [&](const char* k) {
+                auto it = props.find(k);
+                return it == props.end() ? std::string() : it->second;
+            };
+            std::string nm = ToLower(Trim(ob->Attribute("name") ? ob->Attribute("name") : ""));
+            if (nm == "map_info") {
+                info.present = true;
+                info.type = ToLower(Trim(str("type")));
+                info.winCondition = ToLower(Trim(str("wincondition")));
+                info.loseCondition = ToLower(Trim(str("losecondition")));
+                info.fog = ToLower(Trim(str("fog")));
+                info.introText = str("introtext");
+            } else if (nm == "camera_start") {
+                hasCameraStart = true;
+                cameraStart.x = (float)ob->IntAttribute("x", 0);
+                cameraStart.y = (float)ob->IntAttribute("y", 0);
+            } else if (nm.size() > 5 && nm.rfind("team_", 0) == 0 &&
+                       nm.compare(nm.size() - 5, 5, "_info") == 0) {
+                MapTeamInfo ti;
+                // The object is named `team_<n>_info` and repeats the number in a `team` property; the
+                // property wins when both are there, the name is the fallback.
+                ti.team = (int)num("team", (float)atoi(nm.c_str() + 5));
+                ti.allyGroup = (int)num("allygroup", -1);
+                ti.credits = num("credits", -1.0f);
+                teamInfos.push_back(ti);
+            }
+        }
+    }
+    TraceLog(LOG_INFO, "Triggers layer: %d objectgroup(s), %d object(s), mapInfo=%d, teamInfo=%zu",
+             ogSeen, obSeen, (int)info.present, teamInfos.size());
     return true;
 }

@@ -13,9 +13,10 @@ static inline int tileOf(const TileMap& m, int x, int y) { return y * m.w + x; }
 bool isWalkable(const TileMap& map, int x, int y, MoveType mt) {
     if (!map.inBounds(x, y)) return false;
     switch (mt) {
-        case MoveType::AIR:
-        case MoveType::HOVER: return true;
+        case MoveType::AIR: return true;
+        case MoveType::HOVER: return map.walkableHover(x, y);
         case MoveType::WATER: return map.walkableWater(x, y);
+        case MoveType::OVER_CLIFF: return map.walkableOverCliff(x, y);
         case MoveType::OVER_CLIFF_WATER: return map.walkableAmphibious(x, y);
         default: return map.walkableLand(x, y);
     }
@@ -34,7 +35,7 @@ std::vector<Vec2> findPath(const TileMap& map, int sx, int sy, int gx, int gy, M
         if (best < 0) return result;
         gx = bx; gy = by;
     }
-    if (mt == MoveType::AIR || mt == MoveType::HOVER) { // straight line
+    if (mt == MoveType::AIR) { // straight line; HOVER has real terrain rules now, see TileMap::walkableHover
         result.push_back({ (sx + 0.5f) * TILE_SIZE, (sy + 0.5f) * TILE_SIZE });
         result.push_back({ (gx + 0.5f) * TILE_SIZE, (gy + 0.5f) * TILE_SIZE });
         return result;

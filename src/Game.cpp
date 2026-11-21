@@ -50,11 +50,15 @@ static bool overLiquid(const Game& g, Vec2 p) {
 // dropped at parse time, so it cannot fail here either.
 static bool condTestsOk(const Game& g, const Unit& u, const UnloadCond& c) {
     if (c.never) return false;
-    for (auto& pr : c.tests) {
-        bool v = pr.first == CondPred::overLiquid ? overLiquid(g, u.pos)
-               : pr.first == CondPred::overWater ? overWater(g, u.pos)
-               : u.driven;
-        if (pr.second ? v : !v) return false;
+    for (const CondTest& t : c.tests) {
+        bool v;
+        switch (t.pred) {
+            case CondPred::overLiquid: v = overLiquid(g, u.pos); break;
+            case CondPred::overWater: v = overWater(g, u.pos); break;
+            case CondPred::timeAlive: v = u.age >= t.arg * 60.0f; break;  // seconds -> 60 Hz ticks
+            default: v = u.driven; break;
+        }
+        if (t.negated ? v : !v) return false;
     }
     return true;
 }
@@ -255,16 +259,75 @@ static void initTurrets(Unit& u) {
     for (size_t i = old; i < n; ++i) { u.tur[i].angle = u.facing; u.tur[i].lastAim = u.facing; }
 }
 
+// RWX CustomUnit.setUnitType (:998-1045): when a convertTo swaps the template, the turret movement
+// states are carried over BY NAME, not by array index. The landed and flying gunships have different
+// barrel sets ([turret_2],[turret_3],[turret_9] vs [turret_blink],[turret_nano],[turret_2],[turret_3],
+// [turret_main],[turret_antiNuke]); a plain index-preserving resize leaves e.g. turret_2 holding the
+// invisible [turret_9] foot's state, which is why the deployed hull comes out with its top guns wrong.
+static void remapTurrets(Unit& u, const UnitTemplate* from) {
+    if (!u.tpl || !from) { initTurrets(u); return; }
+    const auto& to = u.tpl->turrets;
+    std::vector<TurretState> old = u.tur;
+    std::vector<char> used(old.size(), 0);
+    std::vector<char> claimed(to.size(), 0);
+    std::vector<TurretState> next(to.size());
+    // First pass: a barrel with the same name in both templates keeps its state (RWX's
+    // findProjectileConfigByName lookup), regardless of where it sits in the new array.
+    for (size_t i = 0; i < to.size(); ++i) {
+        for (size_t j = 0; j < old.size(); ++j) {
+            if (used[j] || from->turrets[j].name.empty() || from->turrets[j].name != to[i].name) continue;
+            next[i] = old[j]; used[j] = 1; claimed[i] = 1; break;
+        }
+    }
+    // Second pass: slots with no name match take any leftover state, else start fresh at the new
+    // barrel's rest angle. RWX reuses unclaimed UnitMovementData objects this way.
+    float rest = u.facing;
+    size_t spare = 0;
+    for (size_t i = 0; i < to.size(); ++i) {
+        if (claimed[i]) continue;
+        while (spare < old.size() && used[spare]) ++spare;
+        if (spare < old.size()) {
+            next[i] = old[spare]; used[spare] = 1;
+        } else {
+            next[i] = TurretState{};
+            next[i].angle = rest + to[i].idleDir * 0.0174533f;
+            next[i].lastAim = next[i].angle;
+        }
+    }
+    u.tur = next;
+}
+
 bool Game::init(const std::string& mapPath, std::string* err) {
     if (!map.loadTmx(mapPath, err)) return false;
 
     std::vector<bool> used(16, false);
     for (auto& s : map.spawns) if (s.team >= 0 && s.team < 16) used[s.team] = true;
+    // The map's `team_N_info` objects override the hard-coded economy and carry the alliances. A team the
+    // map describes but that has no unit on the board is not created: RP only spawns what the Units layer
+    // paints, so an empty team would just read as "wiped out" and end the game on tick 1.
+    auto infoFor = [&](int id) -> const MapTeamInfo* {
+        for (const auto& ti : map.teamInfos) if (ti.team == id) return &ti;
+        return nullptr;
+    };
+    for (const auto& ti : map.teamInfos)
+        if (ti.team >= 0 && ti.team < 16 && !used[ti.team])
+            printf("team_info for team %d has no units on this map\n", ti.team);
     for (int i = 0; i < 16; ++i) if (used[i]) {
         Team t; t.id = i; t.color = i; t.isPlayer = (i == 0); t.credits = (i == 0) ? 4000 : 2500;
+        if (const MapTeamInfo* ti = infoFor(i)) {
+            if (ti->credits >= 0.0f) t.credits = ti->credits;
+            if (ti->allyGroup >= 0) t.allyGroup = ti->allyGroup;
+        }
         teams.push_back(t);
     }
-    if (!used[0]) { Team a; a.id = 0; a.isPlayer = true; a.credits = 4000; teams.push_back(a); }
+    if (!used[0]) {
+        Team a; a.id = 0; a.isPlayer = true; a.credits = 4000;
+        if (const MapTeamInfo* ti = infoFor(0)) {
+            if (ti->credits >= 0.0f) a.credits = ti->credits;
+            if (ti->allyGroup >= 0) a.allyGroup = ti->allyGroup;
+        }
+        teams.push_back(a);
+    }
 
     for (auto& s : map.spawns) {
         Vec2 pos = tileSpawnPos(g_templates.find(ToLower(s.unit)), s.tx, s.ty);
@@ -337,6 +400,10 @@ bool Game::init(const std::string& mapPath, std::string* err) {
             if (placed) break;
         }
     }
+    // The `Triggers` object layer's map_info. `fog=none` is the map saying it has no fog at all (3
+    // shipped maps); `los` is line-of-sight fog, which RP has no model for, so it keeps the default
+    // circular sight rather than pretending.
+    if (ToLower(map.info.fog) == "none") fogEnabled = false;
     initFog();
     updateFog();   // light the starting positions right away instead of on the first tick
     return true;
@@ -359,10 +426,15 @@ void Game::revealFogAt(Vec2 world, float tiles, uint8_t value) {
     int x0 = std::max(0, (int)std::floor(cx) - r), x1 = std::min(map.w - 1, (int)std::floor(cx) + r);
     int y0 = std::max(0, (int)std::floor(cy) - r), y1 = std::min(map.h - 1, (int)std::floor(cy) + r);
     float r2 = tiles * tiles;
-    // :1521-1523 -- the rim is a ramp, not a hard edge: (dist - (i-3)) * 10 / (i^2 - (i-3)^2), i.e.
-    // the outer two tiles fade from 0 to 10. RP stops the ramp at 4 so a hull standing on the rim
-    // still counts as seen (the >= 5 cut is what hides it) and only the shading fades out.
-    float inner = std::max(0.0f, tiles - 2.0f), inner2 = inner * inner;
+    // TileMap.updateFogVisibilityForTeamCircle:1543-1580, verbatim:
+    //   f4 = (i-3)^2  -> d2 <= f4 is fully visible (0)
+    //   f5 = i^2      -> d2 <= f5 is the ring, value = (d2 - f4) * 10 / (f5 - f4)
+    // so the ring is 3 tiles wide and reaches 10 (fully black) at its outer edge. RP used i-2 for the
+    // core and capped the ring at 4, and since the "visible" test is `value < 5` that made every tile
+    // inside the sight radius visible -- about 1.2-1.5 tiles more than RWX, with the rim never hiding
+    // anything. The ramp is quadratic because RWX feeds it d2, not the distance.
+    float inner = std::max(0.0f, tiles - 3.0f), inner2 = inner * inner;
+    float ramp = (r2 > inner2) ? 10.0f / (r2 - inner2) : 0.0f;
     for (int y = y0; y <= y1; ++y) {
         uint8_t* row = &fog[(size_t)y * map.w];
         for (int x = x0; x <= x1; ++x) {
@@ -372,7 +444,7 @@ void Game::revealFogAt(Vec2 world, float tiles, uint8_t value) {
             uint8_t v = value;
             if (value == FOG_VISIBLE) {
                 if (d2 <= inner2) v = FOG_VISIBLE;
-                else v = (uint8_t)std::min(4.0f, 1.0f + 3.0f * (std::sqrt(d2) - inner) / 2.0f);
+                else v = (uint8_t)std::min(10.0f, (d2 - inner2) * ramp);
             }
             // Only ever brightens, so a tile two hulls can see stays at the brighter value.
             if (row[x] > v) row[x] = v;
@@ -425,7 +497,10 @@ Projectile* Game::findProjectile(int id) {
 
 // RW: building tiles get path cost -1; mark/unmark footprint tiles
 static void markBuildingOcc(TileMap& map, const Unit& u, int delta) {
-    if (!u.tpl || !u.tpl->isStatic()) return;
+    // RWX only marks [core] isBuilding:true hulls onto the pathfinding grid. A custom unit with
+    // movementType:NONE (e.g. experimentalGunshipLanded) is immobile but NOT a building and must
+    // not consume a construction tile.
+    if (!u.tpl || !u.tpl->isBuilding) return;
     // The anchor tile is what placement added the footprint offset to, so the same offset comes back off
     // the position to recover it (BaseUnit.a(TileMap,Point):2355-2358). A turret that asks for offset 20
     // lands a whole tile further into its footprint than the default, and would block the wrong tiles if
@@ -454,6 +529,7 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     // RWX CustomUnit.java:1074-1083: a shielded unit comes up with a full bubble, and only
     // [core] startShieldAtZero asks for it to fill up from empty instead.
     u.shieldMax = (float)tpl->maxShield;
+    u.shieldRegen = tpl->shieldRegen;
     u.shield = tpl->startShieldAtZero ? 0.0f : u.shieldMax;
     // :1082-1089 the same rule for the energy pool: a fresh unit comes up at
     // maxEnergy * energyStartingPercentage, and startEnergyAtZero leaves it on the 0 it is born with.
@@ -462,15 +538,20 @@ int Game::spawnUnit(const std::string& tplKey, int team, Vec2 pos, bool underCon
     u.animFrame = tpl->defaultFrame;      // CustomUnit.setUnitType:1060
     // RWX BaseBuilding.java:108: a building's body angle is -90 deg, so its turret idles along the
     // unrotated sprite (north) plus [turret] idleDir.
-    if (tpl->isStatic()) {
+    if (tpl->isBuilding) {
         u.facing = -1.5708f;
-        u.targetFacing = u.facing;   // a hull that never turns is always aimed where it points
+        u.targetFacing = u.facing;   // a building's art is authored north, whatever its movement type
     }
     initTurrets(u);
     initLegs(u);
     u.underConstruction = underConstruction;
+    // BaseUnit's constructor sets buildProgress = 1 (BaseUnit.java:386) and only a hull that is being
+    // placed drops it back to 0, so a hull that is not under construction is *finished* rather than
+    // "at progress 0". The green under-construction paint (OrderableUnit.getRenderPaint:4300) keys off
+    // buildProgress, so leaving the struct default of 0 tinted every unit in the game.
+    u.buildProgress = underConstruction ? 0.0f : 1.0f;
     units.push_back(u);
-    if (tpl->isStatic()) markBuildingOcc(map, units.back(), +1);
+    if (tpl->isBuilding) markBuildingOcc(map, units.back(), +1);
     if (attachmentSpawnDepth < 4 && !tpl->attachments.empty()) createAttachments(units.back());
     return u.id;
 }
@@ -479,11 +560,38 @@ bool Game::canAfford(int team, float cost) { Team* t = teamOf(*this, team); retu
 void Game::spend(int team, float cost) { Team* t = teamOf(*this, team); if (t) t->credits -= cost; }
 void Game::reward(int team, float credits) { Team* t = teamOf(*this, team); if (t) t->credits += credits; }
 
+// UnitPrice: an action's cost can come out of any pool, not just credits. `price : ammo=1` is what the
+// nuke launcher and both anti-nuke launchers write, so reading only the credits part made every one of
+// those actions free -- and left the launcher able to fire with an empty magazine.
+static bool canPayActionCost(const Game& g, const Unit& u, const UnitAction& a) {
+    const ResourceCost& c = a.priceCost;
+    if (c.credits > 0.0f) {
+        bool afford = false;
+        for (const Team& t : g.teams) if (t.id == u.team) { afford = t.credits >= c.credits; break; }
+        if (!afford) return false;
+    }
+    if (c.energy > 0.0f && u.energy < c.energy) return false;
+    // Paying hp must not be able to kill the payer outright, which is how RWX reads a UnitPrice on hp.
+    if (c.hp > 0.0f && u.hp <= c.hp) return false;
+    if (c.shield > 0.0f && u.shield < c.shield) return false;
+    if (c.ammo > 0.0f) {
+        auto it = u.resources.find("ammo");
+        if (it == u.resources.end() || it->second < c.ammo) return false;
+    }
+    for (const auto& kv : c.custom) {
+        auto it = u.resources.find(kv.first);
+        if (it == u.resources.end() || it->second < kv.second) return false;
+    }
+    return true;
+}
+
 static bool passableAt(Game& g, Vec2 p, MoveType mt) {
     int x = (int)(p.x / TILE_SIZE), y = (int)(p.y / TILE_SIZE);
     switch (mt) {
-        case MoveType::AIR: case MoveType::HOVER: return g.map.inBounds(x, y);
+        case MoveType::AIR: return g.map.inBounds(x, y);
+        case MoveType::HOVER: return g.map.walkableHover(x, y);
         case MoveType::WATER: return g.map.walkableWater(x, y);
+        case MoveType::OVER_CLIFF: return g.map.walkableOverCliff(x, y);
         case MoveType::OVER_CLIFF_WATER: return g.map.walkableAmphibious(x, y);
         default: return g.map.walkableLand(x, y);
     }
@@ -505,7 +613,10 @@ static void computePath(Game& g, Unit& u, Vec2 target) {
     MoveType mt = u.tpl->moveType;
     u.moveGoal = target; u.hasGoal = true; u.repathTimer = 30; u.stuckTimer = 0;
     u.path.clear(); u.pathIdx = 0;
-    if (mt == MoveType::AIR || mt == MoveType::HOVER) { u.path.push_back(target); return; }
+    // Only AIR ignores terrain. HOVER used to take this shortcut too, back when it was modelled as
+    // "anywhere on the map"; it now has a real passability rule (lava and large rocks stop it), so it
+    // has to walk the same losClear/A* route as a ground unit.
+    if (mt == MoveType::AIR) { u.path.push_back(target); return; }
     if (losClear(g, u.pos, target, mt)) {
         Vec2 d = target - u.pos; float len = d.len();
         int n = (int)(len / TILE_SIZE);
@@ -524,7 +635,47 @@ static void computePath(Game& g, Unit& u, Vec2 target) {
     if (passableAt(g, target, mt)) u.path.back() = target;
 }
 
+// RWX FormationEngine.a(int,float,float): a 6-wide grid of slots rotated to the direction of travel.
+// `count` hulls (rounded up to even), `radius` the largest member, `angle` the facing. Slot i3 starts
+// at 1 and walks 1..6 then resets to 0 (next row i4++); column i2 is 3+i3/2 when i3 is even and
+// 3-(i3+1)/2 when odd, giving the alternating -1,+1,-2,+2,... stagger. Spacing f3 = 2+radius*2*1.5.
+static void formationSlots(int count, float radius, float angle, std::vector<Vec2>& out) {
+    out.clear();
+    if (count <= 0) return;
+    int n = count; if (n % 2 != 0) ++n;          // FormationEngine.a(): round up to even
+    float f3 = 2.0f + radius * 2.0f * 1.5f;
+    float cs = std::cos(angle), sn = std::sin(angle);
+    int i3 = 1, i4 = 0;
+    for (int i = 0; i < n; ++i) {
+        int i2 = (i3 % 2 == 0) ? (3 + i3 / 2) : (3 - (i3 + 1) / 2);
+        float f4 = (float)(i2 - 3) * f3;        // lateral column offset
+        float f5 = (float)(-i4) * f3;           // longitudinal row offset
+        // FormationEngine.a(): rotate the grid into the direction of travel.
+        out.push_back(Vec2{ f5 * cs - f4 * sn, f4 * cs + f5 * sn });
+        ++i3; if (i3 > 6) { i3 = 0; ++i4; }
+    }
+}
+
 void Game::orderMove(std::vector<int> ids, Vec2 target) {
+    // FormationGroup.c(): the facing is the angle from the selection's centroid to the target, and
+    // the grid spacing uses the largest joining hull's radius. Leader (slot 0) stays on the target.
+    Vec2 centroid{ 0, 0 };
+    float maxRadius = 0;
+    int joining = 0;
+    for (int id : ids) {
+        Unit* u = get(id);
+        if (!u || !u->tpl || u->isStatic()) continue;
+        centroid = centroid + u->pos;
+        if (u->tpl->joinsGroupFormations) { maxRadius = std::max(maxRadius, u->tpl->radius); ++joining; }
+    }
+    float angle = 0;
+    if (!ids.empty()) {
+        centroid = centroid * (1.0f / (float)ids.size());
+        angle = std::atan2(target.y - centroid.y, target.x - centroid.x);
+    }
+    std::vector<Vec2> slots;
+    formationSlots(joining, maxRadius, angle, slots);
+
     int k = 0;
     for (int id : ids) {
         Unit* u = get(id); if (!u || !u->tpl || u->isStatic()) continue;
@@ -534,13 +685,10 @@ void Game::orderMove(std::vector<int> ids, Vec2 target) {
         // and dropped on the same tick; it may still fire at whatever it acquires.
         if (u->tpl->ignoreMoveOrders) { u->path.clear(); u->hasGoal = false; continue; }
         Vec2 t = target;
-        // FormationGroup.java:65 -- a hull that opts out of group formations gets no
-        // golden-angle slot and therefore must not consume a slot index either.
-        if (k > 0 && u->tpl->joinsGroupFormations) {
-            float ang = (float)k * 2.39996f;
-            float rad = 6.0f + u->tpl->radius * 1.5f * std::sqrt((float)k);
-            t = target + Vec2{ std::cos(ang) * rad, std::sin(ang) * rad };
-        }
+        // FormationGroup.java:65 -- a hull that opts out of group formations gets no slot and must
+        // not consume one either. Slot 0 is the leader on the target; followers take the grid slots.
+        if (k > 0 && u->tpl->joinsGroupFormations && (size_t)k < slots.size())
+            t = target + slots[k];
         computePath(*this, *u, t);
         if (u->tpl->joinsGroupFormations) ++k;
     }
@@ -643,14 +791,14 @@ void Game::orderStop(std::vector<int> ids) {
 bool Game::buildingSpotFree(Vec2 center, const UnitTemplate& t) const {
     float w = t.footprintTilesW() * TILE_SIZE, h = t.footprintTilesH() * TILE_SIZE;
     for (auto& u : units) {
-        if (u.dead || !u.tpl || !u.tpl->isStatic()) continue;
+        if (u.dead || !u.tpl || !u.tpl->isBuilding) continue;
         float uw = u.tpl->footprintTilesW() * TILE_SIZE, uh = u.tpl->footprintTilesH() * TILE_SIZE;
         if (std::fabs(center.x - u.pos.x) < (w + uw) / 2 - 2 && std::fabs(center.y - u.pos.y) < (h + uh) / 2 - 2) return false;
     }
     return true;
 }
 
-bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty) {
+bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty, float facing) {
     Unit* b = get(builderId); if (!b || !b->tpl || !b->tpl->isBuilder) return false;
     const UnitTemplate* tpl = g_templates.find(ToLower(unitName)); if (!tpl || !tpl->isBuilding) return false;
     if (!canAfford(b->team, tpl->price)) return false;
@@ -667,6 +815,12 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     spend(b->team, tpl->price);
     int bid = spawnUnit(unitName, b->team, center, true);
     if (bid < 0) { reward(b->team, tpl->price); return false; }
+    // The building inherits the ghost's rotation at order time (RWX buildingRotation is baked into
+    // the placed hull's initial turret angle).
+    if (Unit* built = get(bid)) {
+        built->facing = facing;
+        for (auto& s : built->tur) s.angle = facing;
+    }
     if (b->tpl->dieOnConstruct) {
         // RWX CustomUnit.m():3668-3679: the builder is given to the foundation. It leaves play with no
         // death effect and the new building takes over its selection.
@@ -677,7 +831,58 @@ bool Game::orderBuild(int builderId, const std::string& unitName, int tx, int ty
     } else {
         b->nanoTargetId = bid; b->nanoReclaim = false; b->nanoOrderAge = 0;
     }
+    // RWX GameUI.handleBuildingPlacement:2417-2428 creates a BuildPreview for each builder that got
+    // the order. It is the blue "pending site" marker shown while the hull walks over; the under-
+    // construction unit above carries the green buildProgress paint. fadeInProgress starts at
+    // 1 + 0.15*queueIndex (first in the queue => 1.0).
+    {
+        Blueprint bp;
+        bp.tpl = tpl;
+        bp.pos = center;
+        bp.builderId = b->id;
+        bp.targetId = bid;
+        bp.team = b->team;
+        bp.fade = 1.0f + 0.15f * (float)blueprints.size();
+        blueprints.push_back(bp);
+    }
     return true;
+}
+
+// RWX BuildPreview.update:232-258. Every 6 ticks the marker checks whether its builder has a waypoint
+// near the site; RP has no waypoints here, so the equivalent is the builder's nano target being this
+// site and the builder being within build range. Once that has happened at least once, or the site is
+// invalid / older than 180 ticks, the blueprint is removed and the green hull is left on its own.
+void Game::updateBlueprints() {
+    if (blueprints.empty()) return;
+    for (Blueprint& bp : blueprints) {
+        if (bp.dead) continue;
+        bp.timer += 1.0f;
+        bp.lifeTimer += 1.0f;
+        bp.fade = std::max(0.0f, bp.fade - 0.04f);   // fadeInSpeed (BuildPreview:108,236)
+
+        bool near = false;
+        bool valid = false;
+        Unit* builder = get(bp.builderId);
+        Unit* site = get(bp.targetId);
+        if (builder && !builder->dead && site && !site->dead) {
+            valid = true;
+            if (!builder->nanoReclaim && builder->nanoTargetId == bp.targetId) {
+                float range = builder->tpl->nanoRangeForRepair > 0 ? builder->tpl->nanoRangeForRepair
+                                                                   : builder->tpl->nanoRange;
+                near = builder->pos.dist(site->pos) <= range * 1.5f;
+                if (near) bp.wasEverPlaceable = true;
+            }
+        }
+        if (bp.timer > 6.0f) {
+            bp.timer = 0.0f;
+            if ((!bp.wasEverPlaceable && bp.lifeTimer > 180.0f) || !valid) bp.dead = true;
+            // RWX keeps the marker while the waypoint is near; RP drops it the moment the builder can
+            // start work, which is when the site's own green paint becomes the visible progress cue.
+            if (near) bp.dead = true;
+        }
+    }
+    blueprints.erase(std::remove_if(blueprints.begin(), blueprints.end(),
+                                    [](const Blueprint& b) { return b.dead; }), blueprints.end());
 }
 
 // nearest water tile to `from` within `radiusPx` (ships must launch from water)
@@ -713,8 +918,8 @@ bool Game::orderUpgrade(int unitId, int actionIdx) {
     if (!a.convertTo.empty() && !g_templates.find(ToLower(a.convertTo))) return false;
     bool instant = a.buildSpeed >= 1e8f;
     if (!instant && u->upgradeIdx >= 0) return false;
-    if (!canAfford(u->team, a.price)) return false;
-    spend(u->team, a.price);
+    if (!canPayActionCost(*this, *u, a)) return false;
+    payResourceCost(*this, *u, a.priceCost);
     if (instant) {
         UnitAction copy = a;
         actionEvent(*u, "queueitemadded", copy.tags);
@@ -975,6 +1180,7 @@ void Game::update() {
     for (auto& e : effects) { e.t += 1; e.pos.y += e.sink; if (e.t - e.delay >= e.life) e.dead = true; }
     updateFx();
     for (auto& p : particles) { p.t += 1; p.pos = p.pos + p.vel; if (p.t >= p.dur) p.dead = true; }
+    updateBlueprints();   // RWX BuildPreview.updateAll (GameLogic:1566)
     // A dead unit only leaves the list when its death fall is over -- CustomUnit keeps the falling hull
     // as a live game object until it touches down (:1672, and the object is dropped at :1731 / by the
     // isDeathFallComplete path at :1752).
@@ -1267,12 +1473,42 @@ static void stepAnimation(Unit& u, float f) {
     if (u.animPlaying) applyAnimationPose(u, u.animEnding);
 }
 
+// RWX BuilderUnit.updateTargetPriorityPoints:157-192 -- each of the six nano tethers owns two points:
+// the live one (drawn) and the one it chases. The live point steps 0.1 px toward its target, then eases
+// another 4% of the remaining gap, and whenever it has arrived within 1 px the target is re-rolled
+// inside radius*0.75 -- which is what makes the six lines wander over the hull instead of pinning to
+// its centre. Utility.distanceSq(x,y,step) is the obfuscated moveTowards this leans on. With no target
+// both arrays are zeroed and the lines vanish (:161-169).
+static void updateNanoPoints(Unit& u, const Unit* target, float f) {
+    if (!target) {
+        if (u.nanoPoints[0].x != 0.0f || u.nanoPoints[0].y != 0.0f) {
+            for (int i = 0; i < 6; ++i) { u.nanoPoints[i] = Vec2{}; u.nanoRenders[i] = Vec2{}; }
+        }
+        return;
+    }
+    float reach = target->tpl ? target->tpl->radius * 0.75f : 8.0f;
+    if (reach <= 0.0f) reach = 8.0f;
+    for (int i = 0; i < 6; ++i) {
+        Vec2& p = u.nanoPoints[i];
+        Vec2& r = u.nanoRenders[i];
+        p.x = moveTowards(p.x, r.x, 0.1f * f);
+        p.y = moveTowards(p.y, r.y, 0.1f * f);
+        p.x += (r.x - p.x) * 0.04f * f;
+        p.y += (r.y - p.y) * 0.04f * f;
+        if (std::fabs(p.x - r.x) < 1.0f) r.x = g_rng.range(-reach, reach);
+        if (std::fabs(p.y - r.y) < 1.0f) r.y = g_rng.range(-reach, reach);
+    }
+}
+
 void Game::updateUnit(Unit& u) {
     if (!u.tpl) return;
     // A corpse that died above the ground does not update as a unit any more -- no height, no shield, no
     // orders -- it only falls (CustomUnit.update:1672-1768, and :1770-1772 returns for every other dead
     // unit before the live part of update starts).
     if (u.dead) { if (u.deathFalling) updateDeathFall(u); return; }
+    // Before updateActions, so `self.timeAlive(...)` sees this tick: the flare's remove action is polled
+    // there and would otherwise fire one tick late.
+    u.age += 1.0f;
     {
         const UnitTemplate* before = u.tpl;
         updateActions(u);
@@ -1324,8 +1560,10 @@ void Game::updateUnit(Unit& u) {
     // RWX CustomUnit.update:1848-1864: the bubble tops itself up by shieldRegen every tick with no
     // delay after being hit, and the deflection flash fades by 2% of itself plus a flat
     // shieldDeflectionDisplayRate per tick, which is what makes the bubble linger a moment.
-    if (tpl.maxShield > 0) {
-        u.shield = std::min(u.shield + tpl.shieldRegen, u.shieldMax);
+    if (u.shieldMax > 0) {
+        // A converted unit keeps its old UnitStats.shieldRegen (RWX UnitStats.a), not the new
+        // template's default, so the carried-over bubble refills at the same rate.
+        u.shield = std::min(u.shield + u.shieldRegen, u.shieldMax);
         if (u.shield < 0.0f) u.shield = 0.0f;
         if (u.shieldFlash != 0.0f) {
             u.shieldFlash = std::max(0.0f, u.shieldFlash - u.shieldFlash * 0.02f - tpl.shieldFlashRate);
@@ -1546,19 +1784,26 @@ void Game::updateUnit(Unit& u) {
                     bs->hp = std::min(bs->maxHp, bs->hp + tpl.nanoRepairSpeed);
                 }
             }
-            // The nano stream. Repair throws its flecks from the builder at the target (a():5164-5185,
-            // effects.png frame 6); reclaim throws them the other way, from the target back at the hull
-            // that is taking it apart (b():5187-5208, frame 5). Both fire once per 5 ticks.
-            if (tick % 5 == 0 && particles.size() < 100 && !bs->dead) {
+            // The nano stream. OrderableUnit.a(BaseUnit,float,int):5164-5185 (build/repair) and
+            // b(...):5187-5208 (reclaim) both throw their flecks from the *nano muzzle* -- bn(), i.e.
+            // the mainNanoTurret's barrel end -- aimed at the target's centre +-8 px, at 2..4 px per
+            // tick, and both pin the life at V=20 ticks whatever the gap is. The frame is the only
+            // difference: effects.png cell 6 going out, cell 5 coming back. The 5-tick cadence is
+            // turretTurnSpeed, which :5167 resets to 5.0 each time it fires.
+            if (tick % 5 == 0 && particles.size() < 200 && !bs->dead) {
                 Unit& from = reclaiming ? *bs : u;
                 Unit& to = reclaiming ? u : *bs;
-                Vec2 tp = to.pos + Vec2{ g_rng.range(-8, 8), g_rng.range(-8, 8) };
-                Vec2 dd = tp - from.pos;
-                float spd = g_rng.range(2, 4);
+                int tiFrom = from.tpl && from.tpl->mainNanoTurret >= 0 ? from.tpl->mainNanoTurret : 0;
+                int tiTo = to.tpl && to.tpl->mainNanoTurret >= 0 ? to.tpl->mainNanoTurret : 0;
+                Vec2 jitter{ g_rng.range(-8.0f, 8.0f), g_rng.range(-8.0f, 8.0f) };
+                Vec2 src = reclaiming ? from.pos : muzzlePoint(from, tiFrom);
+                Vec2 dst = (reclaiming ? muzzlePoint(to, tiTo) : to.pos) + jitter;
+                Vec2 dd = dst - src;
+                float spd = g_rng.range(2.0f, 4.0f);
                 Particle p;
-                p.pos = from.pos;
-                p.vel = dd * (spd / std::max(dd.len(), 0.001f));
-                p.dur = std::min(60.0f, dd.len() / spd);
+                p.pos = src;
+                p.vel = dd.norm() * spd;
+                p.dur = 20.0f;                       // Effect.V
                 p.reclaim = reclaiming;
                 particles.push_back(p);
             }
@@ -1577,6 +1822,11 @@ void Game::updateUnit(Unit& u) {
         }
         if (best) { u.nanoTargetId = best->id; u.nanoReclaim = false; u.nanoOrderAge = 0; }
     }
+
+    // RWX BuilderUnit.update:253-259 -- the six tether anchors are refreshed every tick, target or not,
+    // and BuilderUnit is the only hull that owns them: a CustomUnit with a nano turret (megaBuilder, the
+    // experimental gunship's repair bay) never draws a tether in RWX, only the flecks.
+    if (tpl.isBuilder) updateNanoPoints(u, u.nanoTargetId >= 0 ? get(u.nanoTargetId) : nullptr, 1.0f);
 
     // AutoRepairRenderHook.b:14-20 -- the ini flag buys no rate and no self-heal, just a timer: `u` counts
     // up every tick, busy or not, and on the first tick past 40 that the hull has nowhere to go
@@ -1724,7 +1974,18 @@ void Game::updateUnit(Unit& u) {
             } else {
                 float accel = tpl.turnAccel * 0.0174533f;
                 float wantV = diff > 0 ? maxV : -maxV;
-                if (std::fabs(wantV - u.turnVel) <= accel) u.turnVel = wantV;
+                // OrderableUnit.B():4610 answers -1, and rotateToward:1291-1297 reads that as "no ramp
+                // at all": it adds sign*getMaxTurnSpeed()*f straight to the rotation, so the hull is at
+                // full turn speed on the very first tick. Only a unit that overrides B() (HoverTankUnit
+                // :226 = 0.5, HeavyTankUnit :233 = 0.2, ...) eases in through `direction`, which is the
+                // branch below. A negative [movement] turnAcceleration has to mean that same sentinel --
+                // run through the ramp formula it would step turnVel the *wrong* way (wantV > turnVel
+                // with a negative accel subtracts), and since |turnVel| then keeps growing while facing
+                // runs away from the target the hull spins faster and faster in the wrong direction.
+                // That was the ladybug's "鬼畜": Ladybug never overrides B(), so its ini's -1 sentinel
+                // made every turn a runaway counter-rotation.
+                if (accel <= 0.0f) u.turnVel = wantV;
+                else if (std::fabs(wantV - u.turnVel) <= accel) u.turnVel = wantV;
                 else u.turnVel += (wantV > u.turnVel ? accel : -accel);
                 float step = u.turnVel;
                 if (std::fabs(step) > std::fabs(diff)) step = diff;
@@ -3266,13 +3527,18 @@ float Game::damage(Unit& target, float dmg, const Projectile* p) {
         }
     }
     const UnitTemplate& tpl = *target.tpl;
-    // a building still being built (or repaired back from rubble) takes 75% more (:1561)
-    if (target.underConstruction && target.buildProgress < 1.0f) dmg *= 1.75f;
+    // CustomUnit.setTarget:4187-4205 runs the armour subtraction *before* it calls super, and
+    // BaseUnit.setTarget:1560-1562 is what applies the 1.75x to a hull that is not finished yet. RP used
+    // to multiply first, which is a different number: 100 damage against 20 armour on a half-built
+    // target is (100-20)*1.75 = 140 in RWX but 100*1.75-20 = 155 the other way round, and the gap grows
+    // with armour.
     if (tpl.armour > 0.0f && dmg > tpl.armourMinKeep) {
         float a = tpl.armour - p->armourIgnore;
         if (a > 0.0f) dmg -= a;
         if (dmg < tpl.armourMinKeep) dmg = tpl.armourMinKeep;
     }
+    // a building still being built (or repaired back from rubble) takes 75% more (:1561)
+    if (target.underConstruction && target.buildProgress < 1.0f) dmg *= 1.75f;
     float toHull = dmg;
     // :1574 also asks for unit energy to be spent, and RWX never charges that field up for a shield
     if (target.shield > 0.0f) {
@@ -3572,7 +3838,7 @@ void Game::addScorch(Vec2 at) {
 void Game::removeUnit(Unit& u) {
     if (u.dead) return;
     u.dead = true;
-    if (u.tpl && u.tpl->isStatic()) markBuildingOcc(map, u, -1);
+    if (u.tpl && u.tpl->isBuilding) markBuildingOcc(map, u, -1);
     // CustomUnit.ds():548-551 -> h(transportUnitsKillOnDeath):553-562. The hold empties before anything
     // else, so a passenger that dies with its carrier is already off the list when its own death runs.
     if (!u.cargo.empty()) releaseCargo(u, u.tpl && u.tpl->transportKillOnDeath);
@@ -3782,12 +4048,34 @@ void Game::runAI() {
     }
 }
 
-static bool teamHasUnits(Game& g, int teamId) { for (auto& u : g.units) if (u.team == teamId && !u.dead) return true; return false; }
+// MissionEngine.a(WaveSpawnMode, BaseUnit):1379-1404, the `mainBuildings` predicate: a building that can
+// produce units, minus turret factories and extractors. RP's `isFactory` is the same idea (it has a
+// queuable option), and [core] resourceRate is the extractor test.
+static bool isMainBuilding(const Unit& u) {
+    return u.tpl && u.tpl->isBuilding && u.tpl->isFactory && u.tpl->resourceRate == 0.0f;
+}
+
+// MissionEngine.update:1316-1360 -- the win/lose test is "does this side still own a unit that satisfies
+// the map's condition". `none` never ends, and `requiredObjectives` needs the mission system RP does not
+// have, so it is treated like `none` instead of guessing (guessing would end a mission map on tick 1).
+static bool teamSatisfies(Game& g, int teamId, const std::string& cond) {
+    for (auto& u : g.units) {
+        if (u.dead || u.team != teamId || !u.tpl) continue;
+        if (cond == "mainbuildings") { if (isMainBuilding(u)) return true; }
+        else if (cond == "allbuildings") { if (u.tpl->isBuilding) return true; }
+        else return true;
+    }
+    return false;
+}
 
 void Game::checkWinLoss() {
     if (gameOver) return;
-    bool playerAlive = teamHasUnits(*this, 0);
-    bool anyEnemy = false; for (auto& t : teams) if (!t.isPlayer && teamHasUnits(*this, t.id)) anyEnemy = true;
+    const std::string cond = ToLower(map.info.winCondition);
+    if (cond == "none" || cond == "requiredobjectives") return;
+    bool playerAlive = teamSatisfies(*this, 0, cond);
+    bool anyEnemy = false;
+    for (auto& t : teams)
+        if (!t.isPlayer && isEnemy(0, t.id) && teamSatisfies(*this, t.id, cond)) anyEnemy = true;
     if (!playerAlive) { gameOver = true; gameOverText = "DEFEAT"; }
     else if (!anyEnemy) { gameOver = true; gameOverText = "VICTORY"; }
 }
@@ -4023,12 +4311,9 @@ bool Game::actionAvailable(const Unit& u, int index) const {
     auto cd = u.actionCooldowns.find(a.name);
     if (cd != u.actionCooldowns.end() && cd->second > 0.0f) return false;
     if (u.allActionCooldown > 0.0f) return false;
-    // canAfford() is non-const, so read the team's balance directly here.
-    if (a.price > 0.0f) {
-        bool afford = false;
-        for (const Team& t : teams) if (t.id == u.team) { afford = t.credits >= a.price; break; }
-        if (!afford) return false;
-    }
+    // canAfford() is non-const, so read the team's balance directly here. The full UnitPrice is checked,
+    // not just the credits part: an empty ammo pool has to hide the nuke button.
+    if (!canPayActionCost(*this, u, a)) return false;
     return true;
 }
 
@@ -4042,14 +4327,47 @@ void Game::runAction(Unit& u, const UnitAction& a, int depth) {
     if (!a.convertTo.empty()) {
         const UnitTemplate* to = g_templates.find(ToLower(a.convertTo));
         if (to && to != u.tpl) {
+            const UnitTemplate* from = u.tpl;
+            // RWX convertTo calls setUnitType(config, false, false, keepFields). With z2=false and no
+            // keepFields array it does NOT call UnitStats.a(), so the NEW template's stat block wins:
+            // landed owns the 5000 shield, the flying gunship has none. Do not carry the bubble over.
+            // The undeploy/deploy animation belongs to the old template. Finish it now and drop its
+            // limb offsets before swapping templates, otherwise the old limb track keeps driving the
+            // new template and the arms never settle into the flying pose.
+            stopAnimation(u, true);
             u.tpl = to;
             u.tplKey = ToLower(a.convertTo);
-            initTurrets(u);
+            u.animFrame = to->defaultFrame;
+            remapTurrets(u, from);   // RWX setUnitType: carry turret state over by barrel name
+            u.legs.clear();          // force initLegs to rebuild from the new template's arm bases
             initLegs(u);
+            // CustomUnit.setUnitType:1073-1083 swaps to the NEW template's shield stats, then rescales
+            // the current pool: startShieldAtZero only clamps, otherwise the pool keeps its fill ratio
+            // (or fills whole when the old hull had no shield at all).
+            float oldShieldMax = u.shieldMax;
+            float newShieldMax = (float)to->maxShield;
+            u.shieldMax = newShieldMax;
+            u.shieldRegen = to->shieldRegen;
+            if (to->startShieldAtZero) u.shield = std::min(u.shield, newShieldMax);
+            else if (oldShieldMax == 0.0f) u.shield = newShieldMax;
+            else u.shield = (u.shield / oldShieldMax) * newShieldMax;
+            u.shieldFlash = 0.0f;
             u.hp = std::min(u.hp, u.maxHp = to->maxHp);
         }
     }
     applyAddResources(*this, u, a.addResources);
+    // resourceAmount / resourceAmount_setValue: set the named pool to the value (the AA beam gunship
+    // refills its afterburn energy to 6). energy and the other built-ins live on the hull, everything
+    // else in `resources`.
+    if (!a.resourceAmount.empty() && a.hasResourceAmountValue) {
+        const std::string& pool = a.resourceAmount;
+        float v = a.resourceAmountValue;
+        if (pool == "energy") u.energy = v;
+        else if (pool == "hp" || pool == "health") u.hp = std::min(u.maxHp, v);
+        else if (pool == "shield") u.shield = std::min(u.shieldMax, v);
+        else if (pool == "credits") { Team* tm = teamOf(*this, u.team); if (tm) tm->credits = v; }
+        else u.resources[pool] = v;
+    }
     if (a.addEnergy != 0.0f) u.energy += a.addEnergy;
     if (a.parentShield != 0.0f && u.parentId >= 0) {
         if (Unit* parent = get(u.parentId)) parent->shield = std::max(0.0f, parent->shield + a.parentShield);
@@ -4073,6 +4391,49 @@ void Game::runAction(Unit& u, const UnitAction& a, int depth) {
     }
     if (!a.messageTo.empty())
         actionMessages.push_back({ u.id, a.messageTags, depth });
+    // `deleteSelf : true` -- the action consumes the hull. RWX calls remove() rather than a death, so
+    // there is no explosion and no wreck; the 10 second flare simply goes away. Removing is the last
+    // thing done here because it invalidates the caller's interest in `u`.
+    if (a.deleteSelf) removeUnit(u);
+}
+
+// fireTurretXAtGround: the aimed half of the action system. RWX's nuke launcher is the hard-coded case
+// (NukeLauncher.a(float,float):338-382) but the key is general -- the modular spider's artillery and the
+// experimental gunship use it too. The shot itself is an ordinary Game::fire with a null unit target and
+// a frozen point, which is the same path an interceptor round takes.
+bool Game::runActionAt(int unitId, const std::string& actionName, Vec2 point) {
+    Unit* u = get(unitId);
+    if (!u || !u->tpl || u->dead) return false;
+    const UnitTemplate& tpl = *u->tpl;
+    int idx = -1;
+    for (size_t i = 0; i < tpl.actions.size(); ++i)
+        if (ToLower(tpl.actions[i].name) == ToLower(actionName)) { idx = (int)i; break; }
+    if (idx < 0) return false;
+    const UnitAction& a = tpl.actions[idx];
+    if (a.fireAtGround.empty()) return false;
+    if (!actionAvailable(*u, idx)) return false;
+    int ti = -1;
+    for (size_t i = 0; i < tpl.turrets.size(); ++i)
+        if (ToLower(tpl.turrets[i].name) == a.fireAtGround) { ti = (int)i; break; }
+    if (ti < 0) return false;
+    // NukeLauncher.java:346-352 -- a nuke may not be dropped closer than 450 px (202500 squared) so the
+    // launcher never wipes itself out. The barrel's own round is what says it is a nuke, which keeps the
+    // rule off the ordinary artillery variants that share this action key.
+    int pi = tpl.turrets[ti].projectile;
+    bool nukeShot = pi >= 0 && pi < (int)tpl.projectiles.size() && tpl.projectiles[pi].nukeWeapon;
+    if (nukeShot && u->pos.dist(point) < 450.0f) return false;
+    if (!canPayActionCost(*this, *u, a)) return false;
+    payResourceCost(*this, *u, a.priceCost);
+    if (a.cooldown > 0.0f) u->actionCooldowns[a.name] = a.cooldown;
+    if (a.allCooldown > 0.0f) u->allActionCooldown = a.allCooldown;
+    // Point the barrel at the chosen spot first. An aimed round is unguided (`targetGround : true` on
+    // every shipped nuke), so it keeps the heading it left with -- firing a barrel that still faced its
+    // last enemy would send the nuke off in that direction instead of at the click.
+    float want = std::atan2(point.y - u->pos.y, point.x - u->pos.x);
+    u->tur[ti].angle = want;
+    u->tur[ti].lastAim = want;
+    fire(*u, nullptr, ti, point);
+    return true;
 }
 
 // CustomUnitActionHandler + the message events: fire the named actions whose
@@ -4142,7 +4503,7 @@ void Game::updateActions(Unit& u) {
         if (u.allActionCooldown > 0.0f) continue;
         auto cd = u.actionCooldowns.find(a.name);
         if (cd != u.actionCooldowns.end() && cd->second > 0.0f) continue;
-        if (a.price > 0.0f && !canAfford(u.team, a.price)) continue;
+        if (!canPayActionCost(*this, u, a)) continue;
         if (!a.events.empty()) continue;  // event-driven, not polled
         runAction(u, a);
     }
